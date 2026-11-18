@@ -32,6 +32,8 @@ pub const FileRef = struct {
     /// Lowercase hex (dpkg, rpm) or apk's `Q1` base64 SHA-1.
     digest: []const u8 = "",
     config: bool = false,
+    /// File mode recorded by the package (rpm FILEMODES, apk a: lines); 0 when unknown (dpkg).
+    mode: u16 = 0,
 };
 
 /// Recorded databases for tests and fuzzing (regenerate with fixtures/make_fixtures.py).
@@ -299,6 +301,7 @@ pub const Db = struct {
                     .algo = if (f.digest.len > 0) algo else .none,
                     .digest = try a.dupe(u8, f.digest),
                     .config = f.flags & rpm.file_config != 0,
+                    .mode = f.mode,
                 });
             }
         }
@@ -355,6 +358,12 @@ pub const Db = struct {
                 'Z' => if (last_file) |p| if (db.files.getPtr(p)) |ref| if (std.mem.startsWith(u8, value, "Q1")) {
                     ref.algo = .sha1;
                     ref.digest = value;
+                },
+                // a:uid:gid:mode for the preceding file.
+                'a' => if (last_file) |p| if (db.files.getPtr(p)) |ref| {
+                    const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse continue;
+                    const perm = std.fmt.parseInt(u16, value[colon + 1 ..], 8) catch continue;
+                    ref.mode = 0o100000 | perm;
                 },
                 else => {},
             }

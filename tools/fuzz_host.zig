@@ -186,6 +186,7 @@ pub fn hostPersistence(gpa: std.mem.Allocator, random: std.Random) !void {
         _ = p.forcedCommand(k.options);
     }
     _ = p.parseAuthLine(input);
+    _ = zav.host.linux.privilege.decodeFileCaps(input);
     var users: std.ArrayList(p.User) = .empty;
     defer users.deinit(gpa);
     try p.parsePasswd(gpa, input, &users);

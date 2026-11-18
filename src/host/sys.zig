@@ -137,7 +137,7 @@ pub fn getXattr(abs_path: []const u8, name: []const u8, out: []u8) Error![]u8 {
     } else if (is_darwin) {
         const rc = getxattr(p, n, out.ptr, out.len, 0, XATTR_NOFOLLOW);
         if (rc < 0) return switch (std.c.errno(-1)) {
-            .NOATTR, .NOTSUP => error.NoData,
+            .NOATTR, .OPNOTSUPP => error.NoData,
             .NOENT, .NOTDIR => error.FileNotFound,
             .ACCES, .PERM => error.AccessDenied,
             .RANGE => error.NoData,
