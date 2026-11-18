@@ -2,6 +2,7 @@
 //! See docs/DESIGN.md for the design this module implements.
 
 pub const cvd = @import("cvd.zig");
+pub const cvd_sign = @import("cvd_sign.zig");
 pub const ir = @import("ir.zig");
 pub const hashsig = @import("hashsig.zig");
 pub const hexsig = @import("hexsig.zig");
@@ -25,6 +26,7 @@ pub const census = @import("census.zig");
 
 test {
     _ = cvd;
+    _ = cvd_sign;
     _ = ir;
     _ = hashsig;
     _ = hexsig;

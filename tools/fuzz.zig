@@ -25,6 +25,10 @@ pub fn main(init: std.process.Init) !void {
             try cvdContainer(gpa.allocator(), random, if (i % 2 == 0) zav.compile.cvd.fixture_cvd else zav.compile.cvd.fixture_cld);
             cases += 1;
         }
+        if (i % 8 == 0 and selected(only, "cvdSign")) {
+            cvdSign(random);
+            cases += 1;
+        }
         if (selected(only, "hashLine")) {
             hashLine(random);
             cases += 1;
@@ -837,6 +841,37 @@ fn cvdContainer(gpa: std.mem.Allocator, random: std.Random, original: []const u8
     var walk_body: std.Io.Reader = .fixed(input[cvd.header_len..]);
     var drain: cvd.Drain = .{};
     cvd.walk(gpa, header, &walk_body, .{}, &drain) catch {};
+}
+
+/// Detached CVD signatures: mutated and truncated DER envelopes, and mutated `.sign` text, must
+/// fail cleanly (the digest is the fixture's, so only an untouched envelope may verify).
+fn cvdSign(random: std.Random) void {
+    const sign = zav.compile.cvd_sign;
+    const S = struct {
+        var der_buf: [16 * 1024]u8 = undefined;
+        var der_len: usize = 0;
+        var digest: [32]u8 = undefined;
+    };
+    if (S.der_len == 0) {
+        const text = sign.fixture_sign;
+        const start = std.mem.indexOf(u8, text, "pkcs7-pem:").? + "pkcs7-pem:".len;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n').?;
+        const d = std.base64.standard.Decoder;
+        S.der_len = d.calcSizeForSlice(text[start..end]) catch unreachable;
+        d.decode(S.der_buf[0..S.der_len], text[start..end]) catch unreachable;
+        std.crypto.hash.sha2.Sha256.hash(zav.compile.cvd.fixture_cvd, &S.digest, .{});
+    }
+    var buf: [16 * 1024]u8 = undefined;
+    @memcpy(buf[0..S.der_len], S.der_buf[0..S.der_len]);
+    const input = mutate(random, &buf, S.der_len, &.{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x30, 0x31, 0x7f, 0x80, 0x81, 0x82, 0x84, 0xa0, 0xff });
+    sign.verifyPkcs7(input, &S.digest, &sign.fixture_pin) catch {};
+
+    var text_buf: [16 * 1024]u8 = undefined;
+    @memcpy(text_buf[0..sign.fixture_sign.len], sign.fixture_sign);
+    const text = mutate(random, &text_buf, sign.fixture_sign.len, "#:0123456789ABCabc+/=\n");
+    var heap: [32 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&heap);
+    sign.verify(fba.allocator(), text, &S.digest, &sign.fixture_pin) catch {};
 }
 
 /// Hash database lines: mutated valid lines through every hash format.

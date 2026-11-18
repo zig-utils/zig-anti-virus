@@ -207,20 +207,14 @@ pub const Census = struct {
         c.keep.deinit();
     }
 
-    /// Verify a CVD (MD5 and signature with the default options) and count its members.
+    /// Verify a CVD (MD5, signature and any detached `.sign` file) and count its members.
     pub fn addContainer(c: *Census, io: Io, dir: Io.Dir, sub_path: []const u8, options: cvd.VerifyOptions) !cvd.Header {
         const file = try dir.openFile(io, sub_path, .{});
         defer file.close(io);
         const keep = c.keep.allocator();
-        const header_bytes = try keep.alloc(u8, cvd.header_len);
-        if (try file.readPositionalAll(io, header_bytes, 0) != cvd.header_len) return error.Truncated;
-        const header = try cvd.parseHeader(header_bytes);
+        const header_buf = try keep.create([cvd.header_len]u8);
+        const header = try @import("compiler.zig").verifyContainer(c.gpa, io, dir, sub_path, file, header_buf, options);
         var buf: [64 * 1024]u8 = undefined;
-        {
-            var r = file.reader(io, &buf);
-            try r.seekTo(cvd.header_len);
-            try cvd.verify(header, &r.interface, options);
-        }
         const label = try keep.dupe(u8, std.fs.path.basename(sub_path));
         try c.containers.append(c.gpa, .{
             .path = label,

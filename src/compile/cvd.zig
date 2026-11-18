@@ -19,6 +19,7 @@ const std = @import("std");
 const Io = std.Io;
 const Md5 = std.crypto.hash.Md5;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const cvd_sign = @import("cvd_sign.zig");
 
 pub const header_len = 512;
 pub const max_info_len = 1024 * 1024;
@@ -174,7 +175,69 @@ pub const VerifyOptions = struct {
     key: PublicKey = talos_key,
     /// Accept a container whose signature cannot be checked (CLD, or a local test build).
     allow_unverified: bool = false,
+    /// The detached `.sign` file published next to the CVD, when there is one (`verifyFile`
+    /// only). It must verify; a CVD without a legacy header signature needs it.
+    sign: ?[]const u8 = null,
+    sign_pin: cvd_sign.Pin = cvd_sign.cisco_root_pin,
 };
+
+/// `verify` for a container on disk, plus the detached signature: reads the header into
+/// `header_buf`, then MD5 over the body and SHA-256 over the whole file in one pass.
+pub fn verifyFile(gpa: std.mem.Allocator, io: Io, file: Io.File, header_buf: *[header_len]u8, options: VerifyOptions) !Header {
+    if (try file.readPositionalAll(io, header_buf, 0) != header_len) return error.Truncated;
+    const header = try parseHeader(header_buf);
+    var buf: [64 * 1024]u8 = undefined;
+    var r = file.reader(io, &buf);
+    try r.seekTo(header_len);
+    var md5 = Md5.init(.{});
+    var sha = Sha256.init(.{});
+    sha.update(header_buf);
+    while (true) {
+        const chunk = r.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        md5.update(chunk);
+        sha.update(chunk);
+        r.interface.toss(chunk.len);
+    }
+    var digest: [16]u8 = undefined;
+    md5.final(&digest);
+    var file_digest: [32]u8 = undefined;
+    sha.final(&file_digest);
+
+    var opts = options;
+    if (options.sign) |text| {
+        cvd_sign.verify(gpa, text, &file_digest, &options.sign_pin) catch |err| {
+            if (!options.allow_unverified) return err;
+        };
+        // A verified detached signature stands in for a missing legacy one.
+        if (header.dsig == null) opts.allow_unverified = true;
+    }
+    try checkMd5(header, &std.fmt.bytesToHex(digest, .lower), opts);
+    return header;
+}
+
+/// The detached signature for the container at `sub_path`: `<stem>-<version>.cvd.sign` (the
+/// name ClamAV's mirrors and cvdupdate use) or `<sub_path>.sign`, or null when neither exists.
+pub fn readSignFile(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, version: u32) !?[]u8 {
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stem = std.fs.path.stem(sub_path);
+    const parent = std.fs.path.dirname(sub_path);
+    const versioned = if (parent) |p|
+        try std.fmt.bufPrint(&name_buf, "{s}/{s}-{d}.cvd.sign", .{ p, stem, version })
+    else
+        try std.fmt.bufPrint(&name_buf, "{s}-{d}.cvd.sign", .{ stem, version });
+    var plain_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const plain = try std.fmt.bufPrint(&plain_buf, "{s}.sign", .{sub_path});
+    for ([_][]const u8{ versioned, plain }) |candidate| {
+        return dir.readFileAlloc(io, candidate, gpa, .limited(cvd_sign.max_sign_file)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| return e,
+        };
+    }
+    return null;
+}
 
 /// Check the header against the body: MD5 always, the digital signature for a CVD.
 /// `body` is consumed to its end.
@@ -190,17 +253,20 @@ pub fn verify(header: Header, body: *Io.Reader, options: VerifyOptions) (Error |
     }
     var digest: [16]u8 = undefined;
     md5.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
+    return checkMd5(header, &std.fmt.bytesToHex(digest, .lower), options);
+}
 
+/// The checks after the body's MD5 is known: the header's MD5 field, then the legacy signature.
+fn checkMd5(header: Header, hex: *const [32]u8, options: VerifyOptions) Error!void {
     if (header.md5) |declared| {
-        if (!std.mem.eql(u8, declared, &hex)) return error.Md5Mismatch;
+        if (!std.mem.eql(u8, declared, hex)) return error.Md5Mismatch;
     } else if (!options.allow_unverified) return error.Unverified;
 
     if (options.kind == .cld or header.dsig == null) {
         if (!options.allow_unverified) return if (header.dsig == null) error.MissingSignature else error.Unverified;
         return;
     }
-    verifySignature(options.key, &hex, header.dsig.?) catch |err| {
+    verifySignature(options.key, hex, header.dsig.?) catch |err| {
         if (options.allow_unverified) return;
         return err;
     };
@@ -467,4 +533,43 @@ test "signature decoding is least-significant digit first" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 64 }, &out);
     try std.testing.expectError(error.BadSignature, decodeSignature("!", &out));
     try std.testing.expectError(error.BadSignature, decodeSignature("////", &out)); // overflows 2 bytes
+}
+
+test "verifyFile checks the detached signature next to the container" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const compiler = @import("compiler.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.cvd", .data = fixture_cvd });
+    const options: VerifyOptions = .{ .key = test_key, .sign_pin = cvd_sign.fixture_pin };
+    var header_buf: [header_len]u8 = undefined;
+
+    // No .sign file: the legacy signature is enough.
+    {
+        const file = try tmp.dir.openFile(io, "test.cvd", .{});
+        defer file.close(io);
+        _ = try compiler.verifyContainer(gpa, io, tmp.dir, "test.cvd", file, &header_buf, options);
+    }
+    // A valid one, found by the mirror's versioned name.
+    const version = (try parseHeader(fixture_cvd[0..header_len])).version;
+    var name_buf: [64]u8 = undefined;
+    const sign_name = try std.fmt.bufPrint(&name_buf, "test-{d}.cvd.sign", .{version});
+    try tmp.dir.writeFile(io, .{ .sub_path = sign_name, .data = cvd_sign.fixture_sign });
+    {
+        const file = try tmp.dir.openFile(io, "test.cvd", .{});
+        defer file.close(io);
+        _ = try compiler.verifyContainer(gpa, io, tmp.dir, "test.cvd", file, &header_buf, options);
+        // The same file against Cisco's root: the chain is not trusted.
+        try std.testing.expectError(error.UntrustedChain, compiler.verifyContainer(gpa, io, tmp.dir, "test.cvd", file, &header_buf, .{ .key = test_key }));
+    }
+    // The container changed after signing: the detached signature no longer matches.
+    var changed: [fixture_cvd.len]u8 = fixture_cvd.*;
+    changed[changed.len - 1] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.cvd", .data = &changed });
+    {
+        const file = try tmp.dir.openFile(io, "test.cvd", .{});
+        defer file.close(io);
+        try std.testing.expectError(error.DigestMismatch, compiler.verifyContainer(gpa, io, tmp.dir, "test.cvd", file, &header_buf, options));
+    }
 }

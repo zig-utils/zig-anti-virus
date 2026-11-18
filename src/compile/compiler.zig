@@ -125,22 +125,15 @@ pub const Compiler = struct {
         c.sources.malwarebazaar = export_time;
     }
 
-    /// Verify a CVD (or, with `allow_unverified`, a CLD) and add its members.
+    /// Verify a CVD (or, with `allow_unverified`, a CLD) and add its members. A detached
+    /// `.sign` file next to it (`main-63.cvd.sign`) is verified too when present.
     pub fn addContainer(c: *Compiler, io: Io, dir: Io.Dir, sub_path: []const u8, options: cvd.VerifyOptions) !cvd.Header {
         const file = try dir.openFile(io, sub_path, .{});
         defer file.close(io);
-        var header_bytes: [cvd.header_len]u8 = undefined;
-        const n = try file.readPositionalAll(io, &header_bytes, 0);
-        if (n != cvd.header_len) return error.Truncated;
-        const header_copy = try c.arena.allocator().dupe(u8, &header_bytes);
-        const header = try cvd.parseHeader(header_copy);
+        const header_buf = try c.arena.allocator().create([cvd.header_len]u8);
+        const header = try verifyContainer(c.gpa, io, dir, sub_path, file, header_buf, options);
 
         var buf: [64 * 1024]u8 = undefined;
-        {
-            var r = file.reader(io, &buf);
-            try r.seekTo(cvd.header_len);
-            try cvd.verify(header, &r.interface, options);
-        }
         var r = file.reader(io, &buf);
         try r.seekTo(cvd.header_len);
         var visitor: MemberVisitor = .{ .compiler = c };
@@ -438,6 +431,17 @@ pub const Compiler = struct {
         };
     }
 };
+
+/// `cvd.verifyFile` with the container's detached signature file, when it has one.
+pub fn verifyContainer(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, file: Io.File, header_buf: *[cvd.header_len]u8, options: cvd.VerifyOptions) !cvd.Header {
+    if (try file.readPositionalAll(io, header_buf, 0) != cvd.header_len) return error.Truncated;
+    const peek = try cvd.parseHeader(header_buf);
+    var opts = options;
+    const sign = if (options.sign == null) try cvd.readSignFile(gpa, io, dir, sub_path, peek.version) else null;
+    defer if (sign) |text| gpa.free(text);
+    if (sign) |text| opts.sign = text;
+    return cvd.verifyFile(gpa, io, file, header_buf, opts);
+}
 
 fn extension(name: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "";
