@@ -326,9 +326,9 @@ pub fn describe(parts: *const [partitions]?Partition, w: *std.Io.Writer) !void {
             };
             const bits = f.sbbf.blocks.len * 256;
             try w.print("    stride {d} q {d}: {d} atoms, {d} grams, {d} bytes, {d:.1} bits/gram, {d:.1}% bits set, expected FPR {d:.3}%\n", .{
-                f.stride,                                                                         f.q,
-                f.atoms,                                                                          f.sbbf.num_keys,
-                f.sbbf.blocks.len * 32,                                                           @as(f64, @floatFromInt(bits)) / @as(f64, @floatFromInt(@max(f.sbbf.num_keys, 1))),
+                f.stride,                                                           f.q,
+                f.atoms,                                                            f.sbbf.num_keys,
+                f.sbbf.blocks.len * 32,                                             @as(f64, @floatFromInt(bits)) / @as(f64, @floatFromInt(@max(f.sbbf.num_keys, 1))),
                 100 * @as(f64, @floatFromInt(set)) / @as(f64, @floatFromInt(bits)), f.sbbf.expectedFalsePositiveRate() * 100,
             });
         }
