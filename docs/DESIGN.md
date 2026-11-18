@@ -6,8 +6,9 @@ How sure each claim is:
 - **[R]**: read in source.
 - **[K]**: well-established public fact.
 - **[E]**: estimate. One of the experiments in section 14 must confirm it.
+- **[M]**: measured; the experiment in section 14 that measured it has the method and hardware.
 
-Every [E] figure is provisional until experiment E0 (the database census) and the benchmark harness replace it with a measurement.
+Every [E] figure is provisional until an experiment replaces it with a measurement. Database counts come from E0 ([census](experiments/E0-census.md): main 63, daily 28187, bytecode 339).
 
 ## 0. Decisions
 
@@ -66,8 +67,8 @@ Every [E] figure is provisional until experiment E0 (the database census) and th
 **Phase 2:** `.pdb .wdb` (they need HTML and URL extraction), `.idb`, and `.crb .cat` (Authenticode trust).
 
 **Out of scope:** `.cbc` bytecode.
-- bytecode.cvd holds on the order of a hundred programs [E]: family-specific decryptors and unpackers, plus a few PDF and JS heuristics.
-- By signature count that is under 0.01%. By unique detections on a current corpus, it is estimated at under 0.5% [E].
+- bytecode.cvd holds 85 programs [M]: family-specific decryptors and unpackers, plus a few PDF and JS heuristics.
+- By signature count that is 0.0023% of 3.64 million [M]. By unique detections on a current corpus, it is estimated at under 0.5% [E].
 - Experiment E9 measures it by comparing `clamscan --bytecode=no` with the default.
 
 **Coverage report:** the compiler declares a functionality level and writes a report that counts every skipped signature by reason (unsupported target, PCRE feature, bytecode trigger, missing container parser). Coverage loss is therefore a measured number.
@@ -119,7 +120,9 @@ A table t is one combination of algorithm (MD5, SHA1, SHA256) and kind (whole fi
 **`HASH_NEED_MAP`** is the per-file gate, consulted before any hashing:
 - Sizes below 2^24 use a dense map, 4 bits per size: {md5, sha1, sha256, reserved}.
 - Larger sizes go into a sorted `{size u64, mask u8}` array.
-- A global `sizeless_mask` covers entries with `*` as the size. Any algorithm in it must be computed for every file. E0 counts these.
+- A global `sizeless_mask` covers entries with `*` as the size. Any algorithm in it must be computed for every file.
+- E0 found 13 such entries (11 MD5, 2 SHA-256, all whole-file, in main.hsb) [M]. So MD5 and SHA-256 run on every scanned file, as they do in ClamAV; the map still gates SHA-1, PE section hashing and which tables are probed.
+- Sizes below 2^24 cover 98.7% of whole-file MD5 entries (174,283 distinct sizes) and 99.99% of PE section entries (69,636 distinct sizes) [M].
 
 **`HASH_HOT[t]`** holds the keys:
 ```
@@ -188,7 +191,7 @@ Estimated cost: 10-30 s and about 1 GB peak [E], always out of process, at low p
 
 For each subsignature, enumerate every fixed run of 4 bytes or more and every bounded expansion. Score each window by its estimated benign frequency, using a 4-gram model built from a benign corpus. Penalise padding runs and common prologues. Pick the rarest window.
 
-Tiers come from the length L of the rarest fixed run:
+Tiers come from the length L of the rarest fixed run. E0 measured the longest fixed run of every subsignature [M]: `.ndb` subsigs are 98% tier A, but `.ldb` subsigs are 57% A, 17% B, 26% C and 0.17% D (2,520, of which 2,048 have a fixed offset). Tier C, not D, is the candidate-volume risk.
 - **A: L ≥ 11.** Stride 8; insert all 8 4-grams of the anchor.
 - **B: 7 ≤ L ≤ 10.** Stride 4.
 - **C: 4 ≤ L ≤ 6.** Stride 1, in a separate smaller filter.
@@ -477,7 +480,7 @@ bench/         corpus manifests, runner, memory sampler, clamd driver, gates
 1. **Parser and normaliser parity decides the detection rate.** Formats are built in order of corpus impact and gated on parity.
 2. **Signature semantics can drift from ClamAV's.** Mitigation: differential testing against libclamav.
 3. **Short atoms inflate candidate counts.** Mitigation: deferral and anchoring.
-4. **Size-less hash signatures** force hashing for every file.
+4. **Size-less hash signatures** force hashing for every file. E0: 13 exist (11 MD5, 2 SHA-256), so MD5 and SHA-256 run on every file, exactly as in ClamAV.
 5. **std decoder speed.** Mitigation: optimise in our code or upstream; no C fallback.
 6. **zig-regex byte mode** is an upstream dependency.
 7. **Zig 0.17-dev API churn.** Mitigation: thin internal wrappers.
@@ -491,7 +494,7 @@ bench/         corpus manifests, runner, memory sampler, clamd driver, gates
 
 | # | Experiment | Pass line |
 |---|---|---|
-| E0 | Database census: counts by extension, target and offset kind; tier histogram; size-less hashes; size coverage; name tokenisation; PCRE count; functionality levels | produces the numbers that replace the [E] figures |
+| E0 | Database census: counts by extension, target and offset kind; tier histogram; size-less hashes; size coverage; name tokenisation; PCRE count; functionality levels ([results](experiments/E0-census.md)) | produces the numbers that replace the [E] figures |
 | E1 | Hash index lookup cost, warm and cold; share of hashed bytes skipped | lookup ≤ 300 ns warm; ≥ 70% of MD5 bytes skipped on B1 |
 | E2 | Prefilter bake-off: SBBF vs FDR shift-or vs double-array Aho-Corasick vs Teddy | PE partition ≥ 1 GB/s per core including stage 2 |
 | E3 | Atom selection vs prefix selection; tier-D deferral coverage | ≥ 10x fewer candidates; ≥ 90% of tier D deferrable or anchorable |

@@ -20,6 +20,8 @@ pub const coverage = @import("coverage.zig");
 pub const compiler = @import("compiler.zig");
 pub const mbazaar = @import("mbazaar.zig");
 pub const builtin = @import("builtin.zig");
+pub const lines = @import("lines.zig");
+pub const census = @import("census.zig");
 
 test {
     _ = cvd;
@@ -41,5 +43,7 @@ test {
     _ = compiler;
     _ = mbazaar;
     _ = builtin;
+    _ = lines;
+    _ = census;
     _ = @This();
 }

@@ -126,6 +126,20 @@ pub fn build(b: *std.Build) void {
     if (b.option([]const u8, "fuzz-target", "Run only fuzz targets whose name contains this")) |only| run_fuzz.addArg(only);
     b.step("fuzz", "Run deterministic fuzz cases").dependOn(&run_fuzz.step);
 
+    // E0: census of ClamAV databases (P3.02). Databases are passed as arguments, never committed.
+    const census_exe = b.addExecutable(.{
+        .name = "census",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/census.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    const run_census = b.addRunArtifact(census_exe);
+    run_census.addPassthruArgs();
+    b.step("census", "Count signatures in ClamAV databases (pass the .cvd files after --)").dependOn(&run_census.step);
+
     // Kernel benchmarks (zig-bench is a lazy dependency, fetched only by this step).
     const bench_step = b.step("bench", "Run kernel benchmarks and write a JSON result file");
     if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {
