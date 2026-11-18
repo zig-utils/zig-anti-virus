@@ -34,6 +34,24 @@ pub const Scratch = struct {
         s.fba.reset();
     }
 
+    /// The current allocation point. Everything allocated after it is released by `release`, which
+    /// is how a container frees a child's working set (decoder windows, materialised members) as
+    /// soon as the child is done, while its own allocations stay.
+    pub fn mark(s: *const Scratch) usize {
+        return s.fba.end_index;
+    }
+
+    pub fn release(s: *Scratch, m: usize) void {
+        std.debug.assert(m <= s.fba.end_index);
+        s.high_water = @max(s.high_water, s.fba.end_index);
+        s.fba.end_index = m;
+    }
+
+    /// Bytes allocated right now.
+    pub fn used(s: *const Scratch) usize {
+        return s.fba.end_index;
+    }
+
     /// Return pages above `keep` to the system (call after the worker has been idle a while).
     pub fn trim(s: *Scratch, keep: usize) void {
         s.reset();
@@ -61,4 +79,16 @@ test "scratch allocates without the heap and resets in place" {
     const after = try a.alloc(u8, 2 * 1024 * 1024);
     @memset(after, 2);
     try std.testing.expectEqual(@as(u8, 2), after[after.len - 1]);
+}
+
+test "mark and release free a child's allocations in place" {
+    var s = try Scratch.init(1024 * 1024);
+    defer s.deinit();
+    const a = s.allocator();
+    _ = try a.alloc(u8, 100);
+    const m = s.mark();
+    _ = try a.alloc(u8, 4096);
+    try std.testing.expect(s.used() > m);
+    s.release(m);
+    try std.testing.expectEqual(m, s.used());
 }

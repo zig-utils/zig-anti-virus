@@ -9,6 +9,7 @@ pub const limits = @import("limits.zig");
 pub const budget = @import("budget.zig");
 pub const hashscan = @import("hashscan.zig");
 pub const bodyscan = @import("bodyscan.zig");
+pub const container = @import("container.zig");
 
 test {
     _ = source;
@@ -17,6 +18,7 @@ test {
     _ = budget;
     _ = hashscan;
     _ = bodyscan;
+    _ = container;
 }
 
 test "a file scan's working set comes from scratch, not the heap" {

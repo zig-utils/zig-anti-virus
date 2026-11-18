@@ -25,6 +25,9 @@ pub const Limits = struct {
     max_total_output: u64 = 1024 * 1024 * 1024,
     /// Wall time for one top-level scan (MaxScanTime), in milliseconds.
     max_scan_time_ms: u64 = 120_000,
+    /// Largest decoder window or dictionary accepted (zstd, xz, LZMA). Windows over 1 MiB also
+    /// need a big-window budget token.
+    max_window: u64 = 8 * 1024 * 1024,
 };
 
 pub const Event = enum(u8) {
@@ -40,6 +43,10 @@ pub const Event = enum(u8) {
     scan_time,
     big_window_budget,
     verify_steps,
+    /// A decoder window (zstd frame window, LZMA dictionary) larger than `max_window`.
+    window_size,
+    /// The worker's scratch arena could not hold a child's working set.
+    memory,
 };
 
 /// Per-scan accounting. Lives in scratch; resetting it is O(1).
@@ -51,6 +58,8 @@ pub const Tracker = struct {
     depth: u8 = 0,
     /// Set bit per event raised during this scan.
     raised: std.EnumSet(Event) = .empty,
+    /// The most recent event, so a caller that got error.LimitReached can name it.
+    last: ?Event = null,
 
     pub fn init(limits: Limits) Tracker {
         return .{ .limits = limits };
@@ -63,11 +72,13 @@ pub const Tracker = struct {
     /// Record an event and report whether scanning should stop.
     fn raise(t: *Tracker, event: Event) error{LimitReached} {
         t.raised.insert(event);
+        t.last = event;
         return error.LimitReached;
     }
 
     pub fn note(t: *Tracker, event: Event) void {
         t.raised.insert(event);
+        t.last = event;
     }
 
     /// Account for `n` more scanned bytes.
