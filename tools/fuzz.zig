@@ -16,6 +16,9 @@ pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer if (gpa.deinit() == .leak) @panic("fuzz: leak");
 
+    var formats = try Formats.init(init.io);
+    defer formats.deinit();
+
     var cases: usize = 0;
     for (0..iterations) |i| {
         if (selected(only, "cvdContainer")) {
@@ -64,6 +67,9 @@ pub fn main(init: std.process.Init) !void {
         }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
+        // Format parsers and decoders (fmt/): one per iteration in rotation, or every target whose
+        // name contains the filter ("fmt.zip").
+        cases += formats.run(random, i, only);
     }
     std.debug.print("fuzz: {d} cases, seed {d}, ok\n", .{ cases, seed });
 }
@@ -654,3 +660,134 @@ fn multihashDiff(random: std.Random) void {
         }
     }
 }
+
+/// Format parsers and decoders: one target per format, taken in turn, each mutating that
+/// format's fixtures and scanning the result through the real dispatcher, positionally or as a
+/// stream. Limits are tight so a case stays cheap; the invariants are no crash, no hang, and
+/// every scratch byte released when the walk returns.
+const Formats = struct {
+    io: std.Io,
+    scratch: zav.engine.scratch.Scratch,
+    budget: zav.engine.budget.Budget,
+    spill: std.Io.Dir,
+    buf: [64 * 1024]u8 = undefined,
+
+    const fixtures = zav.fmt.fixtures;
+    const Target = struct { name: []const u8, inputs: []const []const u8 };
+    const targets = [_]Target{
+        .{ .name = "fmt.gzip", .inputs = vectors(&fixtures.gzip_vectors) },
+        .{ .name = "fmt.bzip2", .inputs = vectors(&fixtures.bzip2_vectors) },
+        .{ .name = "fmt.xz", .inputs = vectors(&fixtures.xz_vectors ++ fixtures.lzma_vectors) },
+        .{ .name = "fmt.zstd", .inputs = vectors(&fixtures.zstd_vectors) },
+        .{ .name = "fmt.bomb", .inputs = vectors(&fixtures.bomb_vectors) },
+    };
+
+    fn vectors(comptime vs: []const fixtures.Vector) []const []const u8 {
+        comptime var out: [vs.len][]const u8 = undefined;
+        inline for (vs, 0..) |v, i| out[i] = v.compressed;
+        const final = out;
+        return &final;
+    }
+
+    fn init(io: std.Io) !Formats {
+        return .{
+            .io = io,
+            .scratch = try .init(64 * 1024 * 1024),
+            .budget = .init(64 * 1024 * 1024),
+            .spill = try std.Io.Dir.cwd().createDirPathOpen(io, ".zig-cache/zav-fuzz", .{}),
+        };
+    }
+
+    fn deinit(f: *Formats) void {
+        f.spill.close(f.io);
+        f.scratch.deinit();
+    }
+
+    const Sink = struct {
+        bytes: u64 = 0,
+        fn visitor(s: *Sink) zav.engine.container.Visitor {
+            return .{ .ptr = s, .vtable = &.{ .enter = enter, .data = data, .leave = leave, .notice = notice } };
+        }
+        fn enter(_: *anyopaque, _: *const zav.engine.container.Object) error{Stop}!void {}
+        fn data(ptr: *anyopaque, _: *const zav.engine.container.Object, bytes: []const u8) error{Stop}!void {
+            const s: *Sink = @ptrCast(@alignCast(ptr));
+            s.bytes += bytes.len;
+        }
+        fn leave(_: *anyopaque, _: *const zav.engine.container.Object) void {}
+        fn notice(_: *anyopaque, _: zav.engine.container.Notice) void {}
+    };
+
+    fn run(f: *Formats, random: std.Random, i: usize, only: []const u8) usize {
+        if (only.len == 0) {
+            f.case(random, targets[i % targets.len]);
+            return 1;
+        }
+        var n: usize = 0;
+        for (targets) |t| if (std.mem.indexOf(u8, t.name, only) != null) {
+            f.case(random, t);
+            n += 1;
+        };
+        return n;
+    }
+
+    fn case(f: *Formats, random: std.Random, target: Target) void {
+        const original = target.inputs[random.uintLessThan(usize, target.inputs.len)];
+        const len = @min(original.len, f.buf.len);
+        @memcpy(f.buf[0..len], original[0..len]);
+        var input = f.buf[0..len];
+        mutateBytes(random, &input, f.buf.len);
+
+        var tracker = zav.engine.limits.Tracker.init(.{
+            .max_file_size = 1024 * 1024,
+            .max_scan_size = 8 * 1024 * 1024,
+            .max_total_output = 4 * 1024 * 1024,
+            .max_files = 200,
+            .max_scan_time_ms = 0,
+        });
+        var sink: Sink = .{};
+        var w: zav.engine.container.Walker = .{
+            .io = f.io,
+            .scratch = &f.scratch,
+            .tracker = &tracker,
+            .budget = &f.budget,
+            .spill_dir = f.spill,
+            .visitor = sink.visitor(),
+            .parse = zav.fmt.scan.parse,
+            .options = .{ .budget_wait_ms = 0 },
+        };
+        if (random.boolean()) {
+            w.scan(.{ .memory = input }, target.name) catch {};
+        } else {
+            var r: std.Io.Reader = .fixed(input);
+            w.scan(.{ .stream = .{ .reader = &r } }, target.name) catch {};
+        }
+        if (f.scratch.used() != 0) @panic("fuzz: scratch not released after a walk");
+        if (f.budget.used.load(.monotonic) != 0) @panic("fuzz: big-window token leaked");
+        f.scratch.reset();
+    }
+
+    /// Byte flips, a truncation, a duplicated or deleted span.
+    fn mutateBytes(random: std.Random, input: *[]u8, cap: usize) void {
+        const in = input.*;
+        if (in.len == 0) return;
+        switch (random.uintLessThan(u8, 4)) {
+            0 => for (0..1 + random.uintLessThan(usize, 8)) |_| {
+                in[random.uintLessThan(usize, in.len)] = random.int(u8);
+            },
+            1 => input.* = in[0..random.uintLessThan(usize, in.len + 1)],
+            2 => {
+                const at = random.uintLessThan(usize, in.len);
+                const n = @min(random.uintLessThan(usize, 64) + 1, in.len - at, cap - in.len);
+                std.mem.copyBackwards(u8, input.*.ptr[at + n .. in.len + n], in[at..]);
+                input.* = input.*.ptr[0 .. in.len + n];
+            },
+            else => {
+                const at = random.uintLessThan(usize, in.len);
+                const n = @min(random.uintLessThan(usize, 64) + 1, in.len - at);
+                std.mem.copyForwards(u8, in[at .. in.len - n], in[at + n ..]);
+                input.* = in[0 .. in.len - n];
+                if (input.*.len > 0) input.*[random.uintLessThan(usize, input.*.len)] ^= 1;
+            },
+        }
+    }
+};
