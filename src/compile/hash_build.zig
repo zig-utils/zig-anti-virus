@@ -18,6 +18,8 @@ pub const Built = struct {
     signature_count: u32 = 0,
     /// Rules dropped because an identical (algorithm, scope, size, digest) came first.
     duplicates: u64 = 0,
+    /// Signature ids of the `extra` names passed to `buildWithNames`, in the same order.
+    extra_sigs: []u32 = &.{},
 
     pub fn deinit(b: *Built) void {
         b.arena.deinit();
@@ -57,7 +59,19 @@ const Entry = struct {
     }
 };
 
+/// A signature that is not a hash rule (a body or logical signature) but shares the id space,
+/// the metadata records and the name pool.
+pub const ExtraName = struct {
+    name: []const u8,
+    flags: ir.Flags = .{},
+    source: ir.Source,
+};
+
 pub fn build(gpa: std.mem.Allocator, rules: []const ir.HashRule) !Built {
+    return buildWithNames(gpa, rules, &.{});
+}
+
+pub fn buildWithNames(gpa: std.mem.Allocator, rules: []const ir.HashRule, extra: []const ExtraName) !Built {
     var built: Built = .{ .arena = .init(gpa) };
     errdefer built.deinit();
     const arena = built.arena.allocator();
@@ -76,14 +90,19 @@ pub fn build(gpa: std.mem.Allocator, rules: []const ir.HashRule) !Built {
 
     var key_buf: std.ArrayList(u8) = .empty;
     defer key_buf.deinit(gpa);
-    for (rules, 0..) |rule, i| {
+    const extra_sigs = try arena.alloc(u32, extra.len);
+    for (0..rules.len + extra.len) |i| {
+        const name, const flags, const source = if (i < rules.len)
+            .{ rules[i].name, rules[i].flags, rules[i].source }
+        else
+            .{ extra[i - rules.len].name, extra[i - rules.len].flags, extra[i - rules.len].source };
         key_buf.clearRetainingCapacity();
-        try key_buf.append(gpa, @bitCast(rule.flags));
-        try key_buf.appendSlice(gpa, rule.name);
+        try key_buf.append(gpa, @bitCast(flags));
+        try key_buf.appendSlice(gpa, name);
         const gop = try sig_ids.getOrPut(gpa, try arena.dupe(u8, key_buf.items));
         if (!gop.found_existing) {
             gop.value_ptr.* = @intCast(meta.items.len);
-            const tokens = ir.NameTokens.parse(rule.name);
+            const tokens = ir.NameTokens.parse(name);
             const fam = try families.getOrPut(gpa, tokens.family);
             if (!fam.found_existing) {
                 fam.value_ptr.* = @intCast(pool.items.len);
@@ -92,14 +111,15 @@ pub fn build(gpa: std.mem.Allocator, rules: []const ir.HashRule) !Built {
             try meta.append(gpa, .{
                 .family_offset = fam.value_ptr.*,
                 .family_len = @intCast(tokens.family.len),
-                .flags = @bitCast(rule.flags),
-                .source = @backingInt(rule.source),
+                .flags = @bitCast(flags),
+                .source = @backingInt(source),
                 .number = tokens.number orelse hashidx.no_number,
                 .revision = tokens.revision orelse 0,
             });
         }
-        rule_sigs[i] = gop.value_ptr.*;
+        if (i < rules.len) rule_sigs[i] = gop.value_ptr.* else extra_sigs[i - rules.len] = gop.value_ptr.*;
     }
+    built.extra_sigs = extra_sigs;
     built.signature_count = @intCast(meta.items.len);
     built.sigmeta = try arena.dupe(u8, std.mem.sliceAsBytes(meta.items));
     built.name_pool = try arena.dupe(u8, pool.items);

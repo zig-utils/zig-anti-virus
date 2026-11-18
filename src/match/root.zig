@@ -2,7 +2,11 @@
 //! See docs/DESIGN.md for the design this module implements.
 
 pub const hashidx = @import("hashidx.zig");
+pub const prog = @import("prog.zig");
+pub const verify_vm = @import("verify_vm.zig");
 
 test {
     _ = hashidx;
+    _ = prog;
+    _ = verify_vm;
 }

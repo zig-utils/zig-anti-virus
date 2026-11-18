@@ -6,6 +6,7 @@ pub const ir = @import("ir.zig");
 pub const hashsig = @import("hashsig.zig");
 pub const hexsig = @import("hexsig.zig");
 pub const ndb = @import("ndb.zig");
+pub const prog_build = @import("prog_build.zig");
 pub const hash_build = @import("hash_build.zig");
 pub const filters = @import("filters.zig");
 pub const coverage = @import("coverage.zig");
@@ -19,6 +20,7 @@ test {
     _ = hashsig;
     _ = hexsig;
     _ = ndb;
+    _ = prog_build;
     _ = hash_build;
     _ = filters;
     _ = coverage;

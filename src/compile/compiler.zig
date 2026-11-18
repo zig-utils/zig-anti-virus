@@ -8,6 +8,10 @@ const std = @import("std");
 const Io = std.Io;
 const ir = @import("ir.zig");
 const hashsig = @import("hashsig.zig");
+const hexsig = @import("hexsig.zig");
+const ndb = @import("ndb.zig");
+const prog_build = @import("prog_build.zig");
+const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
 const hash_build = @import("hash_build.zig");
@@ -30,6 +34,7 @@ pub const Compiler = struct {
     /// Owns every source text; rules borrow from it.
     arena: std.heap.ArenaAllocator,
     rules: std.ArrayList(ir.HashRule) = .empty,
+    bodies: std.ArrayList(ir.BodyRule) = .empty,
     allow: std.ArrayList(ir.HashRule) = .empty,
     ignore_entries: std.ArrayList(filters.IgnoreEntry) = .empty,
     rejected: std.ArrayList(ir.Rejection) = .empty,
@@ -42,6 +47,7 @@ pub const Compiler = struct {
 
     pub fn deinit(c: *Compiler) void {
         c.rules.deinit(c.gpa);
+        c.bodies.deinit(c.gpa);
         c.allow.deinit(c.gpa);
         c.ignore_entries.deinit(c.gpa);
         c.rejected.deinit(c.gpa);
@@ -58,6 +64,8 @@ pub const Compiler = struct {
 
         if (hashsig.formatFor(ext)) |fmt| {
             try hashsig.parse(c.gpa, fmt, owned_name, owned, .{ .rules = &c.rules, .rejected = &c.rejected });
+        } else if (std.mem.eql(u8, ext, "ndb") or std.mem.eql(u8, ext, "ndu")) {
+            try ndb.parse(c.gpa, arena, owned_name, owned, ext[2] == 'u', .{ .rules = &c.bodies, .rejected = &c.rejected });
         } else if (filters.allowlistFormat(ext)) |fmt| {
             try hashsig.parse(c.gpa, fmt, owned_name, owned, .{ .rules = &c.allow, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "ign2")) {
@@ -132,6 +140,10 @@ pub const Compiler = struct {
     pub const Summary = struct {
         signatures: u32,
         hash_rules: u64,
+        /// Body signatures compiled into verify programs.
+        body_rules: u64,
+        /// Verify programs: one per variant after modifier expansion.
+        programs: u64,
         allowlist_rules: u64,
         duplicates: u64,
     };
@@ -154,8 +166,46 @@ pub const Compiler = struct {
             try c.coverage.include(c.gpa, @tagName(rule.source), 1);
         }
 
-        var built = try hash_build.build(c.gpa, kept.items);
+        // Body signatures: filter, expand modifiers into variants, and name them in the shared
+        // signature id space.
+        const arena = c.arena.allocator();
+        var kept_bodies: std.ArrayList(ir.BodyRule) = .empty;
+        defer kept_bodies.deinit(c.gpa);
+        var body_variants: std.ArrayList([]hexsig.Variant) = .empty;
+        defer body_variants.deinit(c.gpa);
+        var names: std.ArrayList(hash_build.ExtraName) = .empty;
+        defer names.deinit(c.gpa);
+        for (c.bodies.items) |*rule| {
+            if (filters.skipReasonFor(rule.name, rule.line, rule.flevel_min, rule.flevel_max, &ignore, filters.engine_flevel)) |reason| {
+                try c.coverage.skip(c.gpa, @tagName(rule.source), reason);
+                continue;
+            }
+            const variants = hexsig.expand(arena, rule.subsig.pattern, rule.subsig.mods) catch |err| {
+                try c.coverage.skip(c.gpa, @tagName(rule.source), hexsig.reasonOf(err));
+                continue;
+            };
+            try kept_bodies.append(c.gpa, rule.*);
+            try body_variants.append(c.gpa, variants);
+            try names.append(c.gpa, .{ .name = rule.name, .flags = rule.flags, .source = rule.source });
+            try c.coverage.include(c.gpa, @tagName(rule.source), 1);
+        }
+
+        var built = try hash_build.buildWithNames(c.gpa, kept.items, names.items);
         defer built.deinit();
+
+        var inputs: std.ArrayList(prog_build.Input) = .empty;
+        defer inputs.deinit(c.gpa);
+        for (kept_bodies.items, body_variants.items, built.extra_sigs) |rule, variants, sig| {
+            for (variants) |v| {
+                var flags: u8 = 0;
+                if (v.folded) flags |= prog.flag_folded;
+                if (v.wide) flags |= prog.flag_wide;
+                if (rule.subsig.mods.fullword) flags |= prog.flag_fullword;
+                try inputs.append(c.gpa, .{ .pattern = v.pattern, .offset = rule.subsig.offset, .target = rule.target, .sig = sig, .flags = flags });
+            }
+        }
+        const programs = try prog_build.build(c.gpa, inputs.items);
+        defer c.gpa.free(programs);
         var allow = try hash_build.build(c.gpa, c.allow.items);
         defer allow.deinit();
 
@@ -171,6 +221,7 @@ pub const Compiler = struct {
             try sections.append(c.gpa, .{ .kind = .fp_tables, .variant = @intCast(t), .bytes = bytes });
             try sections.append(c.gpa, .{ .kind = .fp_tables, .variant = fp_cold_variant_offset + @as(u16, @intCast(t)), .bytes = allow.cold[t].? });
         };
+        if (inputs.items.len > 0) try sections.append(c.gpa, .{ .kind = .subsig_prog, .bytes = programs });
         try sections.append(c.gpa, .{ .kind = .coverage_report, .bytes = report.written() });
 
         var opts = options;
@@ -180,6 +231,8 @@ pub const Compiler = struct {
         return .{
             .signatures = built.signature_count,
             .hash_rules = kept.items.len,
+            .body_rules = kept_bodies.items.len,
+            .programs = inputs.items.len,
             .allowlist_rules = c.allow.items.len,
             .duplicates = built.duplicates,
         };
@@ -210,17 +263,24 @@ test "compile files and a container, filter, and write a database" {
     try c.addFile("local.hdb", "00112233445566778899aabbccddeeff:10:Local.Ignored-1-0\nbad line\n");
     try c.addFile("local.ign2", "Local.Ignored-1-0\n");
     try c.addFile("local.fp", "44d88612fea8a8f36de82e1278abb02f:68:Allow.Eicar\n");
-    try c.addFile("main.ndb", "Eicar:0:*:58354f\n");
+    try c.addFile("main.ndb", "Eicar:0:*:58354f\nBroken:0:*:58(35\n");
+    try c.addFile("main.pdb", "R:example.com\n");
     const summary = try c.write(io, tmp.dir, "out.zavdb", .{ .db_version = 1 });
     try std.testing.expectEqual(@as(u64, 2), summary.hash_rules); // two from the container
     try std.testing.expectEqual(@as(u64, 1), summary.allowlist_rules);
+    try std.testing.expectEqual(@as(u64, 1), summary.body_rules);
+    try std.testing.expectEqual(@as(u64, 1), summary.programs);
 
     const opened = try db.reader.open(io, tmp.dir, "out.zavdb", .{ .allow_unsigned = true });
     defer opened.close();
     const report = opened.section(.coverage_report, 0).?;
     try std.testing.expect(std.mem.indexOf(u8, report, "hdb: 1 skipped (ignored)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "local.hdb: 1 skipped (field_count)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "main.ndb: 1 skipped (unsupported_database)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "ndb: 1 included") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "main.ndb: 1 skipped (hex_bad_alternation)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "main.pdb: 1 skipped (unsupported_database)") != null);
+    const progs = try prog.Programs.init(opened.section(.subsig_prog, 0).?);
+    try std.testing.expectEqual(@as(usize, 1), progs.count());
 
     // The ignored signature is not in the database; the container's EICAR is.
     const t = hashidx.tableVariant(.md5, .file);

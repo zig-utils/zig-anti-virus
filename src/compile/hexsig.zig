@@ -468,6 +468,8 @@ pub const Variant = struct {
     pattern: ir.Pattern,
     /// Some ops still compare case-insensitively: the subsig belongs in a folded partition.
     folded: bool = false,
+    /// The `::w` form: literal bytes are 00-interleaved.
+    wide: bool = false,
 };
 
 /// Most variants one subsignature expands into.
@@ -477,22 +479,36 @@ pub const max_variants: usize = 16;
 /// forms), nocase becomes up to 16 case variants or folded compares, and small literal
 /// alternations become literal variants while the total stays at or under `max_variants`.
 pub fn expand(arena: Allocator, pattern: ir.Pattern, mods: ir.Modifiers) Error![]Variant {
+    // `wide[i]` says whether `list[i]` is the wide form.
     var list: std.ArrayList(ir.Pattern) = .empty;
+    var wide: std.ArrayList(bool) = .empty;
     if (mods.wide) {
-        if (mods.ascii) try list.append(arena, pattern);
+        if (mods.ascii) {
+            try list.append(arena, pattern);
+            try wide.append(arena, false);
+        }
         try list.append(arena, try widen(arena, pattern));
-    } else try list.append(arena, pattern);
+        try wide.append(arena, true);
+    } else {
+        try list.append(arena, pattern);
+        try wide.append(arena, false);
+    }
 
     var folded = false;
     if (mods.nocase) {
         const k = alphaLits(pattern);
         if (k <= 4 and (@as(usize, 1) << @intCast(k)) * list.items.len <= max_variants) {
             var cased: std.ArrayList(ir.Pattern) = .empty;
-            for (list.items) |p| {
+            var cased_wide: std.ArrayList(bool) = .empty;
+            for (list.items, wide.items) |p, w| {
                 var bits: usize = 0;
-                while (bits < (@as(usize, 1) << @intCast(k))) : (bits += 1) try cased.append(arena, try caseVariant(arena, p, bits));
+                while (bits < (@as(usize, 1) << @intCast(k))) : (bits += 1) {
+                    try cased.append(arena, try caseVariant(arena, p, bits));
+                    try cased_wide.append(arena, w);
+                }
             }
             list = cased;
+            wide = cased_wide;
         } else {
             for (list.items) |*p| p.* = try fold(arena, p.*);
         }
@@ -504,24 +520,31 @@ pub fn expand(arena: Allocator, pattern: ir.Pattern, mods: ir.Modifiers) Error![
     while (changed) {
         changed = false;
         var next: std.ArrayList(ir.Pattern) = .empty;
-        for (list.items, 0..) |p, i| {
+        var next_wide: std.ArrayList(bool) = .empty;
+        for (list.items, wide.items, 0..) |p, w, i| {
             const idx = expandableAlt(p) orelse {
                 try next.append(arena, p);
+                try next_wide.append(arena, w);
                 continue;
             };
             const n = p.ops[idx].len;
             if (next.items.len + (list.items.len - i - 1) + n > max_variants) {
                 try next.append(arena, p);
+                try next_wide.append(arena, w);
                 continue;
             }
-            for (0..n) |j| try next.append(arena, try pickAlternative(arena, p, idx, j));
+            for (0..n) |j| {
+                try next.append(arena, try pickAlternative(arena, p, idx, j));
+                try next_wide.append(arena, w);
+            }
             changed = true;
         }
         list = next;
+        wide = next_wide;
     }
 
     const out = try arena.alloc(Variant, list.items.len);
-    for (list.items, out) |p, *v| v.* = .{ .pattern = p, .folded = folded };
+    for (list.items, wide.items, out) |p, w, *v| v.* = .{ .pattern = p, .folded = folded, .wide = w };
     return out;
 }
 
@@ -874,6 +897,7 @@ test "wide interleaves literal bytes with zeros, not wildcards" {
     try testing.expectEqualStrings("4142??44!(45|46){2}47", texts.items[1]);
     try testing.expectEqualStrings("41004200??4300!(45|46)00{2}4700", texts.items[2]);
     try testing.expectEqualStrings("41004200??4400!(45|46)00{2}4700", texts.items[3]);
+    try testing.expect(!v[1].wide and v[2].wide and v[3].wide);
     // Multi-byte negations cannot be widened.
     try testing.expectError(error.BadModifier, expand(a, try parsed(&arena, "41!(4243|4445)"), .{ .wide = true }));
 }
