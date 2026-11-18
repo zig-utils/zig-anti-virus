@@ -115,6 +115,9 @@ pub const Decoder = struct {
     stream_crc: u32 = 0,
     in_block: bool = false,
     done: bool = false,
+    /// NSIS's variant: no stream header, a block starts with the byte 0x31 and the stream ends
+    /// with 0x17 (the first bytes of the two magics), and there are no CRCs or randomised bit.
+    nsis: bool = false,
     err: ?Error = null,
     interface: Io.Reader,
 
@@ -130,6 +133,19 @@ pub const Decoder = struct {
             .tt = tt,
             .tables = tables,
             .block_max = block_max,
+            .interface = .{ .vtable = @import("../engine/container.zig").fillVTable(Decoder), .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    /// The NSIS variant (see `nsis`); its blocks are at most 900k, so `tt` holds 900,000.
+    pub fn initNsis(in: *Io.Reader, tt: []u32, tables: *Tables, buffer: []u8) Error!Decoder {
+        if (tt.len < 900_000) return error.BadHeader;
+        return .{
+            .in = in,
+            .tt = tt,
+            .tables = tables,
+            .block_max = 900_000,
+            .nsis = true,
             .interface = .{ .vtable = @import("../engine/container.zig").fillVTable(Decoder), .buffer = buffer, .seek = 0, .end = 0 },
         };
     }
@@ -221,6 +237,7 @@ pub const Decoder = struct {
             // A block ending exactly after four equal bytes has no count byte.
             d.run = 0;
         }
+        if (d.nsis) return;
         const got = d.crc.final();
         if (got != d.want_crc) return error.BadCrc;
         d.stream_crc = ((d.stream_crc << 1) | (d.stream_crc >> 31)) ^ got;
@@ -228,6 +245,12 @@ pub const Decoder = struct {
 
     /// Read the next block (true) or the end of the stream (false). Concatenated streams continue.
     fn nextBlock(d: *Decoder) Error!bool {
+        if (d.nsis) {
+            const m = try d.take(8);
+            if (m == 0x17) return false;
+            if (m != 0x31) return error.BadBlock;
+            return d.blockBody();
+        }
         while (true) {
             const magic: u48 = @intCast((@as(u64, try d.take(24)) << 24) | try d.take(24));
             if (magic == block_magic) break;
@@ -250,6 +273,11 @@ pub const Decoder = struct {
         }
         d.want_crc = try d.take(32);
         if (try d.bit() == 1) return error.Randomised;
+        return d.blockBody();
+    }
+
+    /// From the block's origPtr on: read the block and invert the BWT.
+    fn blockBody(d: *Decoder) Error!bool {
         const orig_ptr = try d.take(24);
         const n = try d.readBlock();
         if (orig_ptr >= n) return error.BadBlock;
@@ -348,6 +376,7 @@ pub const Decoder = struct {
         }
         const in = d.in;
         const tt = d.tt;
+        var nsis_pad: u8 = 0;
         while (true) {
             if (group_left == 0) {
                 if (sel >= n_selectors) return error.BadBlock;
@@ -357,7 +386,8 @@ pub const Decoder = struct {
             }
             group_left -= 1;
             // Refill to at least 20 bits (the longest code). A valid block is followed by at
-            // least the 80-bit end-of-stream marker, so running dry here means truncation.
+            // least the 80-bit end-of-stream marker, so running dry here means truncation;
+            // NSIS's marker is a single byte, so there the last codes may need zero padding.
             if (nbits < max_code_len) {
                 if (in.end - in.seek >= 8) {
                     const word = std.mem.readInt(u64, in.buffer[in.seek..][0..8], .big);
@@ -366,7 +396,11 @@ pub const Decoder = struct {
                     in.seek += take_n;
                     nbits += take_n * 8;
                 } else while (nbits < max_code_len) {
-                    const b = in.takeByte() catch |e| return e;
+                    const b = in.takeByte() catch |e| blk: {
+                        if (e != error.EndOfStream or !d.nsis or nsis_pad == 3) return e;
+                        nsis_pad += 1;
+                        break :blk 0;
+                    };
                     bits = (bits << 8) | b;
                     nbits += 8;
                 }

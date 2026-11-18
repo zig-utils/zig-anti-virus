@@ -9,6 +9,8 @@ export interface Member { path: string, data: Uint8Array }
 export interface Helpers {
   archive: (name: string, bytes: Uint8Array, members: Member[], malformed?: boolean) => void
   exe: (name: string, bytes: Uint8Array, o: { entry: number | null, sections: number, members?: Member[], malformed?: boolean }) => void
+  /** A PE (make-fixtures.ts buildPe) with `overlay` appended; its entry offset is 0x210. */
+  pe: (overlay: Uint8Array) => Uint8Array
   concat: (...parts: Uint8Array[]) => Uint8Array
   plain: (len: number, s: number) => Uint8Array
   crc32: (data: Uint8Array) => number
@@ -911,6 +913,96 @@ export function dmgImage(h: Helpers, partitions: { name: string, chunks: DmgChun
   return { image: h.concat(...fork, o.noXml ? new Uint8Array(0) : plist, koly), contents }
 }
 
+// ---------------------------------------------------------------------------------------------
+// NSIS installers (the format in NSIS's fileform.h): a firstheader (flags, 0xDEADBEEF,
+// "NullsoftInst", header length, length of everything that follows) in the stub's overlay, then
+// either one compressed stream of length-prefixed items (solid) or length-prefixed blocks, each
+// compressed on its own (bit 31 of the length set) or stored. Compressors: deflate without a zlib
+// header, LZMA (five property bytes, then the stream) and NSIS's bzip2.
+
+/** Bits of a byte array, most significant first. */
+function bitAt(b: Uint8Array, i: number): number {
+  return (b[i >> 3] >> (7 - (i & 7))) & 1
+}
+
+/**
+ * NSIS's bzip2 from a standard stream: the stream header goes, each block's 48-bit magic, CRC and
+ * randomised bit become the single byte 0x31, and the end-of-stream magic and CRC become 0x17.
+ * Block boundaries are found by searching the bit stream for the magics, as bzip2recover does.
+ */
+export function nsisBzip2(std: Uint8Array): Uint8Array {
+  const total = std.length * 8
+  const marks: { at: number, end: boolean }[] = []
+  const blockMagic = 0x314159265359n
+  const endMagic = 0x177245385090n
+  let window = 0n
+  for (let i = 32; i < total; i++) {
+    window = ((window << 1n) | BigInt(bitAt(std, i))) & 0xffffffffffffn
+    if (i - 32 >= 47) {
+      if (window === blockMagic) marks.push({ at: i - 47, end: false })
+      else if (window === endMagic) marks.push({ at: i - 47, end: true })
+    }
+  }
+  const out: number[] = []
+  let cur = 0
+  let n = 0
+  const put = (bit: number) => {
+    cur = (cur << 1) | bit
+    if (++n === 8) {
+      out.push(cur)
+      cur = 0
+      n = 0
+    }
+  }
+  for (let k = 0; k < marks.length; k++) {
+    const m = marks[k]
+    if (m.end) {
+      for (let b = 7; b >= 0; b--) put((0x17 >> b) & 1)
+      break
+    }
+    for (let b = 7; b >= 0; b--) put((0x31 >> b) & 1)
+    const from = m.at + 48 + 32 + 1
+    const to = marks[k + 1].at
+    for (let i = from; i < to; i++) put(bitAt(std, i))
+  }
+  while (n !== 0) put(0)
+  return new Uint8Array(out)
+}
+
+type NsisMethod = 'deflate' | 'lzma' | 'bzip2'
+
+function nsisCompress(h: Helpers, method: NsisMethod, data: Uint8Array): Uint8Array {
+  switch (method) {
+    case 'deflate': return h.deflateRaw(data)
+    case 'bzip2': return nsisBzip2(h.run('bzip2', ['-9', '-c'], data))
+    case 'lzma': {
+      // An "alone" stream without its 8-byte size: properties, then the stream (end marker).
+      const alone = h.py('sys.stdout.buffer.write(lzma.compress(data, format=lzma.FORMAT_ALONE, filters=[{"id": lzma.FILTER_LZMA1, "dict_size": 1 << 20, "lc": 3, "lp": 0, "pb": 2}]))', data)
+      return h.concat(alone.slice(0, 5), alone.slice(13))
+    }
+  }
+}
+
+export function nsisData(h: Helpers, method: NsisMethod, solid: boolean, header: Uint8Array, files: Uint8Array[], o: { stored?: number[], noCrc?: boolean, truncate?: number } = {}): Uint8Array {
+  const items = [header, ...files]
+  let body: Uint8Array
+  if (solid) {
+    body = nsisCompress(h, method, h.concat(...items.flatMap(it => [new Uint8Array(le32(it.length)), it])))
+  } else {
+    body = h.concat(...items.map((it, i) => {
+      if (o.stored?.includes(i)) return h.concat(new Uint8Array(le32(it.length)), it)
+      const c = nsisCompress(h, method, it)
+      return h.concat(new Uint8Array(le32((c.length | 0x80000000) >>> 0)), c)
+    }))
+  }
+  const flags = o.noCrc ? 4 : 0
+  const total = 28 + body.length + (o.noCrc ? 0 : 4)
+  const fh = new Uint8Array([...le32(flags), ...le32(0xdeadbeef), ...enc.encode('NullsoftInst'), ...le32(header.length), ...le32(total)])
+  let out = h.concat(fh, body)
+  if (!o.noCrc) out = h.concat(out, new Uint8Array(le32(h.crc32(out))))
+  return o.truncate ? out.slice(0, o.truncate) : out
+}
+
 /** Apple's LZFSE encoder (macOS compression_tool): the reference for the lzfse vectors. */
 export function lzfse(h: Helpers, data: Uint8Array): Uint8Array {
   return h.run('compression_tool', ['-encode', '-a', 'lzfse'], data)
@@ -1020,5 +1112,20 @@ export function build(h: Helpers): void {
   archive('no-xml.dmg', dmgImage(h, [{ name: 'x', chunks: [{ kind: 'raw', sectors: 1, data: evil }] }], { noXml: true }).image, [])
   // 64 MiB of zeros in 64 zlib chunks.
   archive('zeros-bomb.dmg', dmgImage(h, [{ name: 'zeros', chunks: Array.from({ length: 64 }, () => ({ kind: 'zlib', sectors: 2048 })) }]).image, [])
+  // NSIS installers: a PE stub with the installer data as its overlay.
+  const nsisHeader = h.concat(enc.encode('NSIS install script header '), h.plain(2000, 61))
+  const nsisFiles = [fileB, evil, h.plain(70_000, 63)]
+  const nsisMembers: Member[] = [
+    { path: 'overlay/header', data: nsisHeader },
+    ...nsisFiles.map((f, i) => ({ path: `overlay/data/${i + 1}`, data: f })),
+  ]
+  for (const method of ['deflate', 'lzma', 'bzip2'] as NsisMethod[]) {
+    for (const solid of [false, true]) {
+      const data = nsisData(h, method, solid, nsisHeader, nsisFiles, solid ? {} : { stored: [1] })
+      h.exe(`nsis-${method}${solid ? '-solid' : ''}.exe`, h.pe(data), { entry: 0x210, sections: 3, members: [{ path: 'overlay', data }, ...nsisMembers] })
+    }
+  }
+  const cut = nsisData(h, 'deflate', false, nsisHeader, nsisFiles, { noCrc: true })
+  h.exe('nsis-truncated.exe', h.pe(cut.slice(0, cut.length - 3000)), { entry: 0x210, sections: 3, malformed: true, members: [{ path: 'overlay', data: cut.slice(0, cut.length - 3000) }] })
   archive('dag-bomb.iso', isoImage([{ path: 'x.txt', data: fileA }], { joliet: true, dagDepth: 24 }), [])
 }

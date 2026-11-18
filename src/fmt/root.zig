@@ -25,6 +25,7 @@ pub const cab = @import("cab.zig");
 pub const lzx = @import("lzx.zig");
 pub const lzfse = @import("lzfse.zig");
 pub const dmg = @import("dmg.zig");
+pub const nsis = @import("nsis.zig");
 pub const ooxml = @import("ooxml.zig");
 pub const vba = @import("vba.zig");
 pub const html_norm = @import("html_norm.zig");
@@ -57,6 +58,7 @@ test {
     _ = lzx;
     _ = lzfse;
     _ = dmg;
+    _ = nsis;
     _ = ooxml;
     _ = vba;
     _ = html_norm;

@@ -1026,6 +1026,7 @@ const Formats = struct {
         .{ .name = "fmt.iso9660", .inputs = archives(".iso") },
         .{ .name = "fmt.cab", .inputs = archives(".cab") },
         .{ .name = "fmt.dmg", .inputs = archives(".dmg") },
+        .{ .name = "fmt.nsis", .inputs = exes("nsis-") },
         .{ .name = "fmt.html", .inputs = &.{
             "<!DOCTYPE html><HTML><head><title>T</title><script>var a = '<b>' + 1;</script></head>" ++
                 "<body onload=\"go()\" class='x y'>Hello &amp; &#x41;&#65;&nbsp;<!-- c --> <a href=x>l</a></body></HTML>",

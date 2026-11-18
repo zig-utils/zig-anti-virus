@@ -28,6 +28,8 @@ pub const Format = enum(u8) {
     cab,
     /// Recognised by its trailer (dmg.hasTrailer), positional sources only.
     dmg,
+    /// NSIS installer data (the firstheader), usually a PE overlay.
+    nsis,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
@@ -40,7 +42,7 @@ pub const Format = enum(u8) {
     /// Formats parsed with positional reads (central directories, section tables).
     pub fn needsRandomAccess(f: Format) bool {
         return switch (f) {
-            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg => true,
+            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis => true,
             else => false,
         };
     }
@@ -72,6 +74,7 @@ pub fn detect(head: []const u8) Format {
         }
     }
     if (std.mem.startsWith(u8, head, "MSCF\x00\x00\x00\x00")) return .cab;
+    if (head.len >= 20 and std.mem.eql(u8, head[4..20], "\xef\xbe\xad\xdeNullsoftInst")) return .nsis;
     if (std.mem.startsWith(u8, head, "MZ")) return .pe;
     if (isCpio(head)) return .cpio;
     if (isTar(head)) return .tar;
