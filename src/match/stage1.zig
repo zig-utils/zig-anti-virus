@@ -70,7 +70,7 @@ fn loop(comptime cfg: Config, part: *const pf.Partition, idx: [5]u8, data: []con
     var n: usize = 0;
     var i = start;
     // An unaligned start (a resumed scalar run): one position at a time up to a lane boundary.
-    while (i % lanes != 0 and i < data.len and n + 5 <= pf.ring_len) : (i += 1) n = scalarAt(cfg, idx, seed, .{ b8, b4, b1, b3, b2 }, data, i, ring, n);
+    while (i % lanes != 0 and i < data.len and n + 5 <= pf.ring_len) : (i += 1) n = scalarAt(cfg, idx, seed, .{ b8, b4, b1, b3, b2 }, gate, data, i, ring, n);
     if (i % lanes == 0) {
         while (i + 32 <= data.len and n + per_step <= pf.ring_len) : (i += lanes) {
             const v: @Vector(32, u8) = data[i..][0..32].*;
@@ -124,19 +124,22 @@ fn loop(comptime cfg: Config, part: *const pf.Partition, idx: [5]u8, data: []con
         if (i + 32 <= data.len) return .{ n, i };
     }
     // The last positions: one at a time.
-    while (i < data.len and n + 5 <= pf.ring_len) : (i += 1) n = scalarAt(cfg, idx, seed, .{ b8, b4, b1, b3, b2 }, data, i, ring, n);
+    while (i < data.len and n + 5 <= pf.ring_len) : (i += 1) n = scalarAt(cfg, idx, seed, .{ b8, b4, b1, b3, b2 }, gate, data, i, ring, n);
     return .{ n, i };
 }
 
-inline fn scalarAt(comptime cfg: Config, idx: [5]u8, seed: u32, blocks: [5][]const sbbf.Block, data: []const u8, i: usize, ring: *[pf.ring_len]pf.Candidate, n_in: usize) usize {
+/// One position, the way the vector loop treats it: the sampled filters directly, the
+/// stride-one ones only when the gate names them.
+inline fn scalarAt(comptime cfg: Config, idx: [5]u8, seed: u32, blocks: [5][]const sbbf.Block, gate: []const u8, data: []const u8, i: usize, ring: *[pf.ring_len]pf.Candidate, n_in: usize) usize {
     var n = n_in;
     const pos: u56 = @intCast(i);
-    if (cfg.q2 and i + 2 <= data.len) {
+    const flags: u8 = if ((cfg.s1 or cfg.q3 or cfg.q2) and i + 2 <= data.len) gate[std.mem.readInt(u16, data[i..][0..2], .little)] else 0;
+    if (cfg.q2 and flags & pf.gate_q2 != 0) {
         const g = @as(u32, data[i]) | @as(u32, data[i + 1]) << 8;
         ring[n] = .{ .pos = pos, .filter = idx[4] };
         n += @intFromBool(testBlock(blocks[4], sbbf.hash(g, seed)));
     }
-    if (cfg.q3 and i + 3 <= data.len) {
+    if (cfg.q3 and flags & pf.gate_q3 != 0 and i + 3 <= data.len) {
         const g = @as(u32, data[i]) | @as(u32, data[i + 1]) << 8 | @as(u32, data[i + 2]) << 16;
         ring[n] = .{ .pos = pos, .filter = idx[3] };
         n += @intFromBool(testBlock(blocks[3], sbbf.hash(g, seed)));
@@ -151,7 +154,7 @@ inline fn scalarAt(comptime cfg: Config, idx: [5]u8, seed: u32, blocks: [5][]con
         ring[n] = .{ .pos = pos, .filter = idx[1] };
         n += @intFromBool(testBlock(blocks[1], h));
     }
-    if (cfg.s1) {
+    if (cfg.s1 and flags & pf.gate_s1 != 0) {
         ring[n] = .{ .pos = pos, .filter = idx[2] };
         n += @intFromBool(testBlock(blocks[2], h));
     }

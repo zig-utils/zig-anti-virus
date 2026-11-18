@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
         } else try dirs.append(arena, args[i]);
     }
     var corpus: Corpus = .{};
-    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
+    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
 
     if (std.mem.eql(u8, cmd, "census")) return census(database, index);
     if (std.mem.eql(u8, cmd, "scan")) return scan(gpa, io, index, corpus, if (reference) .reference else .auto);
@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "grams")) return grams(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "kernel")) return kernelDiff(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "planted")) return planted(gpa, io, index, limit);
+    if (std.mem.eql(u8, cmd, "worst")) return worst(gpa, io, index);
     if (std.mem.eql(u8, cmd, "vmprog")) {
         // vmprog <db> <prog> <file>: verify one program at every anchor occurrence, with one
         // memo for the whole file, and report steps and time.
@@ -498,6 +499,24 @@ fn kernelDiff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, cor
         std.mem.sort(pf.Candidate, got.items, {}, lt);
         if (!std.mem.eql(u64, @ptrCast(want.items), @ptrCast(got.items))) {
             std.debug.print("MISMATCH {s}{s}: kernel {d}, reference {d}\n", .{ p, if (random_round) " (random)" else "", got.items.len, want.items.len });
+            var x: usize = 0;
+            var y: usize = 0;
+            while (x < got.items.len or y < want.items.len) {
+                const g: u64 = if (x < got.items.len) @bitCast(got.items[x]) else std.math.maxInt(u64);
+                const h: u64 = if (y < want.items.len) @bitCast(want.items[y]) else std.math.maxInt(u64);
+                if (g == h) {
+                    x += 1;
+                    y += 1;
+                } else if (g < h) {
+                    const c = got.items[x];
+                    std.debug.print("  kernel only: pos {d} filter {d} (stride {d} q {d}) len {d}\n", .{ c.pos, c.filter, part.filters[c.filter].stride, part.filters[c.filter].q, d.len });
+                    x += 1;
+                } else {
+                    const c = want.items[y];
+                    std.debug.print("  reference only: pos {d} filter {d} (stride {d} q {d}) len {d}\n", .{ c.pos, c.filter, part.filters[c.filter].stride, part.filters[c.filter].q, d.len });
+                    y += 1;
+                }
+            }
             return error.KernelMismatch;
         }
         bytes += d.len;
@@ -524,6 +543,7 @@ fn planted(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, limit:
     var inconclusive: usize = 0;
     var detected_prefilter_only_limited: usize = 0;
     var mismatches: usize = 0;
+    var other_first: usize = 0;
     const n = @min(limit, table.records.len);
     const step = @max(1, table.records.len / n);
     var rec_i: usize = 0;
@@ -564,16 +584,129 @@ fn planted(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, limit:
             if (a == .infected) detected_prefilter_only_limited += 1;
             continue;
         }
-        const same = std.meta.activeTag(a) == std.meta.activeTag(b) and (a != .infected or a.infected.sig == b.infected.sig);
-        if (!same) {
+        // Both detecting, but another signature first: a planted file can satisfy several
+        // signatures of one family, and the two paths find matches in a different order.
+        if (a == .infected and b == .infected and a.infected.sig != b.infected.sig) {
+            other_first += 1;
+            continue;
+        }
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
             std.debug.print("MISMATCH record {d}: prefiltered {any}, reference {any}\n", .{ rec_i, a, b });
             mismatches += 1;
             continue;
         }
         if (a == .infected) detected_both += 1;
     }
-    std.debug.print("{d} logical signatures planted ({d} with deferred subsigs): {d} mismatches, {d} detected by both, {d} where the reference ran out of logical state ({d} of them detected by the prefiltered path)\n", .{ tested, deferred_rules, mismatches, detected_both, inconclusive, detected_prefilter_only_limited });
+    std.debug.print("{d} logical signatures planted ({d} with deferred subsigs): {d} mismatches, {d} detected by both ({d} reporting another signature of the file first), {d} where the reference ran out of logical state ({d} of them detected by the prefiltered path)\n", .{ tested, deferred_rules, mismatches, detected_both + other_first, other_first, inconclusive, detected_prefilter_only_limited });
     if (mismatches > 0) return error.Mismatch;
+}
+
+/// E4: worst-case inputs built from the database itself (so they are never committed; this is
+/// their generator), 1 MiB each, scanned with the default budgets: time and verify steps per
+/// MB, and the verdict (a budget that runs out must say so).
+fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
+    const progs = index.programs.?;
+    const w = try Worker.init(gpa, &index);
+    var prng = std.Random.DefaultPrng.init(9);
+    const r = prng.random();
+    const size = 1 << 20;
+    const Kind = enum { anchors, unbounded, subsigs, zeros_opcodes };
+    for (std.enums.values(Kind)) |kind| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        var i: usize = 0;
+        var used: usize = 0;
+        while (buf.items.len < size) : (i = (i + 7919) % progs.count()) {
+            const p = progs.get(i);
+            if (p.header.off_kind != .any or p.header.anchor_op == prog.no_anchor) continue;
+            const ldb = p.header.flags & prog.flag_ldb != 0;
+            switch (kind) {
+                // Every program's anchor literal alone, back to back: the most candidates
+                // that all fail in the verifier.
+                .anchors => {
+                    if (p.header.target > 1) continue;
+                    const lit = p.pattern.bytes(p.pattern.ops[p.header.anchor_op]);
+                    if (lit.len < 5) continue;
+                    // The last byte changed: the atom still fires, the verifier fails.
+                    try buf.appendSlice(gpa, lit[0 .. lit.len - 1]);
+                    try buf.append(gpa, lit[lit.len - 1] ^ 0x55);
+                },
+                // Programs with an unbounded gap: everything but their last part, repeated,
+                // so each candidate searches to the end of the data.
+                .unbounded => {
+                    if (p.header.part_count < 2 or p.header.target > 1) continue;
+                    var part: usize = 0;
+                    var unbounded = false;
+                    for (p.pattern.ops) |o| if (o.code == .part_end and o.b == zav.compile.ir.unbounded) {
+                        unbounded = true;
+                    };
+                    if (!unbounded) continue;
+                    // Every part but the last.
+                    var last_end: usize = 0;
+                    for (p.pattern.ops, 0..) |o, k| if (o.code == .part_end) {
+                        last_end = k;
+                        part += 1;
+                    };
+                    const cut: prog.Program = .{ .header = p.header, .pattern = .{ .ops = p.pattern.ops[0..last_end], .data = p.pattern.data } };
+                    try sample(gpa, &buf, cut, r);
+                },
+                // One subsig of many logical signatures, complete: every one touches state.
+                .subsigs => {
+                    if (!ldb or p.header.flags & prog.flag_deferred != 0 or p.header.target > 1) continue;
+                    try sample(gpa, &buf, p, r);
+                    // The last byte changed, so the subsig is verified and fails at its end.
+                    buf.items[buf.items.len - 1] ^= 0x55;
+                },
+                // Zero padding and the short opcodes the tier-D body signatures start with.
+                .zeros_opcodes => {
+                    for (0..64) |_| try buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0, 0xe8, 0x01, 0, 0, 0, 0x86, 0x01, 0x66, 0x88, 0x01, 0xff, 0xe9, 0x68, 0, 0, 0, 0, 0xff, 0x25 });
+                    used += 1;
+                    if (used > 1000) break;
+                },
+            }
+        }
+        const data = buf.items[0..@min(buf.items.len, size)];
+        // Break every whole match the pieces happen to make, so the scan runs to the end:
+        // overwrite each detection's bytes with noise until the file is clean.
+        var broken: usize = 0;
+        while (broken < 2000) : (broken += 1) {
+            w.state.reset();
+            var budget: vm.Budget = .{};
+            var tracker = zav.engine.limits.Tracker.init(.{});
+            const v = try bodyscan.scanBufferScratch(&index, data, .{ .info = .{ .size = data.len }, .target = 1 }, &budget, &tracker, &w.state, .auto, null, w.scan);
+            if (v != .infected) break;
+            const d = v.infected;
+            const lo = d.start -| 4;
+            const hi = @min(data.len, @max(d.end, d.start + 1) + 4);
+            r.bytes(data[lo..hi]);
+        }
+        var best: u64 = std.math.maxInt(u64);
+        var steps: u64 = 0;
+        var verdict: bodyscan.Verdict = .clean;
+        var stats: pf.Stats = .{};
+        for (0..3) |_| {
+            w.state.reset();
+            var budget: vm.Budget = .{};
+            var tracker = zav.engine.limits.Tracker.init(.{});
+            stats = .{};
+            const t = now(io);
+            verdict = try bodyscan.scanBufferScratch(&index, data, .{ .info = .{ .size = data.len }, .target = 1 }, &budget, &tracker, &w.state, .auto, &stats, w.scan);
+            best = @min(best, nsSince(io, t));
+            steps = budget.used;
+        }
+        const mb = @as(f64, @floatFromInt(data.len)) / 1e6;
+        if (verdict == .infected) {
+            const names = try zav.engine.hashscan.HashIndex.load(index_db);
+            var nb: [256]u8 = undefined;
+            std.debug.print("  ({s} at {d})\n", .{ names.meta.?.name(verdict.infected.sig, &nb) catch "?", verdict.infected.start });
+        }
+        std.debug.print("  ({d} matches broken)\n", .{broken});
+        std.debug.print("{t:<14} {d:>7.2} ms/MB  {d:>9.0} steps/MB  {d:>8.0} verifies/MB  {d:>8.0} candidates/MB  {t}\n", .{
+            kind,                                           @as(f64, @floatFromInt(best)) / 1e6 / mb,
+            @as(f64, @floatFromInt(steps)) / mb,            @as(f64, @floatFromInt(stats.verifies)) / mb,
+            @as(f64, @floatFromInt(stats.candidates)) / mb, std.meta.activeTag(verdict),
+        });
+    }
 }
 
 fn sample(gpa: std.mem.Allocator, out: *std.ArrayList(u8), p: prog.Program, r: std.Random) !void {
