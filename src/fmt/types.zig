@@ -87,6 +87,9 @@ pub const ClType = enum(u16) {
     // Used by ClamAV's own type magic though not in the file types reference.
     part_any,
     ignored,
+    // In the official daily.ftm (functionality level 210).
+    alz,
+    lha_lzh,
     _,
 
     /// `CL_TYPE_ZIP` and friends, case-sensitive as ClamAV writes them.

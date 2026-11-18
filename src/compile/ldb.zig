@@ -467,12 +467,13 @@ pub fn parseByteCompare(text: []const u8, self_index: usize) error{BadByteCompar
         o = o[1..];
     }
     const width = try numberValue(u8, o);
+    // As libclamav reads them: decimal ignores the byte order (little-endian decimal is
+    // malformed); hex, auto and binary without one never hold.
+    if (bc.kind != .decimal and !endian_given) bc.no_order = true;
     switch (bc.kind) {
-        // Decimal is big-endian by definition: little-endian decimal is malformed.
         .decimal => if (endian_given and !bc.big_endian) return error.BadByteCompare,
         .binary => {
             bc.exact = true;
-            if (!endian_given) bc.big_endian = false;
             if (width != 1 and width != 2 and width != 4 and width != 8) return error.BadByteCompare;
         },
         else => {},
@@ -497,18 +498,20 @@ pub fn parseByteCompare(text: []const u8, self_index: usize) error{BadByteCompar
 }
 
 test "byte-compare subsignatures: every encoding, width and endianness option" {
-    const Case = struct { []const u8, ir.ByteKind, bool, bool, u8, u32, bool };
+    // kind, big-endian, exact, width, offset, backward, no byte order written (never holds)
+    const Case = struct { []const u8, ir.ByteKind, bool, bool, u8, u32, bool, bool };
     for ([_]Case{
-        .{ "0(>>4#hb2#=0x10)", .hex, true, false, 2, 4, false },
-        .{ "0(>>0x10#hl4#>1)", .hex, false, false, 4, 16, false },
-        .{ "0(<<8#d3#<100)", .decimal, true, false, 3, 8, true },
-        .{ "0(>>2#db3#=5)", .decimal, true, false, 3, 2, false },
-        .{ "0(>>2#ae6#=5)", .auto, true, true, 6, 2, false },
-        .{ "0(>>2#ib1#=5)", .binary, true, true, 1, 2, false },
-        .{ "0(>>2#il2#=5)", .binary, false, true, 2, 2, false },
-        .{ "0(>>2#i4#=5)", .binary, false, true, 4, 2, false },
-        .{ "0(>>2#ib8#=5)", .binary, true, true, 8, 2, false },
-        .{ "0(>>2#he0x8#>0x10,<0x20)", .hex, true, true, 8, 2, false },
+        .{ "0(>>4#hb2#=0x10)", .hex, true, false, 2, 4, false, false },
+        .{ "0(>>0x10#hl4#>1)", .hex, false, false, 4, 16, false, false },
+        .{ "0(<<8#d3#<100)", .decimal, true, false, 3, 8, true, false },
+        .{ "0(>>2#db3#=5)", .decimal, true, false, 3, 2, false, false },
+        .{ "0(>>2#ae6#=5)", .auto, true, true, 6, 2, false, true },
+        .{ "0(>>2#abe6#=5)", .auto, true, true, 6, 2, false, false },
+        .{ "0(>>2#ib1#=5)", .binary, true, true, 1, 2, false, false },
+        .{ "0(>>2#il2#=5)", .binary, false, true, 2, 2, false, false },
+        .{ "0(>>2#i4#=5)", .binary, true, true, 4, 2, false, true },
+        .{ "0(>>2#ib8#=5)", .binary, true, true, 8, 2, false, false },
+        .{ "0(>>2#he0x8#>0x10,<0x20)", .hex, true, true, 8, 2, false, true },
     }) |c| {
         const bc = try parseByteCompare(c[0], 1);
         try testing.expectEqual(c[1], bc.kind);
@@ -517,6 +520,7 @@ test "byte-compare subsignatures: every encoding, width and endianness option" {
         try testing.expectEqual(c[4], bc.width);
         try testing.expectEqual(c[5], bc.offset);
         try testing.expectEqual(c[6], bc.backward);
+        try testing.expectEqual(c[7], bc.no_order);
     }
     const two = try parseByteCompare("0(>>2#he0x8#>0x10,<0x20)", 1);
     try testing.expectEqual(@as(u8, 2), two.comparison_count);
@@ -581,7 +585,8 @@ pub fn parsePcre(arena: std.mem.Allocator, text: []const u8, first_slash: usize,
         'U' => ungreedy = true,
         else => return error.BadPcre,
     };
-    if (pcre.flags.encompass and pcre.offset.shift == 0) return error.BadPcre;
+    // libclamav ignores `e` without a maxshift: the subsig reads as if `e` were absent.
+    if (pcre.offset.shift == 0) pcre.flags.encompass = false;
     if (ungreedy and pcre.flags.global) return error.PcreFlagUnsupported;
     pcre.program = try cdb.compileRegex(arena, pcre.pattern, flags);
     return pcre;
@@ -616,7 +621,6 @@ test "pcre subsignatures: offsets, triggers, flags, compile failures" {
         .{ "1/abc/", 1, error.BadPcre }, // names itself
         .{ "/abc/", 1, error.BadPcre },
         .{ "0/abc/q", 1, error.BadPcre },
-        .{ "0/abc/e", 1, error.BadPcre }, // e needs a maxshift
         .{ "0/abc/gU", 1, error.PcreFlagUnsupported },
         .{ "0=0/abc/", 1, error.ExprTrueWithoutHits },
         .{ "EP+0:0/abc/", 1, error.OffsetNeedsExecutable },

@@ -142,6 +142,9 @@ pub const Programs = struct {
 
     pub const Error = error{BadProgram};
 
+    /// No programs (a database whose signatures need none, such as regex-only YARA rules).
+    pub const empty: Programs = .{ .bytes = &.{}, .index = &.{} };
+
     pub fn init(section: []const u8) Error!Programs {
         if (section.len < @sizeOf(SectionHeader) or @intFromPtr(section.ptr) % 4 != 0) return error.BadProgram;
         const bytes: []align(4) const u8 = @alignCast(section);

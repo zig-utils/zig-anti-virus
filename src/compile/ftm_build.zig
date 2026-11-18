@@ -23,7 +23,7 @@ pub fn build(arena: std.mem.Allocator, rules: []const ir.FtmRule) !Built {
         var e: ftm.FtmEntry = .{ .kind = r.kind, .rtype = r.rtype, .type = r.type, .magic_len = @intCast(@min(r.magic.len, std.math.maxInt(u16))), .offset = r.offset orelse ftm.any_offset };
         if (r.kind == .body) {
             e.prog = @intCast(inputs.items.len);
-            const offset: ir.Offset = if (r.offset) |o| .{ .kind = .absolute, .a = @intCast(@min(o, std.math.maxInt(i32))) } else .{};
+            const offset = r.body_offset;
             try inputs.append(arena, .{ .pattern = r.pattern.?, .offset = offset, .sig = @intCast(entries.items.len) });
         }
         try entries.append(arena, e);

@@ -131,6 +131,8 @@ pub const BcRecord = extern struct {
     pub const big_endian: u8 = 1 << 0;
     pub const exact: u8 = 1 << 1;
     pub const backward: u8 = 1 << 2;
+    /// No byte order was written: the compare never holds.
+    pub const no_order: u8 = 1 << 3;
 
     pub fn from(subsig: u8, bc: ir.ByteCompare) BcRecord {
         var r: BcRecord = .{
@@ -147,6 +149,7 @@ pub const BcRecord = extern struct {
         if (bc.big_endian) r.flags |= big_endian;
         if (bc.exact) r.flags |= exact;
         if (bc.backward) r.flags |= backward;
+        if (bc.no_order) r.flags |= no_order;
         for (bc.comparisons[0..bc.comparison_count], 0..) |c, i| {
             r.ops[i] = c.op;
             r.values[i] = c.value;
@@ -384,7 +387,7 @@ pub const LdbTable = struct {
 
 fn validBc(bc: BcRecord, nsub: u8) bool {
     if (bc.subsig >= nsub or bc.trigger >= nsub or bc.subsig == bc.trigger) return false;
-    if (@backingInt(bc.kind) > @backingInt(ir.ByteKind.binary) or bc.flags & ~@as(u8, 7) != 0) return false;
+    if (@backingInt(bc.kind) > @backingInt(ir.ByteKind.binary) or bc.flags & ~@as(u8, 15) != 0) return false;
     if (bc.width == 0 or bc.width > ir.max_text_width) return false;
     if (bc.kind == .binary and (bc.flags & BcRecord.exact == 0 or !(bc.width == 1 or bc.width == 2 or bc.width == 4 or bc.width == 8))) return false;
     if (bc.comparison_count == 0 or bc.comparison_count > 2) return false;
@@ -412,13 +415,17 @@ pub fn evalByteCompare(bc: BcRecord, data: []const u8, start: usize) BcResult {
     const exact = bc.flags & BcRecord.exact != 0;
     const big = bc.flags & BcRecord.big_endian != 0;
     if (exact and data.len - pos < bc.width) return .out_of_bounds;
+    if (bc.flags & BcRecord.no_order != 0) return .no;
     const field = data[pos..][0..@min(bc.width, data.len - pos)];
     const value: u64 = switch (bc.kind) {
         .binary => if (big) std.mem.readVarInt(u64, field, .big) else std.mem.readVarInt(u64, field, .little),
         .decimal => decimal(field, exact) orelse return .no,
         .hex => hexText(field, exact, big) orelse return .no,
-        .auto => if (field.len >= 2 and field[0] == '0' and (field[1] == 'x' or field[1] == 'X'))
-            hexText(field[2..], exact, big) orelse return .no
+        // libclamav evaluates auto only big-endian.
+        .auto => if (!big)
+            return .no
+        else if (field.len >= 2 and field[0] == '0' and (field[1] == 'x' or field[1] == 'X'))
+            hexText(field[2..], exact, true) orelse return .no
         else
             decimal(field, exact) orelse return .no,
         _ => return .no,
@@ -477,8 +484,13 @@ test "byte compare evaluation: encodings, widths, endianness, bounds" {
         .{ "0(>>2#de3#=12)", "ab12", 0, .out_of_bounds },
         .{ "0(>>2#d3#>100,<200)", "ab150", 0, .yes },
         .{ "0(>>2#d3#>100,<200)", "ab250", 0, .no },
-        .{ "0(>>2#a6#=0x1f)", "ab0x1f;", 0, .yes },
-        .{ "0(>>2#a6#=31)", "ab31;", 0, .yes },
+        .{ "0(>>2#ab6#=0x1f)", "ab0x1f;", 0, .yes },
+        .{ "0(>>2#ab6#=31)", "ab31;", 0, .yes },
+        // As libclamav: auto little-endian, and hex, auto or binary without a byte order, never hold.
+        .{ "0(>>2#al6#=31)", "ab31;", 0, .no },
+        .{ "0(>>2#a6#=31)", "ab31;", 0, .no },
+        .{ "0(>>2#h4#=0x1234)", "ab1234zz", 0, .no },
+        .{ "0(>>1#i2#=0x0201)", "\x00\x01\x02", 0, .no },
         .{ "0(>>1#ib1#=0x7f)", "\x00\x7f", 0, .yes },
         .{ "0(>>1#il2#=0x0201)", "\x00\x01\x02", 0, .yes },
         .{ "0(>>1#ib2#=0x0102)", "\x00\x01\x02", 0, .yes },

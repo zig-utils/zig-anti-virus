@@ -475,6 +475,9 @@ pub const ByteCompare = struct {
     backward: bool = false,
     kind: ByteKind,
     big_endian: bool,
+    /// Hex, auto and binary compares written without `l` or `b`: libclamav loads them and
+    /// they never hold (tests/differential/cases/bytecompare.case).
+    no_order: bool = false,
     /// Evaluate only if exactly `width` bytes (or digits) can be read.
     exact: bool,
     width: u8,
@@ -549,6 +552,9 @@ pub const FtmRule = struct {
     magic: []const u8 = "",
     /// The pattern for the body kind.
     pattern: ?Pattern = null,
+    /// Where a body magic may match: `*`, `n`, `n,maxshift` or `EOF-n` (all in the official
+    /// daily.ftm). `offset` holds its base.
+    body_offset: Offset = .{},
     name: []const u8,
     /// Required previously detected type (`fmt.types.ClType`), `any` (0) for none.
     rtype: u16,

@@ -147,6 +147,9 @@ pub const Classification = struct {
 pub const Options = struct {
     /// Classify partition types (magictype 4) instead of file types.
     partitions: bool = false,
+    /// The whole file's size, when known: EOF-relative magics only apply when the head is
+    /// the whole file.
+    file_size: ?u64 = null,
 };
 
 const Best = struct {
@@ -195,8 +198,10 @@ fn round(f: Ftm, head: []const u8, rtype: u16, options: Options, budget: *vm.Bud
     if (f.programs) |ps| for (f.entries, 0..) |entry, i| {
         if (entry.kind != .body or entry.offset == any_offset or !wanted(entry, rtype, options)) continue;
         const p = ps.get(entry.prog);
-        const w = vm.startWindow(p.offset(), .{ .size = head.len }) orelse continue;
-        const m = (vm.verify(p, head, w, @intCast(w.lo), budget) catch null) orelse continue;
+        // An EOF-relative magic needs the file's end; it applies when the head is the file.
+        if (p.offset().kind == .eof_minus and options.file_size != head.len) continue;
+        var s = vm.Scanner.init(p, head, .{ .size = head.len }, budget);
+        const m = (s.next() catch null) orelse continue;
         best.offer(m.end - m.start, i);
     };
     return best.entry;

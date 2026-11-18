@@ -676,7 +676,8 @@ fn byteCompare(random: std.Random) void {
             return;
         }
         const v = if (bc.big_endian) std.mem.readVarInt(u64, data[pos..][0..bc.width], .big) else std.mem.readVarInt(u64, data[pos..][0..bc.width], .little);
-        var want = true;
+        // Without a byte order the compare never holds (libclamav).
+        var want = !bc.no_order;
         for (bc.comparisons[0..bc.comparison_count]) |c| want = want and switch (c.op) {
             .lt => v < c.value,
             .gt => v > c.value,

@@ -31,12 +31,14 @@ pub const BodyIndex = struct {
     pub fn load(database: db.reader.Database) !BodyIndex {
         var index: BodyIndex = .{};
         if (database.section(.regex_pool, 0)) |section| index.regexes = try .init(section);
-        const bytes = database.section(.subsig_prog, 0) orelse return index;
-        index.programs = try .init(bytes);
-        for (&index.anchored, 0..) |*slot, p| {
-            if (database.section(.anchored_index, @intCast(p))) |section| slot.* = try .init(section, index.programs.?);
+        // A database of YARA rules with only regex strings has no verify programs at all.
+        if (database.section(.subsig_prog, 0)) |bytes| {
+            index.programs = try .init(bytes);
+            for (&index.anchored, 0..) |*slot, p| {
+                if (database.section(.anchored_index, @intCast(p))) |section| slot.* = try .init(section, index.programs.?);
+            }
         }
-        if (database.section(.ldb_table, 0)) |section| index.ldb = try .initWith(section, index.programs.?, index.regexes);
+        if (database.section(.ldb_table, 0)) |section| index.ldb = try .initWith(section, index.programs, index.regexes);
         if (database.section(.yara_cond, 0)) |section| {
             const table = index.ldb orelse return error.BadYaraTable;
             index.ldb.?.yara = try .init(section, table.records, if (index.regexes) |p| p.count() else 0);
@@ -128,7 +130,8 @@ const Collector = struct {
 /// Scan `data`, the whole file. `budget` is per file. With `state` (reset by the caller between
 /// files) logical signatures are evaluated too.
 pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget: *vm.Budget, tracker: *limits_mod.Tracker, state: ?*logical.State) !Verdict {
-    const progs = index.programs orelse return .clean;
+    if (index.programs == null and index.ldb == null) return .clean;
+    const progs = index.programs orelse prog.Programs.empty;
     const target = file.target;
     const info = file.info;
     var c: Collector = .{ .index = index, .programs = progs, .state = state, .ctx = file.context() };

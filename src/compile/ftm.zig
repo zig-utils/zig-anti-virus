@@ -10,6 +10,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const hexsig = @import("hexsig.zig");
+const ndb = @import("ndb.zig");
 const types = @import("../fmt/types.zig");
 
 pub const LineError = error{ FieldCount, EmptyName, BadMagicType, BadOffset, BadMagic, UnknownFileType, BadFlevel } || hexsig.Error;
@@ -78,9 +79,15 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
         };
     };
     column.* = col(line, fields[1]);
-    const offset: ?u32 = if (std.mem.eql(u8, fields[1], "*")) blk: {
-        if (kind != .body) return error.BadOffset;
-        break :blk null;
+    // Literal magics sit at a fixed offset; body magics also take `n,maxshift` and `EOF-n`.
+    var body_offset: ir.Offset = .{};
+    const offset: ?u32 = if (kind == .body) blk: {
+        body_offset = ndb.parseOffset(fields[1]) catch return error.BadOffset;
+        break :blk switch (body_offset.kind) {
+            .any => null,
+            .absolute, .eof_minus => @intCast(body_offset.a),
+            else => return error.BadOffset,
+        };
     } else std.fmt.parseInt(u32, fields[1], 10) catch return error.BadOffset;
 
     if (fields[3].len == 0) {
@@ -106,7 +113,7 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
     }
 
     column.* = col(line, fields[2]);
-    var rule: ir.FtmRule = .{ .kind = kind, .offset = offset, .name = fields[3], .rtype = rtype, .type = ty, .flevel_min = flevel_min, .flevel_max = flevel_max, .line = line };
+    var rule: ir.FtmRule = .{ .kind = kind, .offset = offset, .body_offset = body_offset, .name = fields[3], .rtype = rtype, .type = ty, .flevel_min = flevel_min, .flevel_max = flevel_max, .line = line };
     var diag: hexsig.Diag = .{};
     const pattern = hexsig.parse(arena, fields[2], &diag) catch |err| {
         column.* += diag.pos;
