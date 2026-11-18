@@ -12,6 +12,7 @@ const std = @import("std");
 const container = @import("../engine/container.zig");
 const Source = @import("../engine/source.zig").Source;
 const detect = @import("detect.zig");
+const heuristics = @import("../engine/heuristics.zig");
 const Walker = container.Walker;
 const Io = std.Io;
 
@@ -314,6 +315,11 @@ pub fn walk(w: *Walker, src: Source) container.Error!void {
         };
     };
     if (info.anomalies.section_table_truncated or info.anomalies.raw_beyond_eof) w.notice(.malformed, "pe: section data beyond end of file");
+    heuristics.reportAll(w, &.{
+        .{ info.anomalies.ep_outside_sections, .pe_entry_outside_sections },
+        .{ info.anomalies.write_exec_section, .pe_write_exec_section },
+        .{ info.anomalies.sections_overlap, .pe_overlapping_sections },
+    });
     try resources(w, src, &info);
     if (info.overlay_off < info.file_size) {
         const overlay = src.slice(info.overlay_off, info.file_size - info.overlay_off) catch return;

@@ -8,6 +8,7 @@ const Io = std.Io;
 const container = @import("../engine/container.zig");
 const Source = @import("../engine/source.zig").Source;
 const Walker = container.Walker;
+const heuristics = @import("../engine/heuristics.zig");
 
 pub const max_headers = 4096;
 
@@ -200,6 +201,10 @@ pub fn walk(w: *Walker, src: Source) container.Error!void {
     const sections = w.alloc(Section, max_headers) orelse return;
     const info = parse(w.io, src, segments, sections) catch return w.notice(.malformed, "elf: header");
     if (info.anomalies.headers_truncated or info.anomalies.data_beyond_eof) w.notice(.malformed, "elf: headers or data beyond end of file");
+    heuristics.reportAll(w, &.{
+        .{ info.anomalies.ep_outside_segments, .elf_entry_outside_segments },
+        .{ info.anomalies.write_exec_segment, .elf_write_exec_segment },
+    });
 }
 
 const fixtures = @import("fixtures/fixtures.zig");

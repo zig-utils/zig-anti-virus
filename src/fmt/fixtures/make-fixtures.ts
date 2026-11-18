@@ -740,7 +740,7 @@ exe('pe-truncated.exe', buildPe({ truncateAt: 0x300 }), { entry: 0x210, sections
 exe('pe-many-sections.exe', buildPe({ sectionCount: 0xffff }), { entry: 0x210, sections: 12, malformed: true })
 
 /** An ELF executable: PT_LOAD text (R+X) at 0x400000, PT_LOAD data (R+W), four sections. */
-function buildElf(o: { is64?: boolean, big?: boolean, entry?: number, relocatable?: boolean, truncateAt?: number } = {}): Uint8Array {
+function buildElf(o: { is64?: boolean, big?: boolean, entry?: number, relocatable?: boolean, truncateAt?: number, wx?: boolean } = {}): Uint8Array {
   const is64 = o.is64 ?? true
   const le = !(o.big ?? false)
   const b = new Uint8Array(0x480)
@@ -793,7 +793,7 @@ function buildElf(o: { is64?: boolean, big?: boolean, entry?: number, relocatabl
     }
   }
   if (!relocatable) {
-    phdr(0, 5, 0, 0x400000, 0x200)
+    phdr(0, o.wx ? 7 : 5, 0, 0x400000, 0x200)
     phdr(1, 6, 0x200, 0x600200, 0x100)
   }
   b.set([0x48, 0x31, 0xff, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05], 0x100)
@@ -819,12 +819,13 @@ exe('i386-32.elf', buildElf({ is64: false }), { entry: 0x100, sections: 4 })
 exe('relocatable.elf', buildElf({ relocatable: true }), { entry: null, sections: 4 })
 exe('ep-outside.elf', buildElf({ entry: 0x900000 }), { entry: null, sections: 4 })
 exe('truncated.elf', buildElf({ truncateAt: 0x90 }), { entry: 0x100, sections: 0, malformed: true })
+exe('wx.elf', buildElf({ wx: true }), { entry: 0x100, sections: 4 })
 
 /**
  * A thin Mach-O: one text segment (file 0..0x400 at `vmaddr`) with a __text section at 0x300,
  * entered through LC_MAIN or an LC_UNIXTHREAD thread state whose PC is vmaddr + 0x300.
  */
-function buildMachO(o: { cpu: 'x86_64' | 'i386' | 'arm64' | 'ppc', main?: boolean }): Uint8Array {
+function buildMachO(o: { cpu: 'x86_64' | 'i386' | 'arm64' | 'ppc', main?: boolean, entryoff?: number, initprot?: number }): Uint8Array {
   const is64 = o.cpu === 'x86_64' || o.cpu === 'arm64'
   const le = o.cpu !== 'ppc'
   const cputype = { x86_64: 0x01000007, i386: 7, arm64: 0x0100000c, ppc: 18 }[o.cpu]
@@ -849,16 +850,16 @@ function buildMachO(o: { cpu: 'x86_64' | 'i386' | 'arm64' | 'ppc', main?: boolea
     w64(off + 32, 0x1000)
     w64(off + 40, 0)
     w64(off + 48, 0x400)
-    w32(off + 56, 5)
-    w32(off + 60, 5)
+    w32(off + 56, 7)
+    w32(off + 60, o.initprot ?? 5)
     w32(off + 64, 1)
   } else {
     w32(off + 24, vmaddr)
     w32(off + 28, 0x1000)
     w32(off + 32, 0)
     w32(off + 36, 0x400)
-    w32(off + 40, 5)
-    w32(off + 44, 5)
+    w32(off + 40, 7)
+    w32(off + 44, o.initprot ?? 5)
     w32(off + 48, 1)
   }
   const sect = off + segLen
@@ -878,7 +879,7 @@ function buildMachO(o: { cpu: 'x86_64' | 'i386' | 'arm64' | 'ppc', main?: boolea
   if (o.main) {
     w32(off, 0x80000028)
     w32(off + 4, 24)
-    w64(off + 8, 0x300)
+    w64(off + 8, o.entryoff ?? 0x300)
     off += 24
   } else {
     const flavor = { x86_64: 4, i386: 1, arm64: 6, ppc: 1 }[o.cpu]
@@ -907,6 +908,8 @@ exe('x86_64-main.macho', machoX64, { entry: 0x300, sections: 1 })
 exe('arm64-thread.macho', machoArm64, { entry: 0x300, sections: 1 })
 exe('i386-thread.macho', buildMachO({ cpu: 'i386' }), { entry: 0x300, sections: 1 })
 exe('ppc-be-thread.macho', buildMachO({ cpu: 'ppc' }), { entry: 0x300, sections: 1 })
+exe('ep-outside.macho', buildMachO({ cpu: 'x86_64', main: true, entryoff: 0x10000 }), { entry: null, sections: 1 })
+exe('wx.macho', buildMachO({ cpu: 'x86_64', main: true, initprot: 7 }), { entry: 0x300, sections: 1 })
 
 function fat(slicesIn: { cpu: number, data: Uint8Array }[]): Uint8Array {
   const head = new Uint8Array(0x1000)

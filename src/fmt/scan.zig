@@ -28,6 +28,7 @@ const elf = @import("elf.zig");
 const macho = @import("macho.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
+const heuristics = @import("../engine/heuristics.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -42,6 +43,8 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
     obj.format = detect.detect(head[0..n]);
     try w.begin(obj);
     try w.feedSource(obj, src);
+    checkName(w, obj);
+    checkEntropy(w, obj.format, src);
     switch (obj.format) {
         .gzip, .bzip2, .xz, .zstd => {
             const buf = w.alloc(u8, container.block_len) orelse return;
@@ -85,6 +88,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     };
     obj.format = detect.detect(r.buffered());
     try w.begin(obj);
+    checkName(w, obj);
     const tee_buf = w.alloc(u8, container.block_len) orelse return w.drain(r);
     var tee: container.Tee = .init(w, obj, r, tee_buf);
     defer tee.interface = undefined;
@@ -103,11 +107,38 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         .zip, .pe, .elf, .macho, .macho_fat, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
+            checkEntropy(w, obj.format, mat.source);
             try randomAccess(w, obj.format, mat.source);
         },
         else => {},
     }
     try w.drain(&tee.interface);
+}
+
+/// Heuristics.Guardian.ExtensionMismatch: a document, image or text name on an executable.
+fn checkName(w: *Walker, obj: *const Object) void {
+    if (heuristics.extensionMismatch(obj.name, obj.format) != null) heuristics.report(w, .extension_mismatch);
+}
+
+/// Heuristics.Guardian.HighEntropy: both ends of an executable (or of anything, in a risky
+/// context) look random.
+fn checkEntropy(w: *Walker, format: Format, src: Source) void {
+    const cfg = w.options.heuristics orelse return;
+    if (!cfg.wants(.high_entropy) or !(cfg.risky or heuristics.isExecutable(format))) return;
+    const total = src.len() orelse return;
+    const block = cfg.entropy_block;
+    if (total < 2 * block) return;
+    const buf = w.alloc(u8, 2 * block) orelse return;
+    defer w.free(buf);
+    src.readAllAt(w.io, 0, buf[0..block]) catch return;
+    src.readAllAt(w.io, total - block, buf[block..]) catch return;
+    if (heuristics.highEntropy(buf[0..block], buf[block..], cfg)) heuristics.report(w, .high_entropy);
+}
+
+fn reportScript(w: *Walker, s: *const heuristics.ScriptScanner) void {
+    const found = s.finish();
+    var it = found.iterator();
+    while (it.next()) |id| heuristics.report(w, id);
 }
 
 /// Formats parsed positionally, after a stream was materialised.
@@ -131,6 +162,8 @@ fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
     defer w.endDerived(&d);
     const out = w.alloc(u8, container.block_len) orelse return;
     var n: text_norm.Normalizer = .{};
+    var scripts: heuristics.ScriptScanner = .{};
+    defer reportScript(w, &scripts);
     var done: u64 = 0;
     const max = w.tracker.limits.max_script_normalize;
     while (true) {
@@ -141,6 +174,7 @@ fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
         const take = @min(chunk.len, out.len, max -| done);
         if (take == 0) return w.limit(.script_normalize);
         try w.feed(&d, out[0..n.feed(chunk[0..take], out)]);
+        scripts.update(chunk[0..take]);
         r.toss(take);
         done += take;
     }
@@ -174,6 +208,10 @@ fn normalizeHtml(w: *Walker, src: Source) Error!void {
         }
         n.finish() catch return sink.failure();
         if (limited and mode == .normalized) w.limit(.html_normalize);
+        if (mode == .scripts) {
+            sink.close();
+            reportScript(w, &sink.markers);
+        }
     }
 }
 
@@ -184,10 +222,12 @@ const HtmlSink = struct {
     open: bool = false,
     scripts: u32 = 0,
     name_buf: [24]u8 = undefined,
+    markers: heuristics.ScriptScanner = .{},
 
     fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
         const s: *HtmlSink = @ptrCast(@alignCast(ctx));
         if (!s.open) return;
+        if (s.mode == .scripts) s.markers.update(bytes);
         s.w.feed(&s.obj, bytes) catch return error.Stop;
     }
 
@@ -514,4 +554,65 @@ test "normaliser limits are reported" {
     try std.testing.expect(rig.rec.hasLimit(.html_normalize));
     try rig.walker.scan(.{ .memory = "some longer text" }, "t.txt");
     try std.testing.expect(rig.rec.hasLimit(.script_normalize));
+}
+
+test "heuristics: each one fires on its positive fixture, and only when enabled" {
+    const H = heuristics.Id;
+    const Case = struct { name: []const u8, bytes: []const u8, id: H };
+    var rnd: [16384]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    prng.random().bytes(&rnd);
+    // A PE header in front of random data: packed-looking at both ends.
+    var packed_pe: [16384]u8 = rnd;
+    @memcpy(packed_pe[0..2], "MZ");
+    const evil_js = "var p = 'x'; eval(atob('YWxlcnQoMSk=')); eval(unescape('%61%6c%65%72%74'));";
+    const page = "<html><script>" ++ evil_js ++ "</script></html>";
+    const exe = struct {
+        fn find(name: []const u8) []const u8 {
+            for (fixtures.exes) |e| if (std.mem.eql(u8, e.name, name)) return e.bytes;
+            unreachable;
+        }
+    }.find;
+    const cases = [_]Case{
+        .{ .name = "pe-ep-outside.exe", .bytes = exe("pe-ep-outside.exe"), .id = .pe_entry_outside_sections },
+        .{ .name = "pe-wx.exe", .bytes = exe("pe-wx.exe"), .id = .pe_write_exec_section },
+        .{ .name = "pe-overlap.exe", .bytes = exe("pe-overlap.exe"), .id = .pe_overlapping_sections },
+        .{ .name = "ep-outside.elf", .bytes = exe("ep-outside.elf"), .id = .elf_entry_outside_segments },
+        .{ .name = "wx.elf", .bytes = exe("wx.elf"), .id = .elf_write_exec_segment },
+        .{ .name = "ep-outside.macho", .bytes = exe("ep-outside.macho"), .id = .macho_entry_outside_segments },
+        .{ .name = "wx.macho", .bytes = exe("wx.macho"), .id = .macho_write_exec_segment },
+        .{ .name = "invoice.pdf", .bytes = exe("pe32.exe"), .id = .extension_mismatch },
+        .{ .name = "packed.bin", .bytes = &packed_pe, .id = .high_entropy },
+        .{ .name = "page.html", .bytes = page, .id = .script_eval_chain },
+    };
+    for (cases) |case| {
+        for ([_]bool{ true, false }) |enabled| {
+            var cfg: heuristics.Config = .{ .min_severity = .low };
+            if (!enabled) cfg.disabled.insert(case.id);
+            var rig: TestRig = undefined;
+            try rig.init(.{});
+            defer rig.deinit();
+            rig.walker.options.heuristics = &cfg;
+            try rig.scanBoth(case.bytes, case.name);
+            var fired = false;
+            for (rig.rec.notices.items) |nt| {
+                if (nt.what == .heuristic and std.mem.eql(u8, nt.detail, case.id.name())) fired = true;
+            }
+            if (fired != enabled) {
+                std.debug.print("{s}: {s} fired={} enabled={}\n", .{ case.name, case.id.name(), fired, enabled });
+                rig.rec.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // Clean fixtures raise nothing at the default (medium) severity.
+    for ([_][]const u8{ "pe32.exe", "pe64.exe", "x86_64.elf", "x86_64-main.macho", "universal.fat" }) |name| {
+        var cfg: heuristics.Config = .{};
+        var rig: TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        rig.walker.options.heuristics = &cfg;
+        try rig.scanBoth(exe(name), name);
+        try std.testing.expect(!rig.rec.has(.heuristic));
+    }
 }

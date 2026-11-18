@@ -8,6 +8,7 @@ const Io = std.Io;
 const container = @import("../engine/container.zig");
 const Source = @import("../engine/source.zig").Source;
 const Walker = container.Walker;
+const heuristics = @import("../engine/heuristics.zig");
 
 pub const max_commands = 4096;
 pub const max_segments = 256;
@@ -279,6 +280,10 @@ pub fn walk(w: *Walker, src: Source) container.Error!void {
     const sections = w.alloc(Section, max_sections) orelse return;
     const info = parse(w.io, src, segments, sections) catch return w.notice(.malformed, "macho: header");
     if (info.anomalies.commands_truncated or info.anomalies.data_beyond_eof) w.notice(.malformed, "macho: load commands or data beyond end of file");
+    heuristics.reportAll(w, &.{
+        .{ info.anomalies.ep_outside_segments, .macho_entry_outside_segments },
+        .{ info.anomalies.write_exec_segment, .macho_write_exec_segment },
+    });
 }
 
 /// Scan a fat binary: every slice becomes a child ("slice/<arch>"), so each architecture is

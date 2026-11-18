@@ -121,6 +121,8 @@ pub const Walker = struct {
         /// How long a decoder waits for a big-window token before reporting the limit.
         budget_wait_ms: u32 = 50,
         memory_child_max: u64 = memory_child_max,
+        /// Heuristic detections (engine/heuristics.zig); null turns them off.
+        heuristics: ?*const @import("heuristics.zig").Config = null,
     };
 
     /// Scan a top-level object. Limit events are reported as notices; error.Halted means the walk
