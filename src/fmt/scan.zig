@@ -23,6 +23,7 @@ const archive = @import("archive.zig");
 const tar = @import("tar.zig");
 const cpio = @import("cpio.zig");
 const zip = @import("zip.zig");
+const pe = @import("pe.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -52,6 +53,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
             try cpio.walk(w, &cursor);
         },
         .zip => try zip.walk(w, src),
+        .pe => try pe.walk(w, src),
         .binary, .text => if (zip.hasTrailer(w, src)) {
             // Data with a zip appended (a self-extractor stub, a polyglot): walk the zip too.
             w.notice(.mismatch, "zip: archive appended to other data");
@@ -82,14 +84,23 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
             var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
             try cpio.walk(w, &cursor);
         },
-        .zip => {
+        .zip, .pe => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
-            try zip.walk(w, mat.source);
+            try randomAccess(w, obj.format, mat.source);
         },
         else => {},
     }
     try w.drain(&tee.interface);
+}
+
+/// Formats parsed positionally, after a stream was materialised.
+fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
+    switch (format) {
+        .zip => try zip.walk(w, src),
+        .pe => try pe.walk(w, src),
+        else => unreachable,
+    }
 }
 
 /// Name for a compression wrapper's output: the parent's name without its extension.
@@ -317,5 +328,34 @@ test "overlapping-entry zip bombs are reported and bounded" {
         // ratio guard: nowhere near the 2 GB and 8 GB the entries claim.
         try std.testing.expectEqual(@as(usize, 2), members);
         try std.testing.expect(bytes < 16 * 1024 * 1024);
+    }
+}
+
+test "executables: children from overlays and resources, positional and streamed" {
+    for (fixtures.exes) |e| {
+        var rig: TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(e.bytes, e.name);
+        for (e.members) |m| {
+            var path_buf: [2048]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ e.name, m.path });
+            var seen: usize = 0;
+            for (rig.rec.objects.items) |o| if (std.mem.eql(u8, o.path, path)) {
+                seen += 1;
+                try std.testing.expectEqual(@as(u64, m.len), o.bytes);
+                try std.testing.expectEqual(m.crc, o.crc);
+            };
+            if (seen != 2) {
+                std.debug.print("{s}: {s} seen {d} times\n", .{ e.name, path, seen });
+                rig.rec.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (e.malformed != rig.rec.has(.malformed)) {
+            std.debug.print("{s}: malformed expected {}\n", .{ e.name, e.malformed });
+            rig.rec.dump();
+            return error.TestUnexpectedResult;
+        }
     }
 }

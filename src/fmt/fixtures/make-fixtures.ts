@@ -581,6 +581,165 @@ function sameEntryBomb(n: number): Uint8Array {
 archive('same-entry-bomb.zip', sameEntryBomb(1000), [], false)
 
 // ---------------------------------------------------------------------------------------------
+// Executables (P5.05 PE, P5.06 ELF and Mach-O), built from the format specifications.
+
+interface Exe { name: string, file: string, entry: number | null, sections: number, imphash: string, impsize: number, members: Member[], malformed: boolean }
+const exes: Exe[] = []
+function exe(name: string, bytes: Uint8Array, o: { entry: number | null, sections: number, imphash?: string, impsize?: number, members?: Member[], malformed?: boolean }) {
+  const file = `exe-${name}.bin`
+  writeFileSync(join(dir, file), bytes)
+  exes.push({ name, file, entry: o.entry, sections: o.sections, imphash: o.imphash ?? '', impsize: o.impsize ?? 0, members: o.members ?? [], malformed: o.malformed ?? false })
+}
+
+interface PeOptions {
+  is64?: boolean
+  entryRva?: number
+  overlay?: Uint8Array
+  resource?: Uint8Array
+  sectionChars?: number[]
+  truncateAt?: number
+  sectionCount?: number
+  overlapSections?: boolean
+}
+
+/**
+ * A PE with .text, .rdata (imports: kernel32!ExitProcess, user32!MessageBoxA) and .rsrc (one
+ * RCDATA resource holding `resource`), then `overlay`. FileAlignment 0x200, SectionAlignment
+ * 0x1000. Its import hash is the ClamAV documentation's clam.exe example.
+ */
+function buildPe(o: PeOptions = {}): Uint8Array {
+  const is64 = o.is64 ?? false
+  const optSize = is64 ? 240 : 224
+  const peOff = 0x80
+  const tableOff = peOff + 24 + optSize
+  const fileAlign = 0x200
+  const align = (n: number) => Math.ceil(n / fileAlign) * fileAlign
+
+  // .text
+  const text = new Uint8Array(0x100)
+  text.set([0x55, 0x89, 0xe5, 0x6a, 0x00, 0xe8, 0, 0, 0, 0, 0xc3], 0x10)
+  // .rdata at RVA 0x2000: descriptors, lookup tables, hint/name entries, DLL names.
+  const rd = new Uint8Array(0x200)
+  const rdv = new DataView(rd.buffer)
+  const thunk = is64 ? 8 : 4
+  const iltK = 0x60
+  const iltU = iltK + 2 * thunk
+  const hnExit = 0x100
+  const hnMsg = 0x110
+  const nameK = 0x130
+  const nameU = 0x140
+  const setThunk = (off: number, v: number) => is64 ? rdv.setBigUint64(off, BigInt(v), true) : rdv.setUint32(off, v, true)
+  // kernel32 descriptor
+  rdv.setUint32(0, 0x2000 + iltK, true)
+  rdv.setUint32(12, 0x2000 + nameK, true)
+  rdv.setUint32(16, 0x2000 + iltK, true)
+  // user32 descriptor
+  rdv.setUint32(20, 0x2000 + iltU, true)
+  rdv.setUint32(32, 0x2000 + nameU, true)
+  rdv.setUint32(36, 0x2000 + iltU, true)
+  setThunk(iltK, 0x2000 + hnExit)
+  setThunk(iltU, 0x2000 + hnMsg)
+  rd.set(enc.encode('\x00\x00ExitProcess\x00'), hnExit)
+  rd.set(enc.encode('\x00\x00MessageBoxA\x00'), hnMsg)
+  rd.set(enc.encode('KERNEL32.dll\x00'), nameK)
+  rd.set(enc.encode('USER32.dll\x00'), nameU)
+  // .rsrc at RVA 0x3000: root -> type 10 (RCDATA) -> id 101 -> language 1033 -> data entry.
+  const payload = o.resource ?? new Uint8Array(0)
+  const rs = new Uint8Array(0x60 + payload.length)
+  const rsv = new DataView(rs.buffer)
+  const dirAt = (off: number, id: number, target: number) => {
+    rsv.setUint16(off + 14, 1, true)
+    rsv.setUint32(off + 16, id, true)
+    rsv.setUint32(off + 20, target, true)
+  }
+  dirAt(0x00, 10, 0x80000000 | 0x18)
+  dirAt(0x18, 101, 0x80000000 | 0x30)
+  dirAt(0x30, 1033, 0x48)
+  rsv.setUint32(0x48, 0x3000 + 0x60, true)
+  rsv.setUint32(0x4c, payload.length, true)
+  rs.set(payload, 0x60)
+
+  const bodies = [text, rd, rs]
+  const names = ['.text', '.rdata', '.rsrc']
+  const chars = o.sectionChars ?? [0x60000020, 0x40000040, 0x40000040]
+  const raws: number[] = []
+  let raw = 0x200
+  for (const b of bodies) {
+    raws.push(raw)
+    raw += align(b.length)
+  }
+  if (o.overlapSections) raws[1] = raws[0]
+  const sizeOfImage = 0x4000 + Math.ceil(rs.length / 0x1000) * 0x1000
+
+  const h = new Uint8Array(0x200)
+  const hv = new DataView(h.buffer)
+  h.set(enc.encode('MZ'), 0)
+  hv.setUint32(0x3c, peOff, true)
+  h.set(enc.encode('PE\0\0'), peOff)
+  const coff = peOff + 4
+  hv.setUint16(coff, is64 ? 0x8664 : 0x14c, true)
+  hv.setUint16(coff + 2, o.sectionCount ?? 3, true)
+  hv.setUint32(coff + 4, 0x5f000000, true)
+  hv.setUint16(coff + 16, optSize, true)
+  hv.setUint16(coff + 18, is64 ? 0x22 : 0x102, true)
+  const opt = peOff + 24
+  hv.setUint16(opt, is64 ? 0x20b : 0x10b, true)
+  hv.setUint32(opt + 4, 0x200, true)
+  hv.setUint32(opt + 16, o.entryRva ?? 0x1010, true)
+  hv.setUint32(opt + 20, 0x1000, true)
+  if (is64) hv.setBigUint64(opt + 24, 0x140000000n, true)
+  else hv.setUint32(opt + 28, 0x400000, true)
+  hv.setUint32(opt + 32, 0x1000, true)
+  hv.setUint32(opt + 36, fileAlign, true)
+  hv.setUint16(opt + 40, 6, true)
+  hv.setUint16(opt + 48, 6, true)
+  hv.setUint32(opt + 56, sizeOfImage, true)
+  hv.setUint32(opt + 60, 0x200, true)
+  hv.setUint16(opt + 68, 2, true)
+  const ndirs = is64 ? opt + 108 : opt + 92
+  hv.setUint32(ndirs, 16, true)
+  hv.setUint32(ndirs + 4 + 8, 0x2000, true)
+  hv.setUint32(ndirs + 4 + 12, 40, true)
+  hv.setUint32(ndirs + 4 + 16, 0x3000, true)
+  hv.setUint32(ndirs + 4 + 20, rs.length, true)
+  for (let i = 0; i < 3; i++) {
+    const t = tableOff + i * 40
+    h.set(enc.encode(names[i]), t)
+    hv.setUint32(t + 8, bodies[i].length, true)
+    hv.setUint32(t + 12, 0x1000 * (i + 1), true)
+    hv.setUint32(t + 16, align(bodies[i].length), true)
+    hv.setUint32(t + 20, raws[i], true)
+    hv.setUint32(t + 36, chars[i], true)
+  }
+  const parts: Uint8Array[] = [h]
+  for (const b of bodies) parts.push(concat(b, new Uint8Array(align(b.length) - b.length)))
+  if (o.overlay) parts.push(o.overlay)
+  const out = concat(...parts)
+  return o.truncateAt ? out.slice(0, o.truncateAt) : out
+}
+
+const clamImp = { imphash: '98c88d882f01a3f6ac1e5f7dfd761624', impsize: 39 }
+const overlayZip = zipBytes([{ name: 'a.txt', data: fileA }, { name: 'eicar.com', data: evil }])
+exe('pe32.exe', buildPe({ resource: eicarZip, overlay: overlayZip }), {
+  entry: 0x210,
+  sections: 3,
+  ...clamImp,
+  members: [
+    { path: 'resource/10/101/1033', data: eicarZip },
+    { path: 'resource/10/101/1033/eicar.com', data: evil },
+    { path: 'overlay', data: overlayZip },
+    { path: 'overlay/a.txt', data: fileA },
+    { path: 'overlay/eicar.com', data: evil },
+  ],
+})
+exe('pe64.exe', buildPe({ is64: true }), { entry: 0x210, sections: 3, ...clamImp })
+exe('pe-ep-outside.exe', buildPe({ entryRva: 0x9000 }), { entry: null, sections: 3, ...clamImp })
+exe('pe-wx.exe', buildPe({ sectionChars: [0xe0000020, 0x40000040, 0x40000040] }), { entry: 0x210, sections: 3, ...clamImp })
+exe('pe-overlap.exe', buildPe({ overlapSections: true }), { entry: 0x210, sections: 3 })
+exe('pe-truncated.exe', buildPe({ truncateAt: 0x300 }), { entry: 0x210, sections: 3, malformed: true })
+exe('pe-many-sections.exe', buildPe({ sectionCount: 0xffff }), { entry: 0x210, sections: 12, malformed: true })
+
+// ---------------------------------------------------------------------------------------------
 // fixtures.zig
 
 const lines = [
@@ -609,6 +768,22 @@ for (const a of archives) {
   }
   lines.push(head)
   for (const m of a.members) lines.push(`        .{ .path = "${m.path}", .len = ${m.data.length}, .crc = 0x${crc32(m.data).toString(16).padStart(8, '0')} },`)
+  lines.push('    } },')
+}
+lines.push('};', '')
+lines.push(
+  'pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };',
+  '',
+  'pub const exes = [_]Exe{',
+)
+for (const e of exes) {
+  const head = `    .{ .name = "${e.name}", .bytes = @embedFile("${e.file}"), .entry = ${e.entry ?? 'null'}, .sections = ${e.sections}, .imphash = "${e.imphash}", .impsize = ${e.impsize}, .malformed = ${e.malformed}, .members = &.{`
+  if (e.members.length === 0) {
+    lines.push(`${head}} },`)
+    continue
+  }
+  lines.push(head)
+  for (const m of e.members) lines.push(`        .{ .path = "${m.path}", .len = ${m.data.length}, .crc = 0x${crc32(m.data).toString(16).padStart(8, '0')} },`)
   lines.push('    } },')
 }
 lines.push('};', '')

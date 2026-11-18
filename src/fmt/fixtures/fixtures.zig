@@ -195,3 +195,21 @@ pub const archives = [_]Archive{
     .{ .name = "overlap-bomb.zip", .bytes = @embedFile("archive-overlap-bomb.zip.bin"), .malformed = false, .members = &.{} },
     .{ .name = "same-entry-bomb.zip", .bytes = @embedFile("archive-same-entry-bomb.zip.bin"), .malformed = false, .members = &.{} },
 };
+
+pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };
+
+pub const exes = [_]Exe{
+    .{ .name = "pe32.exe", .bytes = @embedFile("exe-pe32.exe.bin"), .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{
+        .{ .path = "resource/10/101/1033", .len = 184, .crc = 0x778d4418 },
+        .{ .path = "resource/10/101/1033/eicar.com", .len = 68, .crc = 0x6851cf3c },
+        .{ .path = "overlay", .len = 287, .crc = 0x7f75160a },
+        .{ .path = "overlay/a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "overlay/eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "pe64.exe", .bytes = @embedFile("exe-pe64.exe.bin"), .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
+    .{ .name = "pe-ep-outside.exe", .bytes = @embedFile("exe-pe-ep-outside.exe.bin"), .entry = null, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
+    .{ .name = "pe-wx.exe", .bytes = @embedFile("exe-pe-wx.exe.bin"), .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
+    .{ .name = "pe-overlap.exe", .bytes = @embedFile("exe-pe-overlap.exe.bin"), .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "pe-truncated.exe", .bytes = @embedFile("exe-pe-truncated.exe.bin"), .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+    .{ .name = "pe-many-sections.exe", .bytes = @embedFile("exe-pe-many-sections.exe.bin"), .entry = 528, .sections = 12, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+};

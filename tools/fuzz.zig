@@ -754,6 +754,7 @@ const Formats = struct {
         .{ .name = "fmt.tar", .inputs = archives(".tar") },
         .{ .name = "fmt.cpio", .inputs = archives(".cpio") },
         .{ .name = "fmt.zip", .inputs = archives(".zip") },
+        .{ .name = "fmt.pe", .inputs = exes(".exe") },
     };
 
     fn vectors(comptime vs: []const fixtures.Vector) []const []const u8 {
@@ -774,6 +775,24 @@ const Formats = struct {
         inline for (fixtures.archives) |a| {
             if (comptime std.mem.indexOf(u8, a.name, needle) != null) {
                 out[i] = a.bytes;
+                i += 1;
+            }
+        }
+        const final = out;
+        return &final;
+    }
+
+    fn exes(comptime needle: []const u8) []const []const u8 {
+        @setEvalBranchQuota(1_000_000);
+        comptime var n: usize = 0;
+        inline for (fixtures.exes) |e| {
+            if (comptime std.mem.indexOf(u8, e.name, needle) != null) n += 1;
+        }
+        comptime var out: [n][]const u8 = undefined;
+        comptime var i: usize = 0;
+        inline for (fixtures.exes) |e| {
+            if (comptime std.mem.indexOf(u8, e.name, needle) != null) {
+                out[i] = e.bytes;
                 i += 1;
             }
         }

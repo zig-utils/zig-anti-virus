@@ -8,6 +8,7 @@ const hashidx = @import("../match/hashidx.zig");
 const ir = @import("../compile/ir.zig");
 const source_mod = @import("source.zig");
 const limits_mod = @import("limits.zig");
+const pe = @import("../fmt/pe.zig");
 
 /// The hash sections of an opened database, ready for lookups.
 pub const HashIndex = struct {
@@ -90,6 +91,76 @@ pub fn scanSource(io: Io, index: *const HashIndex, src: source_mod.Source, track
         return .{ .infected = sig };
     }
     return .clean;
+}
+
+/// Section (.mdb/.msb) and import (.imp) hashes of a parsed PE. A section is hashed only when
+/// the pe_section need map lists its stored raw size, and only with the algorithms that size
+/// needs; the import hash is computed only when the pe_import map lists any size at all.
+pub fn scanPe(io: Io, index: *const HashIndex, src: source_mod.Source, info: *const pe.Info, block: []u8) Verdict {
+    if (index.need[@backingInt(ir.HashScope.pe_section)]) |map| {
+        for (info.sections) |*s| {
+            const need = map.mask(s.stored_raw_size);
+            if (need == 0) continue;
+            inline for (.{
+                .{ ir.HashAlgo.md5, hashidx.need_md5, std.crypto.hash.Md5 },
+                .{ ir.HashAlgo.sha1, hashidx.need_sha1, std.crypto.hash.Sha1 },
+                .{ ir.HashAlgo.sha256, hashidx.need_sha256, std.crypto.hash.sha2.Sha256 },
+            }) |a| if (need & a[1] != 0) {
+                if (index.tables[hashidx.tableVariant(a[0], .pe_section)]) |table| {
+                    if (pe.sectionDigest(io, src, s, a[2], block)) |d| {
+                        if (table.lookup(s.stored_raw_size, &d)) |sig| return .{ .infected = sig };
+                    }
+                }
+            };
+        }
+    }
+    if (index.tables[hashidx.tableVariant(.md5, .pe_import)]) |table| {
+        if (pe.importHash(io, src, info)) |ih| {
+            const listed = if (index.need[@backingInt(ir.HashScope.pe_import)]) |map| map.mask(ih.size) != 0 else true;
+            if (listed) if (table.lookup(ih.size, &ih.md5)) |sig| return .{ .infected = sig };
+        }
+    }
+    return .clean;
+}
+
+test "section-hash and import-hash signatures detect a PE" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Compiler = @import("../compile/compiler.zig").Compiler;
+    const fixtures = @import("../fmt/fixtures/fixtures.zig");
+    const sample = fixtures.exes[0].bytes;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // .text is the 512 bytes at 0x200 (independent of the parser's section mapping).
+    var md5: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(sample[0x200..0x400], &md5, .{});
+    var line_buf: [128]u8 = undefined;
+    const mdb = try std.fmt.bufPrint(&line_buf, "512:{s}:Test.Section.Text\n", .{std.fmt.bytesToHex(md5, .lower)});
+    var sections: [pe.max_sections]pe.Section = undefined;
+
+    for ([_]struct { file: []const u8, text: []const u8, name: []const u8 }{
+        .{ .file = "t.mdb", .text = mdb, .name = "Test.Section.Text" },
+        // The ClamAV documentation's clam.exe import hash; the fixture imports the same two functions.
+        .{ .file = "t.imp", .text = "98c88d882f01a3f6ac1e5f7dfd761624:39:Test.Import.Clam\n", .name = "Test.Import.Clam" },
+    }) |case| {
+        var c = Compiler.init(gpa);
+        defer c.deinit();
+        try c.addFile(case.file, case.text);
+        _ = try c.write(io, tmp.dir, "pe.zavdb", .{ .db_version = 1 });
+        const database = try db.reader.open(io, tmp.dir, "pe.zavdb", .{ .allow_unsigned = true });
+        defer database.close();
+        const index = try HashIndex.load(database);
+        const info = try pe.parse(io, .{ .memory = sample }, &sections);
+        var block: [4096]u8 = undefined;
+        const v = scanPe(io, &index, .{ .memory = sample }, &info, &block);
+        var name_buf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(case.name, try index.meta.?.name(v.infected, &name_buf));
+        // A PE without that section or import table stays clean.
+        const other = fixtures.exes[4].bytes; // overlapping sections: .rdata reads .text bytes
+        const other_info = try pe.parse(io, .{ .memory = other }, &sections);
+        if (std.mem.eql(u8, case.file, "t.imp")) try std.testing.expectEqual(Verdict.clean, scanPe(io, &index, .{ .memory = other }, &other_info, &block));
+    }
 }
 
 test "compile the built-in signatures and detect EICAR end to end" {
