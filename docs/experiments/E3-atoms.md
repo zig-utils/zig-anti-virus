@@ -1,0 +1,109 @@
+# E3: atom selection against prefix selection, and tier-D deferral coverage
+
+Issue: zig-utils/zig-anti-virus#34. Pass line (docs/DESIGN.md section 14): at least 10x fewer
+candidates than prefix selection, and at least 90% of tier-D subsigs deferrable or anchorable.
+
+## Method
+
+- Databases: ClamAV main 63 and daily 28187, compiled three ways with
+  `zig build prefilter -- compile <out> main.cvd daily.cvd [--prefix | --no-defer]`
+  (1,628,243 verify programs each; 1,570,219 of them searched, the rest pinned to an offset):
+  - **atoms**: the default. Every searched program gets its rarest window under the benign
+    4-gram model (src/compile/gram_model.zig, built from B1), and logical subsigs outside
+    their expression's cheapest cover are deferred (src/compile/atoms.zig).
+  - **no-defer**: the same atoms, nothing deferred.
+  - **prefix-4**: the first 4 bytes of each program's first literal, stride 1, nothing
+    deferred, through the same filters and verifier.
+  - **prefix-3**: what ClamAV's depth-3 Aho-Corasick trie keys on: every position whose 3 bytes
+    are the first 3 bytes of some searched program's first literal
+    (`zig build prefilter -- prefix`). Counted, not scanned.
+- Corpora: B1, B2 and S1 (bench/corpus), the full sets.
+- Counters (deterministic, unlike times): stage-one **candidates** (positions where a filter
+  fired), atom-table **probes**, **verifies** (entries whose extension or check matched, handed
+  to the verify VM), and deferred programs searched in the second pass, all per MB.
+
+## Results
+
+Candidates and verifies per MB:
+
+| Corpus | prefix-3 candidates | prefix-4 candidates | prefix-4 verifies | no-defer candidates | no-defer verifies | atoms candidates | atoms verifies |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| B1 (356 MB) | 405,240 | 133,842 | 1,970,191 | 24,180 | 19,818 | **2,021** | **224** |
+| B2 (366 MB) | 292,016 | 55,344 | 283,683 | 47,230 | 27,473 | **6,559** | **306** |
+| S1 (15 MB) | 795,452 | 168,514 | 138,555 | 40,813 | 34,636 | **13,272** | **121** |
+
+- Against ClamAV's prefix depth (prefix-3), atom selection with deferral produces **200x fewer
+  candidates on B1, 45x on B2 and 60x on S1**, and 1,800x, 950x and 6,600x fewer positions
+  that reach a verifier. Against 4-byte prefixes through the same machinery it is 66x, 8x and
+  13x fewer candidates. **Pass line met.**
+- Deferral alone (no-defer against atoms) divides candidates by 12, 7 and 3 and verifies by
+  88, 90 and 290, and shrinks the shared atom table from 92 MB to 23 MB. The second pass
+  searched 339 deferred programs per MB on B1 (21 on B2, 0.14 on S1), all batched into one
+  pass per file.
+- Time per core moves with the counters (measured on a shared machine, so noisy): prefix-4
+  3.4 MB/s on B1 and 10 MB/s on B2, no-defer 130 and 87 MB/s, atoms 260 to 325 and 150 to
+  165 MB/s.
+- Limits: verify-budget events on B1 fall from 57 files (prefix-4) and 43 (no-defer) to 0; the
+  6 left are PCRE step budgets.
+
+By filter, atoms on B1 (per MB): stride 8, 887 candidates and 83 verifies; stride 4, 839 and 36;
+stride 1, 130 and 6; 3-gram, 111 and 64; 2-gram, 54 and 35. On S1 the sampled filters carry
+almost everything (7,875 and 5,162 candidates): English and mail words (`http`, `.com`, `mail`,
+`list`) are grams of type-0 text signatures, which the B1 model rates rarer than mail shows.
+Follow-up: zig-utils/zig-anti-virus#108.
+
+## Deferral changes no detection
+
+`zig build prefilter -- planted <db> --limit 2000` takes every 160th logical signature without a
+pinned subsig (1,988 of them, 1,965 with deferred subsigs), synthesises each hex subsig's first
+variant (shortest gaps, first alternatives) into one file per signature, and scans it with the
+prefiltered path (deferral on) and the reference path (every program searched): 1,388 detected
+by both (one of them reporting another signature of the same family first), 14 clean in both
+(their PCRE or byte-compare subsigs are not synthesised), 586 where the reference path ran out
+of logical state (it touches every short subsig the file contains) while the prefiltered path
+detected the planted signature, and no file where the two disagree. There is no malware corpus
+yet (M1, P5.17); this stands in for the differential on it.
+
+## Tier D
+
+Programs whose longest literal at a fixed distance is shorter than 4 bytes, by what happened
+to them (the coverage report's histogram):
+
+| | searched | deferred | anchored |
+|---|---:|---:|---:|
+| 3-byte literal | 2,307 | 866 | 426 |
+| 2-byte literal | 28 | 200 | 1,992 |
+| none | 0 | 0 | 0 |
+
+Deferred or anchored: 3,484 of 5,819, **60%. Pass line missed.** Almost every searched one is an
+`.ndb` body signature (2,289 in the PE partition, one generated family of
+`e8??000000{-50}86xxxx{-15}88xx{-50}ffex`), and `.ndb` signatures have no partner to defer
+behind. They are not left to the reference scanner: they get 3-byte or 2-byte atoms in their own
+stride-one filters, behind the 64 KiB gate (the gate passes 5.9% of B1 positions), with masked
+8-byte checks, and cost 165 candidates and 99 verifies per MB on B1 together. Follow-up:
+zig-utils/zig-anti-virus#107 for bounded expansions (nibble masks, short alternations)
+and sparse grams across single-byte wildcards, which would give most of this family 4-byte
+atoms.
+
+## Atoms by tier, whole database
+
+| Tier | searched | deferred | anchored |
+|---|---:|---:|---:|
+| A (stride 8) | 299,544 | 371,481 | 52,690 |
+| B (stride 4) | 81,108 | 301,654 | 410 |
+| C (stride 1) | 9,158 | 504,073 | 2,306 |
+| D (3-byte) | 2,307 | 866 | 426 |
+| D (2-byte) | 28 | 200 | 1,992 |
+
+1,178,274 of 1,570,219 searched programs are deferred. The tiers come from the window each
+program's cost picked, not from its longest literal: a long literal of zero padding next to a
+rare 3-byte opcode gets the 3-byte atom.
+
+## Replaced estimates
+
+- "at least 10x fewer candidates than prefix selection" [E]: 45x to 200x (B2, B1).
+- "at least 90% of tier D deferrable or anchorable" [E]: 60%; the rest costs 165 candidates per
+  MB on B1 through 3- and 2-byte atoms.
+- "Type-0 duplication costs a few MB" [E] (P4.04): avoided. One atom table is shared by every
+  partition (entries carry their target); each partition only repeats type 0's filters, about
+  0.4 MB per partition, 4.7 MB in all.

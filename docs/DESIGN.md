@@ -148,14 +148,14 @@ keys:    [N]u32 first 4 digest bytes, big-endian, sorted within each size bucket
 
 ### 3.4 Pattern sections
 
-**Partitions:** one per ClamAV target type (PE, OLE2, normalised HTML, mail, graphics, ELF, normalised ASCII, Mach-O, PDF, flash, Java). Each partition k ≥ 1 is built over its own atoms *plus* the type-0 atoms, so every stream is scanned exactly once.
+**Partitions:** one per ClamAV target type (PE, OLE2, normalised HTML, mail, graphics, ELF, normalised ASCII, Mach-O, PDF, flash, Java). Each partition k ≥ 1 is built over its own atoms *plus* the type-0 atoms, so every stream is scanned exactly once. All partitions share one `PREFILTER` section (a directory, then each partition's region) so a database stays well inside the section table (src/match/prefilter.zig).
 
 **`PREFILTER[p]`:**
-- A 64-byte header: q=4, stride, block count, seed.
-- The SBBF: 32-byte blocks of 8 x u32 words.
-- An optional stride-1 filter for tier C, and gram bitmaps for tier D.
+- A 64-byte header: partition, filter count, the one hash seed every filter shares (one hash per position serves them all), the list of programs with no atom, the gate.
+- Up to five zig-regex split-block Bloom filters (32-byte blocks of 8 x u32 words, 16 bits per gram): stride 8 and stride 4 over 4-byte grams (tiers A and B), stride 1 over 4-, 3- and 2-byte grams (tier C and tier D). Small filters get at least 2 KiB.
+- The stride-one gate: 64 KiB, one byte per possible first two bytes, naming the stride-one filters that hold a gram starting with them [M: passes 5.9% of B1 positions].
 
-**`ATOM_TABLE[p]`:** linear probing, at most 50% full. Slots are `{atom u32, first u32}`; entries are `{subsig u24, gram_off u8, flags u16, anchor_len u8, pad u8}`.
+**`ATOM_TABLE`:** one table shared by every partition, linear probing, at most 50% full. Slots are `{key u32, first u32}`; entries are `{prog u32, ext u32, back u32, ext_len u8, stride u8, q u8, flags u8}` with the program's target in the top nibble of `flags`, so a partition keeps only its own and type 0's entries and type 0's atoms are not copied per partition. `ext` holds up to 4 bytes after the key, or the index of a masked 8-byte check of the anchor part for atoms whose own bytes say little (zero padding beside a short opcode). Main + daily: 1,048,576 slots (28.6% used), 396,964 entries, 331,709 checks, 22.7 MB; the whole PREFILTER section is 32 MB [M].
 
 **`SUBSIG_PROG`:** one program per subsignature.
 - Header: ldb, index, target, modifiers (nocase, wide, ascii, fullword), offset kind and values, anchor location, min and max length.
@@ -192,18 +192,17 @@ Large sections (programs, cold rows, sort runs) live in spill files and are mapp
 
 ### 4.2 Atom selection and tiers
 
-For each subsignature, enumerate every fixed run of 4 bytes or more and every bounded expansion. Score each window by its estimated benign frequency, using a 4-gram model built from a benign corpus. Penalise padding runs and common prologues. Pick the rarest window.
+For each searched program (src/compile/atoms.zig), enumerate every window inside a literal at a fixed distance from its part's start, of `stride + 3` bytes for strides 8, 4 and 1, then 3- and 2-byte windows. A window costs its grams' summed benign probability times a probe (20 ns), its key gram's probability times a verify (200 ns), and a small bias for the filter its stride needs; the cheapest wins. Probabilities come from a 4-gram model of the benign corpus B1 (src/compile/gram_model.zig: bigram costs plus the 32,768 most frequent 4-grams, 230 KB, deterministic). A run of zeros beside a rare 3-byte opcode therefore gets the 3-byte atom.
 
-Tiers come from the length L of the rarest fixed run. E0 measured the longest fixed run of every subsignature [M]: `.ndb` subsigs are 98% tier A, but `.ldb` subsigs are 57% A, 17% B, 26% C and 0.17% D (2,521, of which 2,048 have a fixed offset). Tier C, not D, is the candidate-volume risk.
-- **A: L ≥ 11.** Stride 8; insert all 8 4-grams of the anchor.
-- **B: 7 ≤ L ≤ 10.** Stride 4.
-- **C: 4 ≤ L ≤ 6.** Stride 1, in a separate smaller filter.
-- **D: L ≤ 3.** Handled in this order:
-  1. *Deferred* behind a required tier A-C partner in the same logical signature.
-  2. *Anchored*, if it has an offset.
-  3. Otherwise gram bitmaps. E0 and E3 size this.
+Tiers name the window chosen:
+- **A: stride 8**, all 8 4-grams of an 11-byte window in the filter.
+- **B: stride 4.**
+- **C: stride 1**, behind the stride-one gate.
+- **D: a 3-byte or 2-byte atom**, stride 1, behind the gate; no atom at all only for programs without a 2-byte literal (none in main + daily).
 
-Per-byte cost depends on whether a partition contains tier C or D at all, not on the total number of signatures.
+**Deferral by covers** (P4.10, Hyperscan's Rose idea applied to ClamAV expressions): a cover of a logical expression is a set of subsigs one of which must match whenever it holds (`0&1`: either; `0|1`: both; `(0|1)>2`: both; byte compares by their trigger, PCRE by its trigger expression, pinned subsigs free). Only the cheapest cover is searched; every other subsig, of any tier, is deferred to a second pass over files whose signature was touched, all pending atoms in one batched pass. Expressions without a cover defer nothing, so detections are those of searching everything (planted differential on the full database: no mismatch).
+
+Main + daily [M, E3]: 1,570,219 searched programs, 1,178,274 deferred; searched A 299,544, B 81,108, C 9,158, D 2,335. Against ClamAV's depth-3 prefixes this gives 200x fewer candidates on B1 and 45x on B2; deferral alone divides candidates by 7 to 12 and verifies by about 90. Tier D: 60% deferred or anchored (pass line 90%: missed); the rest are `.ndb` signatures with no partner, held to 165 candidates per MB on B1 by 3- and 2-byte atoms (follow-up: bounded expansions and sparse grams, #107).
 
 ### 4.3 PCRE, YARA, Guardian rules, container signatures
 
@@ -248,9 +247,10 @@ miss -> read first 4 KiB -> file-type trie
 **Stage 1:**
 - For each sampled position: load a u32, multiply-hash it, choose a block, and test 8 bits in one SIMD compare.
 - Append the position to the ring without a branch.
-- Positions are independent, so many misses stay in flight. An Aho-Corasick walk is a chain of dependent loads, and once the automaton outgrows L2 it is latency-bound at roughly 70-200 MB/s [E].
+- Positions are independent, so many misses stay in flight. An Aho-Corasick walk is a chain of dependent loads: zig-regex's sparse automaton over 400k binary literals scans at 40 MB/s, and the dense one is not built past 100k [M].
 - Vectorise the hashing (overlapping loads from one vector via comptime shuffles), not the probes.
-- Estimated about 2 cycles per byte for a PE partition with only tiers A and B, roughly 2 GB/s per core [E].
+- The sampled filters hash their four lanes per 16 bytes in one vector; the stride-one filters run only behind the gate, one byte load per position, and test only the lanes and filters it names.
+- Measured on B1 with the full database (E2) [M]: strides 8 and 4 alone 2.26 GB/s per core; the PE partition with every tier 0.76-0.88 GB/s, 0.69-0.70 GB/s with stage two (Apple M3 Pro, shared machine). Per tier over random data: tier A 1.7-2.1 GB/s, tiers A and B 2.1 GB/s (M3 Pro, EPYC 9V74). The 1 GB/s pass line is missed because of the stride-one tier.
 
 **Verify VM:**
 - Starts at the anchor part and searches the other parts within their gap bounds, using SIMD memchr and masked compares.
@@ -500,9 +500,9 @@ bench/         corpus manifests, runner, memory sampler, clamd driver, gates
 |---|---|---|
 | E0 | Database census: counts by extension, target and offset kind; tier histogram; size-less hashes; size coverage; name tokenisation; PCRE count; functionality levels ([results](experiments/E0-census.md)) | produces the numbers that replace the [E] figures |
 | E1 | Hash index lookup cost, warm and cold; share of hashed bytes skipped ([results](experiments/E1-hash-index.md)) | lookup ≤ 300 ns warm; ≥ 70% of MD5 bytes skipped on B1 |
-| E2 | Prefilter bake-off: SBBF vs FDR shift-or vs double-array Aho-Corasick vs Teddy | PE partition ≥ 1 GB/s per core including stage 2 |
-| E3 | Atom selection vs prefix selection; tier-D deferral coverage | ≥ 10x fewer candidates; ≥ 90% of tier D deferrable or anchorable |
-| E4 | Verify VM worst case on A1 | no input over 50 ms/MB |
+| E2 | Prefilter bake-off: SBBF vs FDR shift-or vs double-array Aho-Corasick vs Teddy ([results](experiments/E2-prefilter.md)) | PE partition ≥ 1 GB/s per core including stage 2 |
+| E3 | Atom selection vs prefix selection; tier-D deferral coverage ([results](experiments/E3-atoms.md)) | ≥ 10x fewer candidates; ≥ 90% of tier D deferrable or anchorable |
+| E4 | Verify VM worst case on A1 ([results](experiments/E4-verify.md)) | no input over 50 ms/MB |
 | E5 | Memory: idle, nominal, peak; reload under load | 24 / 64 MB; reload ≤ 2 MB |
 | E6 | pread vs mmap vs io_uring; munmap shootdowns; cache hygiene | pick defaults; io_uring ≥ 2x fewer µs per small file |
 | E7 | std flate, zstd, xz vs zlib-ng, libdeflate, libzstd ([results](experiments/E7-decoders.md)) | std flate ≥ 60% of zlib-ng, otherwise optimise |
