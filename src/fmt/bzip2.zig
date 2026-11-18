@@ -12,7 +12,49 @@
 //! as unsupported rather than decoded.
 const std = @import("std");
 const Io = std.Io;
-const Crc = std.hash.crc.@"CRC-32/BZIP2";
+
+/// CRC-32/BZIP2 (polynomial 0x04C11DB7, MSB first, no reflection) with slicing-by-8 tables.
+/// std.hash.crc.Generic updates the non-reflected CRCs a byte at a time, which cost a tenth of
+/// the decode time here; this has the same init/update/final shape as std's, so it could replace
+/// the byte loop there for every MSB-first CRC.
+const Crc = struct {
+    state: u32 = 0xffffffff,
+
+    const tables = blk: {
+        @setEvalBranchQuota(20_000);
+        var t: [8][256]u32 = undefined;
+        for (0..256) |i| {
+            var c: u32 = @as(u32, i) << 24;
+            for (0..8) |_| c = if (c & 0x80000000 != 0) (c << 1) ^ 0x04C11DB7 else c << 1;
+            t[0][i] = c;
+        }
+        for (1..8) |k| {
+            for (0..256) |i| t[k][i] = (t[k - 1][i] << 8) ^ t[0][t[k - 1][i] >> 24];
+        }
+        break :blk t;
+    };
+
+    pub fn init() Crc {
+        return .{};
+    }
+
+    pub fn update(c: *Crc, bytes: []const u8) void {
+        var crc = c.state;
+        var b = bytes;
+        while (b.len >= 8) {
+            const hi = crc ^ std.mem.readInt(u32, b[0..4], .big);
+            crc = tables[7][hi >> 24] ^ tables[6][(hi >> 16) & 0xff] ^ tables[5][(hi >> 8) & 0xff] ^ tables[4][hi & 0xff] ^
+                tables[3][b[4]] ^ tables[2][b[5]] ^ tables[1][b[6]] ^ tables[0][b[7]];
+            b = b[8..];
+        }
+        for (b) |x| crc = (crc << 8) ^ tables[0][(crc >> 24) ^ x];
+        c.state = crc;
+    }
+
+    pub fn final(c: Crc) u32 {
+        return ~c.state;
+    }
+};
 
 pub const Error = error{
     BadHeader,
@@ -37,8 +79,14 @@ pub fn workingSet(level: u8) usize {
     return @as(usize, level) * 100_000 * 4 + @sizeOf(Tables);
 }
 
+/// Codes up to this long decode in one lookup; longer ones continue through limit/base.
+const lookup_bits = 10;
+
 const Tables = struct {
     selectors: [max_selectors]u8,
+    /// Per group, indexed by the next `lookup_bits` bits: symbol << 5 | code length, or 0 when
+    /// the code is longer.
+    lookup: [max_groups][1 << lookup_bits]u16,
     lens: [max_groups][max_alpha]u8,
     limit: [max_groups][max_code_len + 2]i32,
     base: [max_groups][max_code_len + 2]i32,
@@ -186,14 +234,17 @@ pub const Decoder = struct {
             if (magic != end_magic) return error.BadBlock;
             const combined = try d.take(32);
             if (combined != d.stream_crc) return error.BadCrc;
-            // Byte-align, then another stream may follow.
+            // Byte-align, then another stream may follow. The block loop refills a word at a
+            // time, so the next stream's first bytes may already be in the bit buffer.
             d.nbits -= d.nbits % 8;
-            if (d.nbits != 0) return error.BadBlock;
-            const next = d.in.peek(4) catch return false;
+            var next: [4]u8 = undefined;
+            var have: usize = 0;
+            while (have < 4 and d.nbits >= 8) : (have += 1) next[have] = @intCast(try d.take(8));
+            if (have < 4) @memcpy(next[have..], d.in.peek(4 - have) catch return false);
             if (!std.mem.eql(u8, next[0..3], "BZh") or next[3] < '1' or next[3] > '9') return false;
             const level_max: u32 = @as(u32, next[3] - '0') * 100_000;
             if (level_max > d.tt.len) return false;
-            d.in.toss(4);
+            if (have < 4) d.in.toss(4 - have);
             d.block_max = level_max;
             d.stream_crc = 0;
         }
@@ -279,7 +330,7 @@ pub const Decoder = struct {
             try buildTable(t, g, alpha);
         }
 
-        // MTF/RLE2 decode into tt.
+        // MTF/RLE2 decode into tt. The bit buffer lives in locals for the loop.
         var mtf: [256]u8 = undefined;
         for (&mtf, 0..) |*m, i| m.* = @intCast(i);
         const eob = n_in_use + 1;
@@ -289,6 +340,14 @@ pub const Decoder = struct {
         var g: usize = 0;
         var run: u32 = 0;
         var run_weight: u32 = 1;
+        var bits = d.bits;
+        var nbits: u32 = d.nbits;
+        defer {
+            d.bits = bits;
+            d.nbits = @intCast(nbits);
+        }
+        const in = d.in;
+        const tt = d.tt;
         while (true) {
             if (group_left == 0) {
                 if (sel >= n_selectors) return error.BadBlock;
@@ -297,7 +356,41 @@ pub const Decoder = struct {
                 group_left = group_size;
             }
             group_left -= 1;
-            const sym = try d.decodeSymbol(g);
+            // Refill to at least 20 bits (the longest code). A valid block is followed by at
+            // least the 80-bit end-of-stream marker, so running dry here means truncation.
+            if (nbits < max_code_len) {
+                if (in.end - in.seek >= 8) {
+                    const word = std.mem.readInt(u64, in.buffer[in.seek..][0..8], .big);
+                    const take_n = (63 - nbits) >> 3;
+                    bits = (bits << @intCast(take_n * 8)) | (word >> @intCast(64 - take_n * 8));
+                    in.seek += take_n;
+                    nbits += take_n * 8;
+                } else while (nbits < max_code_len) {
+                    const b = in.takeByte() catch |e| return e;
+                    bits = (bits << 8) | b;
+                    nbits += 8;
+                }
+            }
+            const peek: u32 = @intCast((bits >> @intCast(nbits - lookup_bits)) & ((1 << lookup_bits) - 1));
+            const hit = t.lookup[g][peek];
+            var sym: u32 = undefined;
+            if (hit != 0) {
+                nbits -= hit & 31;
+                sym = hit >> 5;
+            } else {
+                var len: u32 = lookup_bits + 1;
+                while (true) : (len += 1) {
+                    if (len > max_code_len) return error.BadHuffman;
+                    const code: i32 = @intCast((bits >> @intCast(nbits - len)) & ((@as(u64, 1) << @intCast(len)) - 1));
+                    if (code <= t.limit[g][len]) {
+                        const idx = code - t.base[g][len];
+                        if (idx < 0 or idx >= max_alpha) return error.BadHuffman;
+                        sym = t.perm[g][@intCast(idx)];
+                        nbits -= len;
+                        break;
+                    }
+                }
+            }
             if (sym <= 1) {
                 // RUNA/RUNB: bijective base-2 run length of the front symbol.
                 if (run_weight > d.block_max) return error.BadBlock;
@@ -309,7 +402,7 @@ pub const Decoder = struct {
             if (run > 0) {
                 if (n + run > d.block_max) return error.BadBlock;
                 const b = seq_to_unseq[mtf[0]];
-                @memset(d.tt[n..][0..run], b);
+                @memset(tt[n..][0..run], b);
                 n += run;
                 run = 0;
                 run_weight = 1;
@@ -318,29 +411,21 @@ pub const Decoder = struct {
             if (n >= d.block_max) return error.BadBlock;
             const idx = sym - 1;
             const v = mtf[idx];
-            std.mem.copyBackwards(u8, mtf[1 .. idx + 1], mtf[0..idx]);
+            // Most indices are small: a byte loop beats a memmove call.
+            var k = idx;
+            while (k >= 4) : (k -= 4) {
+                mtf[k] = mtf[k - 1];
+                mtf[k - 1] = mtf[k - 2];
+                mtf[k - 2] = mtf[k - 3];
+                mtf[k - 3] = mtf[k - 4];
+            }
+            while (k > 0) : (k -= 1) mtf[k] = mtf[k - 1];
             mtf[0] = v;
-            d.tt[n] = seq_to_unseq[v];
+            tt[n] = seq_to_unseq[v];
             n += 1;
         }
         if (n == 0) return error.BadBlock;
         return n;
-    }
-
-    fn decodeSymbol(d: *Decoder, g: usize) Error!u32 {
-        const t = d.tables;
-        var len: u6 = @intCast(t.min_len[g]);
-        var code: i32 = @intCast(try d.take(len));
-        while (true) {
-            if (code <= t.limit[g][len]) {
-                const idx = code - t.base[g][len];
-                if (idx < 0 or idx >= max_alpha) return error.BadHuffman;
-                return t.perm[g][@intCast(idx)];
-            }
-            len += 1;
-            if (len > max_code_len) return error.BadHuffman;
-            code = (code << 1) | try d.bit();
-        }
     }
 };
 
@@ -381,6 +466,26 @@ fn buildTable(t: *Tables, g: usize, alpha: u32) Error!void {
         code <<= 1;
     }
     t.min_len[g] = min;
+
+    // One-lookup table for codes up to `lookup_bits` long, filled from the canonical codes.
+    const look = &t.lookup[g];
+    @memset(look, 0);
+    var next_code: [max_code_len + 2]u32 = undefined;
+    var c: u32 = 0;
+    for (1..max_code_len + 1) |ln| {
+        next_code[ln] = c;
+        c = (c + @as(u32, @intCast(count[ln]))) << 1;
+    }
+    for (0..alpha) |sym| {
+        const ln = t.lens[g][sym];
+        const cw = next_code[ln];
+        next_code[ln] += 1;
+        if (ln > lookup_bits) continue;
+        const shift: u5 = @intCast(lookup_bits - ln);
+        const first = cw << shift;
+        const entry: u16 = @intCast((sym << 5) | ln);
+        @memset(look[first..][0 .. @as(u32, 1) << shift], entry);
+    }
 }
 
 fn decodeAll(gpa: std.mem.Allocator, compressed: []const u8) ![]u8 {
@@ -431,4 +536,16 @@ test "corrupt streams fail cleanly" {
         if (decodeAll(gpa, copy)) |out| gpa.free(out) else |_| {}
     }
     try std.testing.expectError(error.BadHeader, decodeAll(gpa, "BZx9"));
+}
+
+test "slicing-by-8 CRC matches std's CRC-32/BZIP2" {
+    var buf: [1000]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(3);
+    prng.random().bytes(&buf);
+    for ([_]usize{ 0, 1, 7, 8, 9, 63, 1000 }) |len| {
+        var ours: Crc = .init();
+        ours.update(buf[0 .. len / 2]);
+        ours.update(buf[len / 2 .. len]);
+        try std.testing.expectEqual(std.hash.crc.@"CRC-32/BZIP2".hash(buf[0..len]), ours.final());
+    }
 }
