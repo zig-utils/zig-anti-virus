@@ -15,6 +15,7 @@ const targets = [_]Target{
     .{ .name = "cveVersion", .run = cveVersion },
     .{ .name = "macosPlist", .run = macosPlist },
     .{ .name = "cveFeeds", .run = cveFeeds },
+    .{ .name = "cveIndex", .run = cveIndex },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -277,4 +278,28 @@ pub fn cveFeeds(gpa: std.mem.Allocator, random: std.Random) !void {
             _ = feeds.osvZipRecords(gpa, mutateCopy(random, &buf, feeds.fixtures.osv_zip), {}, Sink.each) catch {};
         },
     }
+}
+
+/// .zavcve sections with flipped bytes: queries must stay in bounds.
+pub fn cveIndex(gpa: std.mem.Allocator, random: std.Random) !void {
+    const index = zav.cve.index;
+    const feeds = zav.cve.feeds;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var b = index.Builder.init(gpa);
+    defer b.deinit();
+    try b.addNvd(try feeds.parseNvdPage(arena.allocator(), feeds.fixtures.nvd_log4shell));
+    try b.addOsv(try feeds.parseOsv(arena.allocator(), feeds.fixtures.osv_lodash));
+    var s = try b.serialize();
+    defer s.deinit(gpa);
+    const lists = [_]*std.ArrayList(u8){ &s.strings, &s.records, &s.packages, &s.package_ranges, &s.cpes, &s.cpe_ranges };
+    for (0..random.uintLessThan(usize, 16)) |_| {
+        const l = lists[random.uintLessThan(usize, lists.len)];
+        if (l.items.len > 0) l.items[random.uintLessThan(usize, l.items.len)] = random.int(u8);
+    }
+    const idx = index.Index.fromBytes(.{ .strings = s.strings.items, .records = s.records.items, .packages = s.packages.items, .package_ranges = s.package_ranges.items, .cpes = s.cpes.items, .cpe_ranges = s.cpe_ranges.items }) catch return;
+    var hits: [8]index.Hit = undefined;
+    for (idx.queryPackage("npm", "lodash", "4.17.20", &hits)) |h| _ = idx.info(h.record);
+    for (idx.queryCpe("apache", "log4j", "2.14.1", &hits)) |h| _ = idx.info(h.record);
+    _ = idx.find("CVE-2021-44228");
 }

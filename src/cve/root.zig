@@ -3,8 +3,10 @@
 
 pub const version = @import("version.zig");
 pub const feeds = @import("feeds.zig");
+pub const index = @import("index.zig");
 
 test {
     _ = version;
     _ = feeds;
+    _ = index;
 }

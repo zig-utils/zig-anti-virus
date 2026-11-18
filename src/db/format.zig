@@ -11,6 +11,9 @@ comptime {
 }
 
 pub const magic = "ZAVDB\x00\r\n".*;
+/// The CVE index (.zavcve) uses the same container with its own magic, so neither file can be
+/// opened as the other.
+pub const cve_magic = "ZAVCVE\x00\n".*;
 pub const format_major: u16 = 1;
 pub const format_minor: u16 = 0;
 pub const header_size: u32 = 4096;
@@ -81,6 +84,13 @@ pub const SectionKind = enum(u32) {
     yara_cond = 16,
     delta_index = 17,
     coverage_report = 18,
+    // .zavcve sections (src/cve/index.zig).
+    cve_strings = 32,
+    cve_records = 33,
+    cve_packages = 34,
+    cve_package_ranges = 35,
+    cve_cpes = 36,
+    cve_cpe_ranges = 37,
     _,
 };
 

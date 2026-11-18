@@ -34,6 +34,8 @@ pub const Error = error{
 pub const TrustedKey = struct { public_key: [32]u8 };
 
 pub const OpenOptions = struct {
+    /// The container kind expected: format.magic or format.cve_magic.
+    magic: [8]u8 = format.magic,
     /// Keys whose signatures are accepted.
     trusted_keys: []const TrustedKey = &.{},
     /// Accept a database with no signature (local development only).
@@ -69,7 +71,7 @@ pub const Database = struct {
 pub fn validate(bytes: []const u8, options: OpenOptions) Error!void {
     if (bytes.len < format.header_size) return error.TooSmall;
     const h: *const format.Header = @ptrCast(@alignCast(bytes.ptr));
-    if (!std.mem.eql(u8, &h.magic, &format.magic)) return error.BadMagic;
+    if (!std.mem.eql(u8, &h.magic, &options.magic)) return error.BadMagic;
     if (h.format_major != format.format_major) return error.UnsupportedVersion;
     if (h.header_size != format.header_size or h.section_table_offset != format.section_table_offset) return error.BadHeader;
     if (h.total_size != bytes.len) return error.SizeMismatch;

@@ -18,6 +18,8 @@ pub const Section = struct {
 };
 
 pub const Options = struct {
+    /// format.magic for signature databases, format.cve_magic for the CVE index.
+    magic: [8]u8 = format.magic,
     db_version: u64,
     build_unix_time: u64 = 0,
     feature_flags: u64 = 0,
@@ -76,6 +78,7 @@ pub fn plan(sections: []const Section, options: Options) Error!Layout {
 
     const h = layout.header();
     h.* = .{
+        .magic = options.magic,
         .feature_flags = options.feature_flags,
         .db_version = options.db_version,
         .build_unix_time = options.build_unix_time,
