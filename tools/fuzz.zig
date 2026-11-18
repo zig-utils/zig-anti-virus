@@ -680,11 +680,31 @@ const Formats = struct {
         .{ .name = "fmt.xz", .inputs = vectors(&fixtures.xz_vectors ++ fixtures.lzma_vectors) },
         .{ .name = "fmt.zstd", .inputs = vectors(&fixtures.zstd_vectors) },
         .{ .name = "fmt.bomb", .inputs = vectors(&fixtures.bomb_vectors) },
+        .{ .name = "fmt.tar", .inputs = archives(".tar") },
+        .{ .name = "fmt.cpio", .inputs = archives(".cpio") },
     };
 
     fn vectors(comptime vs: []const fixtures.Vector) []const []const u8 {
         comptime var out: [vs.len][]const u8 = undefined;
         inline for (vs, 0..) |v, i| out[i] = v.compressed;
+        const final = out;
+        return &final;
+    }
+
+    fn archives(comptime needle: []const u8) []const []const u8 {
+        @setEvalBranchQuota(1_000_000);
+        comptime var n: usize = 0;
+        inline for (fixtures.archives) |a| {
+            if (comptime std.mem.indexOf(u8, a.name, needle) != null) n += 1;
+        }
+        comptime var out: [n][]const u8 = undefined;
+        comptime var i: usize = 0;
+        inline for (fixtures.archives) |a| {
+            if (comptime std.mem.indexOf(u8, a.name, needle) != null) {
+                out[i] = a.bytes;
+                i += 1;
+            }
+        }
         const final = out;
         return &final;
     }

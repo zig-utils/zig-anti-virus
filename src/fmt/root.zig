@@ -10,6 +10,9 @@ pub const bzip2 = @import("bzip2.zig");
 pub const lzma = @import("lzma.zig");
 pub const xz = @import("xz.zig");
 pub const zstd = @import("zstd.zig");
+pub const archive = @import("archive.zig");
+pub const tar = @import("tar.zig");
+pub const cpio = @import("cpio.zig");
 /// Reference vectors (tests, fuzzing, benchmarks).
 pub const fixtures = @import("fixtures/fixtures.zig");
 
@@ -23,4 +26,7 @@ test {
     _ = lzma;
     _ = xz;
     _ = zstd;
+    _ = archive;
+    _ = tar;
+    _ = cpio;
 }

@@ -19,6 +19,9 @@ const Error = container.Error;
 const detect = @import("detect.zig");
 const Format = detect.Format;
 const decode = @import("decode.zig");
+const archive = @import("archive.zig");
+const tar = @import("tar.zig");
+const cpio = @import("cpio.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -39,6 +42,14 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
             var sr: container.SourceReader = .init(w.io, src, buf);
             try decompress(w, obj, &sr.interface, &sr.pulled);
         },
+        .tar => {
+            var cursor: archive.Cursor = .{ .w = w, .positional = src };
+            try tar.walk(w, &cursor);
+        },
+        .cpio => {
+            var cursor: archive.Cursor = .{ .w = w, .positional = src };
+            try cpio.walk(w, &cursor);
+        },
         else => {},
     }
 }
@@ -56,6 +67,14 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     defer tee.interface = undefined;
     switch (obj.format) {
         .gzip, .bzip2, .xz, .zstd => try decompress(w, obj, &tee.interface, &tee.pulled),
+        .tar => {
+            var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
+            try tar.walk(w, &cursor);
+        },
+        .cpio => {
+            var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
+            try cpio.walk(w, &cursor);
+        },
         else => {},
     }
     try w.drain(&tee.interface);
@@ -217,5 +236,39 @@ test "a decompression bomb of each format stops at the ratio limit with an event
         // in the first block), not at 64 MiB.
         const bound = 100 * @max(v.compressed.len, 1024 * 1024 / 100) + 2 * container.block_len;
         for (rig.rec.objects.items) |e| if (e.kind == .decompressed) try std.testing.expect(e.bytes <= bound);
+    }
+}
+
+test "archives: every tar and cpio variant, positional and streamed" {
+    for (fixtures.archives) |a| {
+        if (std.mem.indexOf(u8, a.name, ".tar") == null and std.mem.indexOf(u8, a.name, ".cpio") == null) continue;
+        var rig: TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(a.bytes, a.name);
+        for (a.members) |m| {
+            var path_buf: [2048]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ a.name, m.path });
+            var seen: usize = 0;
+            for (rig.rec.objects.items) |e| if (std.mem.eql(u8, e.path, path)) {
+                seen += 1;
+                std.testing.expectEqual(@as(u64, m.len), e.bytes) catch |err| {
+                    std.debug.print("{s}: {s}\n", .{ a.name, path });
+                    return err;
+                };
+                try std.testing.expectEqual(m.crc, e.crc);
+            };
+            if (seen != 2) {
+                std.debug.print("{s}: member {s} seen {d} times\n", .{ a.name, path, seen });
+                rig.rec.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (a.malformed != rig.rec.has(.malformed)) {
+            std.debug.print("{s}: malformed expected {}\n", .{ a.name, a.malformed });
+            rig.rec.dump();
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 0), rig.scratch.used());
     }
 }
