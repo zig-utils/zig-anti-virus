@@ -1,0 +1,11 @@
+{
+  "name": "zig-anti-virus",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Low-memory anti-malware engine and clamd-compatible daemon in Zig",
+  "scripts": {
+    "check:pin": "bun scripts/check-pin.ts",
+    "release": "pantry release patch --yes",
+    "release:minor": "pantry release minor --yes"
+  }
+}

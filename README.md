@@ -38,6 +38,17 @@ These are design targets, to be proven by the benchmark gates:
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
 
+## Development
+
+Zig `0.17.0-dev.1857+3c46da14d` (`pantry install` provides it from deps.yaml).
+
+```sh
+zig build && zig build test && zig build lib
+./zig-out/bin/zav --version
+```
+
+Contributor rules are in [AGENTS.md](AGENTS.md).
+
 ## License
 
 MIT
