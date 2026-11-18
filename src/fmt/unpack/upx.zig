@@ -2,7 +2,8 @@
 //! UPX's public documentation (no UPX source is used): the l_info / p_info / b_info block chain of
 //! ELF and Mach-O executables, the PackHeader of PE executables, the NRV2B, NRV2D and NRV2E
 //! bit streams (8-bit, 16-bit and 32-bit little-endian bit buffers), UPX's two-byte LZMA header,
-//! and the x86 (0x49: E8, E9 and 0F 8x with a CTO byte) and ARM64 (0x52: B and BL) call filters.
+//! and the x86 (0x49: E8, E9 and 0F 8x with a CTO byte; 0x24 to 0x26: E8 and/or E9) and ARM64
+//! (0x52: B and BL) call filters.
 //!
 //! - ELF and Mach-O: the original file is rebuilt exactly. The first block holds the original
 //!   headers; each loadable segment's bytes follow in order (split into blocks of at most
@@ -190,15 +191,21 @@ fn decompress(w: *Walker, method: Method, src: []const u8, dst: []u8) DecodeErro
 }
 
 /// Undo UPX's call filters. 0x49: E8, E9 and 0F 8x followed by the CTO byte hold a big-endian
-/// 24-bit absolute target; 0x52: ARM64 B and BL hold an absolute word index.
+/// 24-bit absolute target (0x24, 0x25 and 0x26: the same for E8, E9, or both, without the
+/// conditional jumps); 0x52: ARM64 B and BL hold an absolute word index.
 pub fn unfilter(buf: []u8, id: u8, cto: u8) bool {
     switch (id) {
         0 => {},
-        0x49 => {
+        0x24, 0x25, 0x26, 0x49 => {
             var i: usize = 0;
             while (i + 5 <= buf.len) {
                 const op = buf[i];
-                const call = op == 0xe8 or op == 0xe9 or (i > 0 and buf[i - 1] == 0x0f and op & 0xf0 == 0x80);
+                const call = switch (id) {
+                    0x24 => op == 0xe8,
+                    0x25 => op == 0xe9,
+                    0x26 => op == 0xe8 or op == 0xe9,
+                    else => op == 0xe8 or op == 0xe9 or (i > 0 and buf[i - 1] == 0x0f and op & 0xf0 == 0x80),
+                };
                 if (call and buf[i + 1] == cto) {
                     const abs: u32 = (@as(u32, buf[i + 2]) << 16) | (@as(u32, buf[i + 3]) << 8) | buf[i + 4];
                     const rel = abs -% @as(u32, @truncate(i + 1));
