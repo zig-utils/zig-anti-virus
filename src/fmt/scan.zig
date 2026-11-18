@@ -28,6 +28,7 @@ const elf = @import("elf.zig");
 const macho = @import("macho.zig");
 const ole2 = @import("ole2.zig");
 const iso9660 = @import("iso9660.zig");
+const cab = @import("cab.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
@@ -69,6 +70,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .macho_fat => try macho.walkFat(w, src),
         .ole2 => try ole2.walk(w, src),
         .iso9660 => try iso9660.walk(w, src),
+        .cab => try cab.walk(w, src),
         .html => try normalizeHtml(w, src),
         .binary, .text => {
             if (obj.format == .text) {
@@ -110,7 +112,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
         .text => try normalizeText(w, &tee.interface),
-        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .html => {
+        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             checkEntropy(w, obj.format, mat.source);
@@ -171,6 +173,7 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
         .macho_fat => try macho.walkFat(w, src),
         .ole2 => try ole2.walk(w, src),
         .iso9660 => try iso9660.walk(w, src),
+        .cab => try cab.walk(w, src),
         .html => try normalizeHtml(w, src),
         else => unreachable,
     }
@@ -475,6 +478,8 @@ test "archives: every tar, cpio and zip variant, positional and streamed" {
             .{ .name = "macro.docm", .what = .macros },
             .{ .name = "macro.docm", .what = .external },
             .{ .name = "macro.docm", .what = .embedded },
+            .{ .name = "quantum.cab", .what = .unsupported },
+            .{ .name = "overlap.cab", .what = .overlap },
         }) |x| if (std.mem.eql(u8, a.name, x.name) and !rig.rec.has(x.what)) {
             std.debug.print("{s}: expected a {t} notice\n", .{ a.name, x.what });
             rig.rec.dump();

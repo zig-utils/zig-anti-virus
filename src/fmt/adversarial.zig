@@ -122,6 +122,8 @@ test "bombs and nesting stop at their limits within bounds" {
         .{ .name = "deep-40.gz", .bytes = archive("deep-40.gz"), .expect = .{ .limit = .recursion }, .max_ms = 5_000, .lim = tight },
         // ISO 9660: 24 levels of directories, each listing the next twice (2^24 paths).
         .{ .name = "dag-bomb.iso", .bytes = archive("dag-bomb.iso"), .expect = .{ .notice = .overlap }, .max_ms = 2_000, .lim = tight },
+        // A cabinet folder of 2048 MSZIP blocks, 64 MiB of zeros.
+        .{ .name = "zeros-bomb.cab", .bytes = archive("zeros-bomb.cab"), .expect = .{ .limit = .ratio }, .max_ms = 5_000, .lim = tight },
     };
     for (cases) |c| try run(c);
     for (fixtures.bomb_vectors) |v| try run(.{ .name = v.name, .bytes = v.compressed, .expect = .{ .limit = .ratio }, .max_ms = 10_000, .lim = tight });

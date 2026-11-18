@@ -237,6 +237,44 @@ pub const archives = [_]Archive{
         .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
         .{ .path = "tools/eicar.com", .len = 68, .crc = 0x6851cf3c },
     } },
+    .{ .name = "stored.cab", .bytes = @embedFile("archive-stored.cab.bin"), .malformed = false, .members = &.{
+        .{ .path = "a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "dir/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "mszip.cab", .bytes = @embedFile("archive-mszip.cab.bin"), .malformed = false, .members = &.{
+        .{ .path = "big.bin", .len = 100000, .crc = 0x420ed0d8 },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+        .{ .path = "a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "dir/b.bin", .len = 3000, .crc = 0xdb24f08b },
+    } },
+    .{ .name = "lzx.cab", .bytes = @embedFile("archive-lzx.cab.bin"), .malformed = false, .members = &.{
+        .{ .path = "code.exe", .len = 70000, .crc = 0xbdb47b09 },
+        .{ .path = "big.bin", .len = 100000, .crc = 0x420ed0d8 },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "lzx21.cab", .bytes = @embedFile("archive-lzx21.cab.bin"), .malformed = false, .members = &.{
+        .{ .path = "a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "dir/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "reserve.cab", .bytes = @embedFile("archive-reserve.cab.bin"), .malformed = false, .members = &.{
+        .{ .path = "a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "dir/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "badsum.cab", .bytes = @embedFile("archive-badsum.cab.bin"), .malformed = true, .members = &.{
+        .{ .path = "a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "dir/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "quantum.cab", .bytes = @embedFile("archive-quantum.cab.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "overlap.cab", .bytes = @embedFile("archive-overlap.cab.bin"), .malformed = true, .members = &.{
+        .{ .path = "a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "dir/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "zeros-bomb.cab", .bytes = @embedFile("archive-zeros-bomb.cab.bin"), .malformed = false, .members = &.{} },
     .{ .name = "dag-bomb.iso", .bytes = @embedFile("archive-dag-bomb.iso.bin"), .malformed = false, .members = &.{} },
 };
 

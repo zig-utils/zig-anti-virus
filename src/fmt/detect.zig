@@ -25,6 +25,7 @@ pub const Format = enum(u8) {
     ole2,
     /// Phase-three containers (P5.18).
     iso9660,
+    cab,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
@@ -37,7 +38,7 @@ pub const Format = enum(u8) {
     /// Formats parsed with positional reads (central directories, section tables).
     pub fn needsRandomAccess(f: Format) bool {
         return switch (f) {
-            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660 => true,
+            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab => true,
             else => false,
         };
     }
@@ -68,6 +69,7 @@ pub fn detect(head: []const u8) Format {
             else => {},
         }
     }
+    if (std.mem.startsWith(u8, head, "MSCF\x00\x00\x00\x00")) return .cab;
     if (std.mem.startsWith(u8, head, "MZ")) return .pe;
     if (isCpio(head)) return .cpio;
     if (isTar(head)) return .tar;
@@ -154,6 +156,7 @@ test "magic numbers" {
     try std.testing.expectEqual(Format.macho_fat, detect("\xca\xfe\xba\xbe\x00\x00\x00\x02"));
     try std.testing.expectEqual(Format.binary, detect("\xca\xfe\xba\xbe\x00\x00\x00\x34")); // Java class
     try std.testing.expectEqual(Format.pe, detect("MZ\x90\x00"));
+    try std.testing.expectEqual(Format.cab, detect("MSCF\x00\x00\x00\x00\x10\x00"));
     try std.testing.expectEqual(Format.cpio, detect("070701000000"));
     try std.testing.expectEqual(Format.html, detect("<!-- x -->\n<HTML><body>hi</body></HTML>"));
     try std.testing.expectEqual(Format.text, detect("just some words\n"));
