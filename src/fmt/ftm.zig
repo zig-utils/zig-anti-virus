@@ -12,8 +12,9 @@
 //! entries whose magic ends there. Body-format magics (magictype 1) are verify programs in
 //! SUBSIG_PROG variant 1. Classification of the first bytes of a file:
 //!
-//! 1. Every entry whose rtype is CL_TYPE_ANY competes; the longest match wins (the earliest
-//!    entry on ties). Fixed-offset body magics compete with their match length.
+//! 1. Every literal entry whose rtype is CL_TYPE_ANY competes; the longest match wins (the
+//!    earliest entry on ties). Body magics, at fixed offsets too, do not: libclamav matches them
+//!    with its pattern matcher, which re-types text and binary data (`retype`, step 4).
 //! 2. Entries whose rtype is the type found refine it, the same way, up to a few rounds.
 //! 3. With no magic at all the head is classified as ASCII text, UTF-8 text or binary data.
 //! 4. Body magics with offset `*` whose rtype is ANY or the final type are embedded-type
@@ -195,15 +196,9 @@ fn round(f: Ftm, head: []const u8, rtype: u16, options: Options, budget: *vm.Bud
             depth += 1;
         }
     }
-    if (f.programs) |ps| for (f.entries, 0..) |entry, i| {
-        if (entry.kind != .body or entry.offset == any_offset or !wanted(entry, rtype, options)) continue;
-        const p = ps.get(entry.prog);
-        // An EOF-relative magic needs the file's end; it applies when the head is the file.
-        if (p.offset().kind == .eof_minus and options.file_size != head.len) continue;
-        var s = vm.Scanner.init(p, head, .{ .size = head.len }, budget);
-        const m = (s.next() catch null) orelse continue;
-        best.offer(m.end - m.start, i);
-    };
+    // Body magics never take part here: libclamav matches them with its pattern matcher, which
+    // only types text and binary data (`embeddedType`).
+    _ = budget;
     return best.entry;
 }
 
@@ -389,6 +384,31 @@ const rank_sfx = 563;
 /// cli_determine_fmap_type reads (1024 bytes) passes false, since libclamav computes no relative
 /// offsets for it. Returns the type the matches settle on (CL_TYPE_ANY when none matched).
 pub fn embeddedType(f: Ftm, data: []const u8, base: types.ClType, whole: bool, budget: *vm.Budget) types.ClType {
+    if (!whole) return windowType(f, data, base, .{ .absolute = true, .eof = false }, budget);
+    // scanraw matches a whole object in SCANBUFF windows (overlapping by the database's longest
+    // pattern; `window_overlap` stands in for it) and keeps the type latest in libclamav's order
+    // among the windows' results, so the rule above applies per window.
+    var best: types.ClType = .any;
+    var off: usize = 0;
+    while (true) {
+        const end = @min(data.len, off + window_len);
+        const last = end == data.len;
+        const t = windowType(f, data[off..end], base, .{ .absolute = off == 0, .eof = last }, budget);
+        if (clamRank(t) > clamRank(best)) best = t;
+        if (last) break;
+        off = end - window_overlap;
+    }
+    return best;
+}
+
+/// libclamav's SCANBUFF, the window its matcher scans an object in.
+pub const window_len = 128 * 1024;
+/// The overlap between windows (libclamav's maxpatlen, which depends on the whole database).
+pub const window_overlap = 512;
+
+const Offsets = struct { absolute: bool, eof: bool };
+
+fn windowType(f: Ftm, data: []const u8, base: types.ClType, offsets: Offsets, budget: *vm.Budget) types.ClType {
     const ps = f.programs orelse return .any;
     const Last = struct { end: usize, entry: usize, rank: u16, t: types.ClType };
     var last_sticky: ?Last = null;
@@ -406,8 +426,9 @@ pub fn embeddedType(f: Ftm, data: []const u8, base: types.ClType, whole: bool, b
         if (entry.rtype != 0 and entry.rtype != @backingInt(base)) continue;
         const p = ps.get(entry.prog);
         switch (p.offset().kind) {
-            .any, .absolute => {},
-            .eof_minus => if (!whole) continue,
+            .any => {},
+            .absolute => if (!offsets.absolute) continue,
+            .eof_minus => if (!offsets.eof) continue,
             else => continue,
         }
         var scanner = vm.Scanner.init(p, data, .{ .size = data.len }, budget);

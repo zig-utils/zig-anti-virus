@@ -150,7 +150,7 @@ fn kind(f: *const Fixture, head: []const u8) types.ClType {
     return ftm.classify(f.ftm, head, .{}, &budget).type;
 }
 
-test "overlapping magics: longest wins, rtype refines, body magics compete" {
+test "overlapping magics: longest literal wins, rtype refines, body magics re-type" {
     var f = try fixture(
         \\0:0:4d5a:DOS executable:CL_TYPE_ANY:CL_TYPE_MSEXE
         \\0:0:504b0304:ZIP:CL_TYPE_ANY:CL_TYPE_ZIP
@@ -174,9 +174,12 @@ test "overlapping magics: longest wins, rtype refines, body magics compete" {
     try std.testing.expectEqual(types.ClType.gif, kind(&f, "GIF89a..."));
     try std.testing.expectEqual(types.ClType.graphics, kind(&f, "GIF87a..."));
     try std.testing.expectEqual(types.ClType.elf, kind(&f, "\x7fELF\x02"));
-    // A longer literal and a longer body magic beat shorter ones.
-    try std.testing.expectEqual(types.ClType.html, kind(&f, "<html>"));
-    try std.testing.expectEqual(types.ClType.script, kind(&f, "<hXm"));
+    // Body magics do not classify; they re-type text and binary data, and when several match
+    // the type later in libclamav's order wins (HTML over SCRIPT).
+    try std.testing.expectEqual(types.ClType.text_ascii, kind(&f, "<html>"));
+    var rb: vm.Budget = .{};
+    try std.testing.expectEqual(types.ClType.html, ftm.retype(f.ftm, "<html>", .text_ascii, &rb).?);
+    try std.testing.expectEqual(types.ClType.script, ftm.retype(f.ftm, "<hXm", .text_ascii, &rb).?);
     // rtype: NSIS refines a PE, and only a PE.
     try std.testing.expectEqual(types.ClType.nulsft, kind(&f, "MZNullsoft"));
     try std.testing.expectEqual(types.ClType.msexe, kind(&f, "MZ......"));
@@ -242,4 +245,26 @@ test "a corrupt trie is refused" {
             _ = ftm.classify(t, "MZ\x90\x00PK", .{}, &budget);
         } else |_| {}
     }
+}
+
+test "embedded types over a whole object: the rule per scan window, the latest type across them" {
+    var f = try fixture(
+        \\1:*:3c68746d6c3e:HTML:CL_TYPE_ANY:CL_TYPE_HTML
+        \\1:*:4d5a50450000:PE:CL_TYPE_ANY:CL_TYPE_MSEXE
+        \\
+    );
+    defer f.deinit();
+    const gpa = std.testing.allocator;
+    const data = try gpa.alloc(u8, 3 * ftm.window_len);
+    defer gpa.free(data);
+    @memset(data, 'a');
+    var budget: vm.Budget = .{};
+    // In one window a later executable header takes over from HTML (CL_TYPE_MSEXE always does).
+    @memcpy(data[100..106], "<html>");
+    @memcpy(data[200..206], "MZPE\x00\x00");
+    try std.testing.expectEqual(types.ClType.msexe, ftm.embeddedType(f.ftm, data, .any, true, &budget));
+    // In separate windows the type later in libclamav's order wins: HTML.
+    @memset(data[200..206], 'a');
+    @memcpy(data[2 * ftm.window_len ..][0..6], "MZPE\x00\x00");
+    try std.testing.expectEqual(types.ClType.html, ftm.embeddedType(f.ftm, data, .any, true, &budget));
 }
