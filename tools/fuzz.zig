@@ -16,7 +16,8 @@ pub fn main(init: std.process.Init) !void {
     var cases: usize = 0;
     for (0..iterations) |i| {
         try cvdContainer(gpa.allocator(), random, if (i % 2 == 0) zav.compile.cvd.fixture_cvd else zav.compile.cvd.fixture_cld);
-        cases += 1;
+        hashLine(random);
+        cases += 2;
     }
     std.debug.print("fuzz: {d} cases, seed {d}, ok\n", .{ cases, seed });
 }
@@ -42,4 +43,22 @@ fn cvdContainer(gpa: std.mem.Allocator, random: std.Random, original: []const u8
     var walk_body: std.Io.Reader = .fixed(input[cvd.header_len..]);
     var drain: cvd.Drain = .{};
     cvd.walk(gpa, header, &walk_body, .{}, &drain) catch {};
+}
+
+/// Hash database lines: mutated valid lines through every hash format.
+fn hashLine(random: std.Random) void {
+    const hashsig = zav.compile.hashsig;
+    const seeds = [_][]const u8{
+        "44d88612fea8a8f36de82e1278abb02f:68:Eicar-Test-Signature",
+        "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f:*:Eicar-Test-Signature:73:200",
+        "45056:3395856ce81f2b7382dee72602f798b642f14140:Win.Trojan.Y-2-0",
+    };
+    const exts = [_][]const u8{ "hdb", "hsb", "mdb", "msb", "imp", "hdu" };
+    var buf: [160]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    var line = buf[0..seed.len];
+    for (0..random.uintLessThan(usize, 6)) |_| line[random.uintLessThan(usize, line.len)] = random.int(u8);
+    if (random.boolean()) line = line[0..random.uintLessThan(usize, line.len + 1)];
+    _ = hashsig.parseLine(hashsig.formatFor(exts[random.uintLessThan(usize, exts.len)]).?, line) catch {};
 }
