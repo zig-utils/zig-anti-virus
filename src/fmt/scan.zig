@@ -27,6 +27,7 @@ const pe = @import("pe.zig");
 const elf = @import("elf.zig");
 const macho = @import("macho.zig");
 const ole2 = @import("ole2.zig");
+const iso9660 = @import("iso9660.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
@@ -42,6 +43,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
     var head: [detect.head_len]u8 = undefined;
     const n = src.readAt(w.io, 0, &head) catch 0;
     obj.format = detect.detect(head[0..n]);
+    if (obj.format == .binary) obj.format = deepPositional(w, src);
     try w.begin(obj);
     try w.feedSource(obj, src);
     checkName(w, obj);
@@ -66,6 +68,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .macho => try macho.walk(w, src),
         .macho_fat => try macho.walkFat(w, src),
         .ole2 => try ole2.walk(w, src),
+        .iso9660 => try iso9660.walk(w, src),
         .html => try normalizeHtml(w, src),
         .binary, .text => {
             if (obj.format == .text) {
@@ -89,6 +92,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         error.ReadFailed => return if (w.halt != null) error.Halted else {},
     };
     obj.format = detect.detect(r.buffered());
+    if (obj.format == .binary) obj.format = deepStream(r);
     try w.begin(obj);
     checkName(w, obj);
     const tee_buf = w.alloc(u8, container.block_len) orelse return w.drain(r);
@@ -106,7 +110,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
         .text => try normalizeText(w, &tee.interface),
-        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .html => {
+        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             checkEntropy(w, obj.format, mat.source);
@@ -115,6 +119,20 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         else => {},
     }
     try w.drain(&tee.interface);
+}
+
+/// Formats recognised past the detection head (see `detect.detectDeep`), for positional sources.
+fn deepPositional(w: *Walker, src: Source) Format {
+    var probe: [detect.deep_probe_end - detect.deep_probe_off]u8 = undefined;
+    src.readAllAt(w.io, detect.deep_probe_off, &probe) catch return .binary;
+    return detect.detectDeep(&probe) orelse .binary;
+}
+
+/// The same for a stream, when its buffer can hold the probe without consuming anything.
+fn deepStream(r: *Io.Reader) Format {
+    if (r.buffer.len < detect.deep_probe_end) return .binary;
+    r.fill(detect.deep_probe_end) catch return .binary;
+    return detect.detectDeep(r.buffered()[detect.deep_probe_off..detect.deep_probe_end]) orelse .binary;
 }
 
 /// Heuristics.Guardian.ExtensionMismatch: a document, image or text name on an executable.
@@ -152,6 +170,7 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
         .macho => try macho.walk(w, src),
         .macho_fat => try macho.walkFat(w, src),
         .ole2 => try ole2.walk(w, src),
+        .iso9660 => try iso9660.walk(w, src),
         .html => try normalizeHtml(w, src),
         else => unreachable,
     }

@@ -19,6 +19,7 @@ pub const pe = @import("pe.zig");
 pub const elf = @import("elf.zig");
 pub const macho = @import("macho.zig");
 pub const ole2 = @import("ole2.zig");
+pub const iso9660 = @import("iso9660.zig");
 pub const ooxml = @import("ooxml.zig");
 pub const vba = @import("vba.zig");
 pub const html_norm = @import("html_norm.zig");
@@ -45,6 +46,7 @@ test {
     _ = elf;
     _ = macho;
     _ = ole2;
+    _ = iso9660;
     _ = ooxml;
     _ = vba;
     _ = html_norm;

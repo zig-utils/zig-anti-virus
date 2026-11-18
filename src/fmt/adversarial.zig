@@ -120,6 +120,8 @@ test "bombs and nesting stop at their limits within bounds" {
         .{ .name = "same-entry-bomb.zip", .bytes = archive("same-entry-bomb.zip"), .expect = .{ .notice = .overlap }, .max_ms = 10_000, .lim = tight },
         .{ .name = "deep-40.zip", .bytes = archive("deep-40.zip"), .expect = .{ .limit = .recursion }, .max_ms = 5_000, .lim = tight },
         .{ .name = "deep-40.gz", .bytes = archive("deep-40.gz"), .expect = .{ .limit = .recursion }, .max_ms = 5_000, .lim = tight },
+        // ISO 9660: 24 levels of directories, each listing the next twice (2^24 paths).
+        .{ .name = "dag-bomb.iso", .bytes = archive("dag-bomb.iso"), .expect = .{ .notice = .overlap }, .max_ms = 2_000, .lim = tight },
     };
     for (cases) |c| try run(c);
     for (fixtures.bomb_vectors) |v| try run(.{ .name = v.name, .bytes = v.compressed, .expect = .{ .limit = .ratio }, .max_ms = 10_000, .lim = tight });

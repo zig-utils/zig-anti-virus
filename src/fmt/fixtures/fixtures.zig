@@ -212,6 +212,32 @@ pub const archives = [_]Archive{
     .{ .name = "plain.docx", .bytes = @embedFile("archive-plain.docx.bin"), .malformed = false, .members = &.{
         .{ .path = "word/document.xml", .len = 199, .crc = 0xe8d50a28 },
     } },
+    .{ .name = "joliet.iso", .bytes = @embedFile("archive-joliet.iso.bin"), .malformed = false, .members = &.{
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "docs/manual/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "tools/eicar.com", .len = 68, .crc = 0x6851cf3c },
+        .{ .path = "boot/0", .len = 2048, .crc = 0x4ea6b03b },
+    } },
+    .{ .name = "primary.iso", .bytes = @embedFile("archive-primary.iso.bin"), .malformed = false, .members = &.{
+        .{ .path = "README.TXT", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "DOCS/MANUAL/B.BIN", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "TOOLS/EICAR.COM", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "rockridge.iso", .bytes = @embedFile("archive-rockridge.iso.bin"), .malformed = false, .members = &.{
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "docs/manual/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "tools/eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "loop.iso", .bytes = @embedFile("archive-loop.iso.bin"), .malformed = true, .members = &.{
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "docs/manual/b.bin", .len = 3000, .crc = 0xdb24f08b },
+        .{ .path = "tools/eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "truncated.iso", .bytes = @embedFile("archive-truncated.iso.bin"), .malformed = true, .members = &.{
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "tools/eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "dag-bomb.iso", .bytes = @embedFile("archive-dag-bomb.iso.bin"), .malformed = false, .members = &.{} },
 };
 
 pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };

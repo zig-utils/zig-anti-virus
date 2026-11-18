@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import zlib from 'node:zlib'
+import * as containers from './containers.ts'
 
 const dir = dirname(new URL(import.meta.url).pathname)
 mkdirSync(dir, { recursive: true })
@@ -1198,6 +1199,11 @@ exe('universal.fat', fat([{ cpu: 0x01000007, data: machoX64 }, { cpu: 0x0100000c
   sections: 0,
   members: [{ path: 'slice/x86_64', data: machoX64 }, { path: 'slice/arm64', data: evilMacho }],
 })
+
+// ---------------------------------------------------------------------------------------------
+// Phase-three containers and unpackers (P5.18, P5.19): see containers.ts.
+
+containers.build({ archive, exe, concat, plain, crc32, run, py, deflateRaw: d => zlib.deflateRawSync(d), evil, fileA, fileB })
 
 // ---------------------------------------------------------------------------------------------
 // fixtures.zig

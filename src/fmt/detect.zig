@@ -23,6 +23,8 @@ pub const Format = enum(u8) {
     macho,
     macho_fat,
     ole2,
+    /// Phase-three containers (P5.18).
+    iso9660,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
@@ -35,7 +37,7 @@ pub const Format = enum(u8) {
     /// Formats parsed with positional reads (central directories, section tables).
     pub fn needsRandomAccess(f: Format) bool {
         return switch (f) {
-            .zip, .pe, .elf, .macho, .macho_fat, .ole2 => true,
+            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660 => true,
             else => false,
         };
     }
@@ -72,6 +74,17 @@ pub fn detect(head: []const u8) Format {
     if (isHtml(head)) return .html;
     if (isText(head)) return .text;
     return .binary;
+}
+
+/// Formats whose magic sits past `head_len`: ISO 9660 has "CD001" in the volume descriptor at
+/// 32 KiB. Callers that can read that far (positional sources, or a stream whose buffer holds
+/// `deep_probe_end` bytes) pass the bytes at `deep_probe_off`.
+pub const deep_probe_off = 0x8001;
+pub const deep_probe_end = deep_probe_off + 5;
+
+pub fn detectDeep(probe: []const u8) ?Format {
+    if (std.mem.eql(u8, probe, "CD001")) return .iso9660;
+    return null;
 }
 
 fn isCpio(head: []const u8) bool {
