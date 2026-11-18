@@ -14,13 +14,15 @@ const ir = @import("../compile/ir.zig");
 const lt = @import("ldb_table.zig");
 const vm = @import("verify_vm.zig");
 const regex = @import("regex");
+const yc = @import("yara_cond.zig");
 
 pub const slot_count: usize = 8192;
 /// Entries the table takes before new signatures spill (75% load).
 pub const table_limit: usize = slot_count / 4 * 3;
 pub const counter_pool: usize = 32 * 1024;
 /// Trigger match starts kept per (signature, trigger) for byte compares.
-pub const bc_offsets_per_trigger: usize = 8;
+/// Match starts kept per (signature, subsig) for byte-compare triggers and YARA strings.
+pub const bc_offsets_per_trigger: usize = 16;
 pub const bc_pool: usize = 256;
 /// Bytes for entries that spill past the table, the counter pool or the trigger pool.
 pub const spill_bytes: usize = 256 * 1024;
@@ -45,6 +47,8 @@ const TriggerOffsets = struct {
     ldb: u32,
     trigger: u8,
     n: u8 = 0,
+    /// More matches than `starts` holds were seen; the first ones are kept.
+    overflow: bool = false,
     starts: [bc_offsets_per_trigger]u64 = undefined,
 };
 
@@ -77,6 +81,8 @@ pub const State = struct {
     regex_scratch: ?*regex.Scratch = null,
     /// A PCRE subsig could not be decided (step budget, or no scratch) during the last finalize.
     regex_limited: bool = false,
+    /// A YARA condition needed match offsets beyond the ones kept.
+    offsets_limited: bool = false,
 
     /// Reserve the table, touched list, counter and trigger pools and the spill arena (about
     /// 500 KiB) from `scratch`. They live as long as the worker.
@@ -104,16 +110,19 @@ pub const State = struct {
         s.spill_arena.reset();
         s.bc_out_of_bounds = false;
         s.regex_limited = false;
+        s.offsets_limited = false;
     }
 
     fn recordTrigger(s: *State, table: lt.LdbTable, rec: lt.LdbRecord, ldb: u32, subsig: u16, start: u64) !void {
-        for (table.byteCompares(rec)) |bc| {
-            if (bc.trigger != subsig) continue;
+        const wanted = rec.flags & lt.flag_yara != 0 or for (table.byteCompares(rec)) |bc| {
+            if (bc.trigger == subsig) break true;
+        } else false;
+        if (wanted) {
             for (s.triggers.items) |*t| if (t.ldb == ldb and t.trigger == subsig) {
                 if (t.n < bc_offsets_per_trigger) {
                     t.starts[t.n] = start;
                     t.n += 1;
-                }
+                } else t.overflow = true;
                 return;
             };
             var t: TriggerOffsets = .{ .ldb = ldb, .trigger = @intCast(subsig), .n = 1 };
@@ -133,6 +142,40 @@ pub const State = struct {
     fn triggerStarts(s: *const State, ldb: u32, trigger: u8) []const u64 {
         for (s.triggers.items) |*t| if (t.ldb == ldb and t.trigger == trigger) return t.starts[0..t.n];
         return &.{};
+    }
+
+    fn triggerEntry(s: *State, ldb: u32, trigger: u8) ?*TriggerOffsets {
+        for (s.triggers.items) |*t| if (t.ldb == ldb and t.trigger == trigger) return t;
+        return null;
+    }
+
+    /// Make sure `ldb` has state even with nothing matched (YARA rules whose condition can hold
+    /// without a string match), checking its target description as a first touch would.
+    pub fn ensure(s: *State, table: lt.LdbTable, ctx: lt.FileContext, ldb: u32) !void {
+        if (s.find(ldb) != null or s.findSpilled(ldb) != null) return;
+        const rec = table.records[ldb];
+        const dead = !lt.tdbMatches(table.tdbs[ldb], ctx);
+        const wants_counts = rec.flags & lt.flag_counts != 0 and !dead;
+        if (s.touched_len < table_limit and (!wants_counts or s.counts_used + rec.nsub <= s.counts.len)) {
+            var i = hash(ldb);
+            while (s.slots[i].used != 0) i = (i + 1) & (slot_count - 1);
+            var slot: Slot = .{ .ldb = ldb, .used = 1, .dead = @intFromBool(dead) };
+            if (wants_counts) {
+                slot.cnt_off = @intCast(s.counts_used);
+                @memset(s.counts[s.counts_used..][0..rec.nsub], 0);
+                s.counts_used += rec.nsub;
+            }
+            s.slots[i] = slot;
+            s.touched[s.touched_len] = @intCast(i);
+            s.touched_len += 1;
+            return;
+        }
+        var e: Spilled = .{ .ldb = ldb, .dead = dead };
+        if (wants_counts) {
+            e.counts = try s.spill_arena.allocator().alloc(u16, rec.nsub);
+            @memset(e.counts, 0);
+        }
+        try s.spill.append(s.spill_arena.allocator(), e);
     }
 
     fn hash(ldb: u32) usize {
@@ -162,17 +205,17 @@ pub const State = struct {
             if (slot.dead != 0) return;
             slot.mask |= bit;
             if (slot.cnt_off != no_counters) s.counts[slot.cnt_off + subsig] +|= 1;
-            if (rec.bc_count > 0) try s.recordTrigger(table, rec, ldb, subsig, start);
+            if (rec.bc_count > 0 or rec.flags & lt.flag_yara != 0) try s.recordTrigger(table, rec, ldb, subsig, start);
             return;
         }
         if (s.findSpilled(ldb)) |e| {
             if (e.dead) return;
             e.mask |= bit;
             if (e.counts.len > 0) e.counts[subsig] +|= 1;
-            if (rec.bc_count > 0) try s.recordTrigger(table, rec, ldb, subsig, start);
+            if (rec.bc_count > 0 or rec.flags & lt.flag_yara != 0) try s.recordTrigger(table, rec, ldb, subsig, start);
             return;
         }
-        if (rec.bc_count > 0 and lt.tdbMatches(table.tdbs[ldb], ctx)) try s.recordTrigger(table, rec, ldb, subsig, start);
+        if ((rec.bc_count > 0 or rec.flags & lt.flag_yara != 0) and lt.tdbMatches(table.tdbs[ldb], ctx)) try s.recordTrigger(table, rec, ldb, subsig, start);
         // First touch: the target description decides whether the signature can match at all.
         const dead = !lt.tdbMatches(table.tdbs[ldb], ctx);
         const wants_counts = rec.flags & lt.flag_counts != 0 and !dead;
@@ -241,6 +284,28 @@ pub const State = struct {
         return out[0..nsub];
     }
 
+    /// Whether a touched signature matches, and should be reported (private YARA rules match
+    /// but are not reported).
+    fn matches(s: *State, table: lt.LdbTable, data: []const u8, info: vm.FileInfo, ldb: u32, rec: lt.LdbRecord, mask: u64, counters: ?[]const u16, buf: *[ir.max_subsigs]u32) bool {
+        if (rec.flags & lt.flag_yara == 0) return lt.evalRpn(table.expr(rec), s.countsOf(table, data, info, ldb, rec, mask, counters, buf));
+        const yara = table.yara orelse return false;
+        const rule = yara.find(ldb) orelse return false;
+        var strings: [ir.max_subsigs]yc.StringState = undefined;
+        for (0..rec.nsub) |i| {
+            const count: u32 = if (counters) |c| c[i] else @intFromBool(mask & (@as(u64, 1) << @intCast(i)) != 0);
+            var st: yc.StringState = .{ .count = count };
+            if (s.triggerEntry(ldb, @intCast(i))) |t| {
+                std.mem.sortUnstable(u64, t.starts[0..t.n], {}, std.sort.asc(u64));
+                st.starts = t.starts[0..t.n];
+                st.overflow = t.overflow;
+            }
+            strings[i] = st;
+        }
+        const r = yc.evaluate(yara.condition(rule), .{ .data = data, .filesize = info.size, .strings = strings[0..rec.nsub] });
+        if (r.limited) s.offsets_limited = true;
+        return r.matched and rule.flags & yc.flag_private == 0;
+    }
+
     /// How many times a PCRE subsig matches under its offset and flags.
     fn runPcre(s: *State, table: lt.LdbTable, pr: lt.PcreRecord, data: []const u8, info: vm.FileInfo) u32 {
         const scratch = s.regex_scratch orelse {
@@ -295,7 +360,7 @@ pub const State = struct {
             if (slot.dead != 0) continue;
             const rec = table.records[slot.ldb];
             const counters: ?[]const u16 = if (slot.cnt_off != no_counters) s.counts[slot.cnt_off..][0..rec.nsub] else null;
-            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, info, slot.ldb, rec, slot.mask, counters, &buf))) {
+            if (s.matches(table, data, info, slot.ldb, rec, slot.mask, counters, &buf)) {
                 if (n == out.len) return n;
                 out[n] = slot.ldb;
                 n += 1;
@@ -306,7 +371,7 @@ pub const State = struct {
             if (e.dead) continue;
             const rec = table.records[e.ldb];
             const counters: ?[]const u16 = if (e.counts.len > 0) e.counts else null;
-            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, info, e.ldb, rec, e.mask, counters, &buf))) {
+            if (s.matches(table, data, info, e.ldb, rec, e.mask, counters, &buf)) {
                 if (n == out.len) return n;
                 out[n] = e.ldb;
                 n += 1;

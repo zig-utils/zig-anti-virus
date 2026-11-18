@@ -85,6 +85,14 @@ pub fn main(init: std.process.Init) !void {
             cdbLine(random);
             cases += 1;
         }
+        if (selected(only, "yaraRule")) {
+            try yaraRule(random);
+            cases += 1;
+        }
+        if (selected(only, "yaraCond")) {
+            yaraCond(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
         // Format parsers and decoders (fmt/): one per iteration in rotation, or every target whose
@@ -753,6 +761,59 @@ fn cdbLine(random: std.Random) void {
     } else |_| {
         if (column > line.len) @panic("fuzz: cdb column out of range");
     }
+}
+
+/// YARA rule files: mutated rules through the parser; whatever compiles has a valid condition.
+fn yaraRule(random: std.Random) !void {
+    const seeds = [_][]const u8{
+        "rule A : t { meta: x = \"y\" strings: $a = \"eval(\" nocase wide $b = { 4D 5A [2-4] 00 (90|CC) } condition: $a and #b > 1 or $b at 0 }",
+        "rule B { strings: $r = /ht+p[s]?:\\/\\/x/i $t = \"abc\" xor(1-2) condition: 2 of them and uint16(0) == 0x5a4d and filesize < 1MB }",
+        "private rule C { strings: $a = \"zz\" $b = \"yy\" condition: any of ($a*) and @a[1] + 4 < 100 and not $b in (0..10) }",
+    };
+    var mem: [512 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    const a = fba.allocator();
+    var buf: [320]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const text = mutate(random, &buf, seed.len, "{}()[]$#@!\"/:=<>&|^~*-+ 0123456789abcdefandornotofthemat");
+    var rules: std.ArrayList(zav.compile.yara.Rule) = .empty;
+    var rejected: std.ArrayList(zav.compile.ir.Rejection) = .empty;
+    zav.compile.yara.parse(a, a, "f.yar", text, .{ .rules = &rules, .rejected = &rejected }) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
+    for (rules.items) |r| {
+        if (!zav.match.yara_cond.check(r.cond, r.strings.len)) @panic("fuzz: yara rule with an invalid condition");
+        if (r.strings.len == 0 or r.strings.len > zav.compile.ir.max_subsigs) @panic("fuzz: yara string count");
+    }
+}
+
+/// Random condition programs: check refuses the malformed ones, and anything it accepts
+/// evaluates over random inputs without crashing.
+fn yaraCond(random: std.Random) void {
+    const yc = zav.match.yara_cond;
+    var ops: [24]yc.CondOp = undefined;
+    const n = 1 + random.uintLessThan(usize, ops.len);
+    const codes = [_]yc.CondCode{ .push, .filesize, .found, .count, .at, .in, .offset, .read, .add, .sub, .mul, .div, .mod, .neg, .bnot, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le, .gt, .ge, .land, .lor, .lnot };
+    for (ops[0..n]) |*o| o.* = .{ .code = codes[random.uintLessThan(usize, codes.len)], .str = random.uintLessThan(u8, 3), .k = switch (random.uintLessThan(u8, 4)) {
+        0 => random.int(i64),
+        1 => 4,
+        2 => 2,
+        else => random.intRangeAtMost(i64, -3, 70),
+    } };
+    if (!yc.check(ops[0..n], 3)) return;
+    var data: [32]u8 = undefined;
+    random.bytes(&data);
+    var starts: [3][4]u64 = undefined;
+    var strings: [3]yc.StringState = undefined;
+    for (&strings, &starts) |*st, *ss| {
+        const k = random.uintAtMost(usize, 4);
+        for (ss[0..k]) |*x| x.* = random.uintAtMost(u64, 40);
+        std.mem.sortUnstable(u64, ss[0..k], {}, std.sort.asc(u64));
+        st.* = .{ .count = @intCast(k + random.uintAtMost(usize, 2)), .starts = ss[0..k], .overflow = random.boolean() };
+    }
+    _ = yc.evaluate(ops[0..n], .{ .data = data[0..random.uintAtMost(usize, data.len)], .filesize = random.int(u64), .strings = &strings });
+    _ = yc.canMatchWithoutHits(ops[0..n]);
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.

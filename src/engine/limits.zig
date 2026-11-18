@@ -49,6 +49,8 @@ pub const Event = enum(u8) {
     logical_state,
     /// A regex search (a .cdb filename regex, a PCRE subsig) ran out of its step budget.
     regex_steps,
+    /// A YARA condition needed more string matches or match offsets than are kept.
+    yara_matches,
     /// A decoder window (zstd frame window, LZMA dictionary) larger than `max_window`.
     window_size,
     /// The worker's scratch arena could not hold a child's working set.

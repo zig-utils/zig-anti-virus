@@ -13,6 +13,10 @@ const anchored = @import("../match/anchored.zig");
 const lt = @import("../match/ldb_table.zig");
 const logical = @import("../match/logical.zig");
 const regex_pool = @import("../match/regex_pool.zig");
+const yara_cond = @import("../match/yara_cond.zig");
+
+/// Matches of one YARA regex string recorded per file before the count is reported as limited.
+pub const max_regex_matches: u32 = 1024;
 const limits_mod = @import("limits.zig");
 
 pub const BodyIndex = struct {
@@ -33,6 +37,10 @@ pub const BodyIndex = struct {
             if (database.section(.anchored_index, @intCast(p))) |section| slot.* = try .init(section, index.programs.?);
         }
         if (database.section(.ldb_table, 0)) |section| index.ldb = try .initWith(section, index.programs.?, index.regexes);
+        if (database.section(.yara_cond, 0)) |section| {
+            const table = index.ldb orelse return error.BadYaraTable;
+            index.ldb.?.yara = try .init(section, table.records, if (index.regexes) |p| p.count() else 0);
+        }
         return index;
     }
 };
@@ -151,10 +159,50 @@ pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget:
             if (c.settled(p)) break;
         }
     }
+    if (state) |st| if (index.ldb) |table| if (table.yara) |yara| {
+        // YARA: regex strings are searched here (they have no verify program), and rules whose
+        // condition can hold with no string matched get state so they are evaluated.
+        for (yara.rules) |rule| {
+            if (rule.flags & yara_cond.flag_always != 0) st.ensure(table, c.ctx, rule.ldb) catch {
+                c.overflow = true;
+            };
+            for (yara.ruleStrings(rule), 0..) |str, i| {
+                if (str.kind != yara_cond.kind_regex) continue;
+                const scratch = st.regex_scratch orelse {
+                    st.regex_limited = true;
+                    continue;
+                };
+                const program = index.regexes.?.get(str.regex);
+                var pos: usize = 0;
+                var n: u32 = 0;
+                while (pos <= data.len) {
+                    const m = (program.findFrom(scratch, data, pos) catch {
+                        st.regex_limited = true;
+                        break;
+                    }) orelse break;
+                    if (n == max_regex_matches) {
+                        tracker.note(.yara_matches);
+                        break;
+                    }
+                    st.touch(table, c.ctx, rule.ldb, @intCast(i), m.start) catch {
+                        c.overflow = true;
+                        break;
+                    };
+                    n += 1;
+                    // Every start position counts, as YARA counts matches.
+                    pos = m.start + 1;
+                }
+            }
+        }
+    };
     if (state) |st| if (index.ldb) |table| {
         var out: [1]u32 = undefined;
         const n = st.finalizeWith(table, data, info, &out);
         if (st.bc_out_of_bounds) tracker.note(.byte_compare_bounds);
+        if (n == 0 and st.offsets_limited) {
+            tracker.note(.yara_matches);
+            return .{ .limited = .yara_matches };
+        }
         if (n == 0 and st.regex_limited) {
             tracker.note(.regex_steps);
             return .{ .limited = .regex_steps };
@@ -294,4 +342,75 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
     try std.testing.expectEqual(reserved, fba.end_index);
     // The last case's compare pointed past the end of the data: a bounds event, still no match.
     try std.testing.expect(tracker.raised.contains(.byte_compare_bounds));
+}
+
+test "YARA rules end to end: text, hex and regex strings, offsets, reads, always rules" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Compiler = @import("../compile/compiler.zig").Compiler;
+    const hashscan = @import("hashscan.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var c = Compiler.init(gpa);
+    defer c.deinit();
+    try c.addFile("test.yar",
+        \\rule Yara_Pe_Dropper {
+        \\  strings:
+        \\    $mz = { 4D 5A }
+        \\    $s = "dropper" nocase
+        \\    $u = /https?:\/\/[a-z]+\.invalid/
+        \\  condition:
+        \\    $mz at 0 and uint16(0) == 0x5A4D and $s and #u >= 2
+        \\}
+        \\rule Yara_Wide { strings: $w = "evil" wide condition: $w in (0..16) }
+        \\rule Yara_Missing { strings: $a = "marker!" condition: uint8(0) == 0x41 and not $a }
+        \\private rule Yara_Private { strings: $p = "private!" condition: $p }
+        \\
+    );
+    const summary = try c.write(io, tmp.dir, "yara.zavdb", .{ .db_version = 1 });
+    try std.testing.expectEqual(@as(u64, 4), summary.yara_rules);
+    const database = try db.reader.open(io, tmp.dir, "yara.zavdb", .{ .allow_unsigned = true });
+    defer database.close();
+    const index = try BodyIndex.load(database);
+    const names = try hashscan.HashIndex.load(database);
+
+    var scratch: [2 * 1024 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+    var state = try logical.State.init(fba.allocator());
+    const regex = @import("regex");
+    const capacity = index.regexes.?.capacity(256);
+    var regex_scratch = try regex.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity)), capacity);
+    state.regex_scratch = &regex_scratch;
+    var tracker = limits_mod.Tracker.init(.{});
+    var name_buf: [64]u8 = undefined;
+
+    const Case = struct { []const u8, ?[]const u8 };
+    for ([_]Case{
+        .{ "MZ..DROPPER http://a.invalid and https://bb.invalid", "Yara_Pe_Dropper" },
+        .{ "MZ..DROPPER http://a.invalid only one", null },
+        .{ "xMZ.dropper http://a.invalid https://bb.invalid", null }, // MZ not at 0
+        .{ "ab e\x00v\x00i\x00l\x00", "Yara_Wide" },
+        .{ ".................e\x00v\x00i\x00l\x00", null }, // starts at 17, past the range
+        .{ "A plain file", "Yara_Missing" }, // no string matched: evaluated because it can hold
+        .{ "A file with marker!", null },
+        .{ "a private! match is not reported", null },
+    }) |case| {
+        state.reset();
+        var budget: vm.Budget = .{};
+        const verdict = try scanBuffer(&index, case[0], .{ .info = .{ .size = case[0].len } }, &budget, &tracker, &state);
+        if (case[1]) |want| {
+            if (verdict != .infected) {
+                std.debug.print("case: {s} gave {any}\n", .{ case[0], verdict });
+                return error.TestUnexpectedResult;
+            }
+            std.testing.expectEqualStrings(want, try names.meta.?.name(verdict.infected.sig, &name_buf)) catch |err| {
+                std.debug.print("case: {s}\n", .{case[0]});
+                return err;
+            };
+        } else std.testing.expectEqual(Verdict.clean, verdict) catch |err| {
+            std.debug.print("case: {s}\n", .{case[0]});
+            return err;
+        };
+    }
 }

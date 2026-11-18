@@ -9,6 +9,7 @@ pub const ldb_table = @import("ldb_table.zig");
 pub const logical = @import("logical.zig");
 pub const container = @import("container.zig");
 pub const regex_pool = @import("regex_pool.zig");
+pub const yara_cond = @import("yara_cond.zig");
 
 test {
     _ = hashidx;
@@ -19,4 +20,5 @@ test {
     _ = logical;
     _ = container;
     _ = regex_pool;
+    _ = yara_cond;
 }

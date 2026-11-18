@@ -32,6 +32,9 @@ pub const LdbHeader = extern struct {
 
 /// Record flag: the expression compares counts, so per-subsig counters are needed.
 pub const flag_counts: u8 = 1 << 0;
+/// Record flag: a YARA rule. Its condition lives in YARA_COND; the RPN expression is empty and
+/// every subsig's match starts are kept for `at`, `in` and `@a[i]`.
+pub const flag_yara: u8 = 1 << 1;
 
 pub const LdbRecord = extern struct {
     /// Signature id (sigmeta).
@@ -247,6 +250,9 @@ pub const LdbTable = struct {
     bcs: []const BcRecord,
     pcres: []const PcreRecord = &.{},
     regexes: ?regex_pool.RegexPool = null,
+    /// YARA conditions for records flagged `flag_yara`; set by the loader after both tables
+    /// validate (YaraTable.init needs the records).
+    yara: ?@import("yara_cond.zig").YaraTable = null,
 
     pub const Error = error{BadLdbTable};
 
@@ -277,7 +283,13 @@ pub const LdbTable = struct {
         for (table.records, table.tdbs, 0..) |rec, tdb, i| {
             if (rec.nsub == 0 or rec.nsub > ir.max_subsigs) return error.BadLdbTable;
             if (@as(u64, rec.expr_off) + rec.expr_len > h.rpn_count) return error.BadLdbTable;
-            if (!checkRpn(table.expr(rec), rec.nsub)) return error.BadLdbTable;
+            if (rec.flags & ~(flag_counts | flag_yara) != 0) return error.BadLdbTable;
+            const yara = rec.flags & flag_yara != 0;
+            if (yara) {
+                // Conditions are checked by YaraTable.init; a YARA record counts and has no
+                // RPN, byte compares or PCRE.
+                if (rec.expr_len != 0 or rec.flags & flag_counts == 0 or rec.bc_count != 0 or rec.pcre_count != 0) return error.BadLdbTable;
+            } else if (!checkRpn(table.expr(rec), rec.nsub)) return error.BadLdbTable;
             if (@as(u64, rec.pcre_first) + rec.pcre_count > h.pcre_count) return error.BadLdbTable;
             var counts_needed = usesCounts(table.expr(rec));
             var prev_pcre: i16 = -1;
@@ -293,7 +305,7 @@ pub const LdbTable = struct {
                 if (@backingInt(pr.off_kind) > @backingInt(ir.OffsetKind.last_section)) return error.BadLdbTable;
                 counts_needed = counts_needed or usesCounts(trig);
             }
-            if ((rec.flags & flag_counts != 0) != counts_needed) return error.BadLdbTable;
+            if (!yara and (rec.flags & flag_counts != 0) != counts_needed) return error.BadLdbTable;
             if (tdb.target > 14 or tdb.intermediate_count > ir.max_intermediates) return error.BadLdbTable;
             if (@as(u64, rec.prog_first) + rec.prog_count > nprog) return error.BadLdbTable;
             if (@as(u64, rec.bc_first) + rec.bc_count > h.bc_count) return error.BadLdbTable;

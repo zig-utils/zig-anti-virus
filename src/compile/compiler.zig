@@ -20,6 +20,8 @@ const ftm_build = @import("ftm_build.zig");
 const cdb = @import("cdb.zig");
 const container = @import("../match/container.zig");
 const regex_pool = @import("../match/regex_pool.zig");
+const yara = @import("yara.zig");
+const yara_cond = @import("../match/yara_cond.zig");
 const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
@@ -47,6 +49,7 @@ pub const Compiler = struct {
     logicals: std.ArrayList(ir.LogicalRule) = .empty,
     magics: std.ArrayList(ir.FtmRule) = .empty,
     containers: std.ArrayList(ir.CdbRule) = .empty,
+    yara_rules: std.ArrayList(yara.Rule) = .empty,
     allow: std.ArrayList(ir.HashRule) = .empty,
     ignore_entries: std.ArrayList(filters.IgnoreEntry) = .empty,
     rejected: std.ArrayList(ir.Rejection) = .empty,
@@ -63,6 +66,7 @@ pub const Compiler = struct {
         c.logicals.deinit(c.gpa);
         c.magics.deinit(c.gpa);
         c.containers.deinit(c.gpa);
+        c.yara_rules.deinit(c.gpa);
         c.allow.deinit(c.gpa);
         c.ignore_entries.deinit(c.gpa);
         c.rejected.deinit(c.gpa);
@@ -87,6 +91,8 @@ pub const Compiler = struct {
             try ftm.parse(c.gpa, arena, owned_name, owned, .{ .rules = &c.magics, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "cdb") or std.mem.eql(u8, ext, "cdu")) {
             try cdb.parse(c.gpa, arena, owned_name, owned, ext[2] == 'u', .{ .rules = &c.containers, .rejected = &c.rejected });
+        } else if (std.mem.eql(u8, ext, "yar") or std.mem.eql(u8, ext, "yara")) {
+            try yara.parse(c.gpa, arena, owned_name, owned, .{ .rules = &c.yara_rules, .rejected = &c.rejected });
         } else if (filters.allowlistFormat(ext)) |fmt| {
             try hashsig.parse(c.gpa, fmt, owned_name, owned, .{ .rules = &c.allow, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "ign2")) {
@@ -169,6 +175,8 @@ pub const Compiler = struct {
         magic_rules: u64,
         /// Container metadata signatures in CDB_TABLE.
         container_rules: u64,
+        /// YARA rules (LDB_TABLE records with YARA_COND conditions).
+        yara_rules: u64,
         /// Verify programs: one per variant after modifier expansion.
         programs: u64,
         allowlist_rules: u64,
@@ -254,6 +262,17 @@ pub const Compiler = struct {
             try names.append(c.gpa, .{ .name = rule.name, .flags = rule.flags, .source = rule.source });
             try c.coverage.include(c.gpa, @tagName(rule.source), 1);
         }
+        var kept_yara: std.ArrayList(*const yara.Rule) = .empty;
+        defer kept_yara.deinit(c.gpa);
+        for (c.yara_rules.items) |*rule| {
+            if (filters.skipReasonFor(rule.name, rule.text, 0, 0, &ignore, filters.engine_flevel)) |reason| {
+                try c.coverage.skip(c.gpa, "yara", reason);
+                continue;
+            }
+            try kept_yara.append(c.gpa, rule);
+            try names.append(c.gpa, .{ .name = rule.name, .source = .yara });
+            try c.coverage.include(c.gpa, "yara", 1);
+        }
         var kept_magics: std.ArrayList(ir.FtmRule) = .empty;
         defer kept_magics.deinit(c.gpa);
         for (c.magics.items) |*rule| {
@@ -282,7 +301,8 @@ pub const Compiler = struct {
         var ldb_entries: std.ArrayList(ldb_build.Entry) = .empty;
         defer ldb_entries.deinit(c.gpa);
         const logical_sigs = built.extra_sigs[kept_bodies.items.len..][0..kept_logicals.items.len];
-        const container_sigs = built.extra_sigs[kept_bodies.items.len + kept_logicals.items.len ..];
+        const container_sigs = built.extra_sigs[kept_bodies.items.len + kept_logicals.items.len ..][0..kept_containers.items.len];
+        const yara_sigs = built.extra_sigs[kept_bodies.items.len + kept_logicals.items.len + kept_containers.items.len ..];
         // Every compiled regex goes into one REGEX_POOL; records refer to it by index.
         var regex_blobs: std.ArrayList([]const u8) = .empty;
         defer regex_blobs.deinit(c.gpa);
@@ -318,6 +338,41 @@ pub const Compiler = struct {
             e.regex_first = @intCast(regex_blobs.items.len);
             try ldb_build.pcrePrograms(e.rule, &regex_blobs, c.gpa);
         }
+        // YARA rules: LDB records after the logical signatures, strings as subsigs, conditions
+        // in YARA_COND, regex strings in REGEX_POOL after the PCRE programs.
+        var yara_inputs: std.ArrayList(yara_cond.RuleInput) = .empty;
+        defer yara_inputs.deinit(c.gpa);
+        for (kept_yara.items, yara_sigs) |rule, sig| {
+            const record: u32 = @intCast(ldb_entries.items.len);
+            const first: u32 = @intCast(inputs.items.len);
+            const strings = try arena.alloc(yara_cond.YaraString, rule.strings.len);
+            for (rule.strings, strings, 0..) |str, *out, i| {
+                if (str.regex) |blob| {
+                    out.* = .{ .kind = yara_cond.kind_regex, .regex = @intCast(regex_blobs.items.len) };
+                    try regex_blobs.append(c.gpa, blob);
+                    continue;
+                }
+                out.* = .{ .kind = yara_cond.kind_program };
+                for (str.variants) |v| {
+                    var flags: u8 = prog.flag_ldb;
+                    if (v.folded) flags |= prog.flag_folded;
+                    if (v.wide) flags |= prog.flag_wide;
+                    if (str.fullword) flags |= prog.flag_fullword;
+                    try inputs.append(c.gpa, .{ .pattern = v.pattern, .sig = record, .subsig = @intCast(i), .flags = flags });
+                }
+            }
+            const subsigs = try arena.alloc(ir.LogicalSubsig, rule.strings.len);
+            for (subsigs) |*sub| sub.* = .{ .hex = .{ .pattern = .{ .ops = &.{}, .data = &.{} } } };
+            const shell = try arena.create(ir.LogicalRule);
+            shell.* = .{ .name = rule.name, .tdb = .{}, .expr = &.{}, .subsigs = subsigs, .source = .yara };
+            try ldb_entries.append(c.gpa, .{ .rule = shell, .sig = sig, .prog_first = first, .prog_count = @intCast(inputs.items.len - first), .yara = true });
+            var flags: u8 = 0;
+            if (rule.always) flags |= yara_cond.flag_always;
+            if (rule.private) flags |= yara_cond.flag_private;
+            try yara_inputs.append(c.gpa, .{ .ldb = record, .cond = rule.cond, .strings = strings, .flags = flags });
+        }
+        const yara_raw = try yara_cond.build(c.gpa, yara_inputs.items);
+        defer c.gpa.free(yara_raw);
         const pool_raw = try regex_pool.build(c.gpa, regex_blobs.items);
         defer c.gpa.free(pool_raw);
         const ldb_raw = try ldb_build.build(c.gpa, ldb_entries.items);
@@ -354,6 +409,7 @@ pub const Compiler = struct {
         if (inputs.items.len > 0) try sections.append(c.gpa, .{ .kind = .subsig_prog, .bytes = programs });
         if (ldb_entries.items.len > 0) try sections.append(c.gpa, .{ .kind = .ldb_table, .align_log2 = 12, .bytes = ldb_raw });
         if (kept_containers.items.len > 0) try sections.append(c.gpa, .{ .kind = .cdb_table, .bytes = cdb_raw });
+        if (yara_inputs.items.len > 0) try sections.append(c.gpa, .{ .kind = .yara_cond, .bytes = yara_raw });
         if (regex_blobs.items.len > 0) try sections.append(c.gpa, .{ .kind = .regex_pool, .bytes = pool_raw });
         if (kept_magics.items.len > 0) {
             try sections.append(c.gpa, .{ .kind = .ftm_trie, .hot = true, .bytes = magic.trie });
@@ -375,6 +431,7 @@ pub const Compiler = struct {
             .logical_rules = ldb_entries.items.len,
             .magic_rules = kept_magics.items.len,
             .container_rules = kept_containers.items.len,
+            .yara_rules = yara_inputs.items.len,
             .programs = inputs.items.len,
             .allowlist_rules = c.allow.items.len,
             .duplicates = built.duplicates,

@@ -15,6 +15,7 @@ pub const Source = enum(u8) {
     ndb,
     ldb,
     cdb,
+    yara,
 };
 
 pub const HashAlgo = enum(u8) {
@@ -130,6 +131,12 @@ pub const Reason = enum(u8) {
     /// A regex that needs the backtracking engine (backreferences, lookaround, lazy repeats,
     /// a repeated group holding an alternation, ...), so no allocation-free program exists.
     regex_unsupported,
+    // YARA rules.
+    yara_syntax,
+    yara_unsupported,
+    yara_short_string,
+    yara_no_strings,
+    yara_xor_range,
 };
 
 pub const Rejection = struct {

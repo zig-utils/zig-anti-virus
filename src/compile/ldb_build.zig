@@ -12,6 +12,9 @@ pub const Entry = struct {
     prog_count: u32,
     /// REGEX_POOL index of the rule's first PCRE program; the rest follow in subsig order.
     regex_first: u32 = 0,
+    /// A YARA rule: its condition is in YARA_COND, `rule.expr` is empty and `rule.subsigs`
+    /// only gives the string count.
+    yara: bool = false,
 };
 
 /// The PCRE programs of `rules`, in the order `build` numbers them from each entry's
@@ -60,7 +63,7 @@ pub fn build(gpa: std.mem.Allocator, entries: []const Entry) ![]u8 {
         const rec: ldb_table.LdbRecord = .{
             .sig = e.sig,
             .nsub = @intCast(e.rule.subsigs.len),
-            .flags = if (counts) ldb_table.flag_counts else 0,
+            .flags = if (e.yara) ldb_table.flag_counts | ldb_table.flag_yara else if (counts) ldb_table.flag_counts else 0,
             .expr_len = @intCast(e.rule.expr.len),
             .expr_off = expr_off,
             .prog_first = e.prog_first,
