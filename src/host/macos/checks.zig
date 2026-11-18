@@ -416,17 +416,25 @@ test "fixture: a LaunchAgent pointing at a script in /tmp is reported" {
     try std.testing.expect(tmp_agent and unsigned_found);
 }
 
-test "live: this macOS host has no high or critical findings" {
+test "live: macOS checks run on this host; a clean CI runner has no high or critical findings" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const h = try Host.openLive(std.testing.io);
     defer h.close();
     var s = scan.Scan.init(std.testing.allocator, h, .{ .only = &.{"macos"} });
     defer s.deinit();
     try s.runChecks(&checks);
+    // On any machine: the report is well formed and every finding is actionable.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try s.writeJson(&out.writer, .{});
+    try @import("../schema.zig").expectValid(std.testing.allocator, scan.report_schema, out.written());
+    // Only a CI runner is a known-clean image; developer machines carry real findings and other
+    // processes may install launchd jobs while the suite runs.
+    if (!@import("../host.zig").onCi()) return;
     var bad = false;
-    for (s.findings.items) |f| {
-        std.debug.print("macos: {s} {t} {s} {?s}\n", .{ f.check, f.severity, f.title, f.subject });
-        if (f.severity.atLeast(.high)) bad = true;
-    }
+    for (s.findings.items) |f| if (f.severity.atLeast(.high)) {
+        std.debug.print("macos on CI: {s} {t} {s} {?s}\n", .{ f.check, f.severity, f.title, f.subject });
+        bad = true;
+    };
     try std.testing.expect(!bad);
 }

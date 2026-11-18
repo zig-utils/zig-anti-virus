@@ -130,6 +130,23 @@ fn mapError(e: anyerror) ReadError {
     };
 }
 
+/// True when running under CI (GitHub Actions and most others set CI=true). Live tests make
+/// clean-machine assertions only there: a developer machine is not a clean image, and other work
+/// running on it (agents, launchd jobs being installed) must not make the suite flaky.
+pub fn onCi() bool {
+    if (builtin.os.tag.isDarwin()) {
+        const v = std.c.getenv("CI") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "true");
+    }
+    if (builtin.os.tag == .linux) {
+        var buf: [64 * 1024]u8 = undefined;
+        const env = std.Io.Dir.cwd().readFile(std.testing.io, "/proc/self/environ", &buf) catch return false;
+        var it = std.mem.splitScalar(u8, env, 0);
+        while (it.next()) |kv| if (std.mem.eql(u8, kv, "CI=true")) return true;
+    }
+    return false;
+}
+
 /// Builds fixture trees for tests: files, directories and symlinks under a temp directory, and
 /// a `Host` rooted there.
 pub const Fixture = struct {
