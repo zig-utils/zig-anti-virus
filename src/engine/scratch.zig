@@ -3,8 +3,7 @@
 //! here, so the hot loop never calls the heap. After a burst the worker trims back to a small
 //! resident size with madvise, returning the pages to the system.
 const std = @import("std");
-const posix = std.posix;
-const builtin = @import("builtin");
+const vm = @import("../rt/vm.zig");
 
 pub const default_reservation: usize = 64 * 1024 * 1024;
 /// Bytes kept resident after an idle trim.
@@ -16,14 +15,12 @@ pub const Scratch = struct {
     high_water: usize = 0,
 
     pub fn init(reservation: usize) !Scratch {
-        var flags: posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
-        if (@hasField(posix.MAP, "NORESERVE")) flags.NORESERVE = true;
-        const region = try posix.mmap(null, reservation, .{ .READ = true, .WRITE = true }, flags, -1, 0);
+        const region = try vm.reserve(reservation);
         return .{ .region = region, .fba = .init(region) };
     }
 
     pub fn deinit(s: *Scratch) void {
-        posix.munmap(s.region);
+        vm.release(s.region);
     }
 
     /// Allocator for one scan's working set. Freed all at once by `reset`.
@@ -43,8 +40,7 @@ pub const Scratch = struct {
         const start = std.mem.alignForward(usize, keep, std.heap.pageSize());
         if (s.high_water <= start) return;
         const len = std.mem.alignForward(usize, s.high_water, std.heap.pageSize()) - start;
-        const advice = if (builtin.os.tag.isDarwin()) std.c.MADV.FREE_REUSABLE else posix.MADV.DONTNEED;
-        posix.madvise(@alignCast(s.region.ptr + start), len, advice) catch {};
+        vm.discard(@alignCast(s.region[start..][0..len]));
         s.high_water = start;
     }
 };

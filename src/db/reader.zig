@@ -12,6 +12,7 @@ const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;
 const format = @import("format.zig");
+const vm = @import("../rt/vm.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const Error = error{
@@ -60,7 +61,7 @@ pub const Database = struct {
     }
 
     pub fn close(db: Database) void {
-        posix.munmap(db.mapping);
+        vm.unmapFile(db.mapping);
     }
 };
 
@@ -120,8 +121,8 @@ pub fn open(io: Io, dir: Io.Dir, sub_path: []const u8, options: OpenOptions) !Da
     defer file.close(io);
     const st = try file.stat(io);
     if (st.size < format.header_size) return error.TooSmall;
-    const mapping = try posix.mmap(null, @intCast(st.size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-    errdefer posix.munmap(mapping);
+    const mapping = try vm.mapFile(file.handle, std.math.cast(usize, st.size) orelse return error.TooLarge);
+    errdefer vm.unmapFile(mapping);
     try validate(mapping, options);
     return .{ .mapping = mapping };
 }
