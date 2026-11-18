@@ -206,6 +206,20 @@ pub fn build(b: *std.Build) void {
     run_e1.addPassthruArgs();
     b.step("e1", "Hash index lookup cost and skipped hashing (pass db, CVD dir and corpus roots after --)").dependOn(&run_e1.step);
 
+    // The 4-gram frequency model atom selection embeds (src/compile/gram_model.bin).
+    const gram_model_exe = b.addExecutable(.{
+        .name = "gram-model",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gram_model.zig"),
+            .target = target,
+            .optimize = if (optimize == .debug) .fast else optimize,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    const run_gram_model = b.addRunArtifact(gram_model_exe);
+    run_gram_model.addPassthruArgs();
+    b.step("gram-model", "Build the 4-gram frequency model from benign corpus directories").dependOn(&run_gram_model.step);
+
     // Kernel benchmarks (zig-bench is a lazy dependency, fetched only by this step).
     const bench_step = b.step("bench", "Run kernel benchmarks and write a JSON result file");
     if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {
