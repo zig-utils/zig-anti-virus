@@ -117,9 +117,7 @@ jobs:
         run: |
           db="$RUNNER_TEMP/db"
           python3 tools/diff/realdb.py gate --db $db/main --db $db/daily --out "$RUNNER_TEMP/gate"
-          # Reported, not enforced yet: the remaining differences are scan-pipeline semantics
-          # (embedded HTML re-typing a binary file) that zav-diff's reference scan does not model.
-          python3 tools/diff/gate.py --cvd "$HOME/clamav-db/main.cvd" --cvd "$HOME/clamav-db/daily.cvd" --db $db/main --db $db/daily --tmp "$RUNNER_TEMP/gz" --show 120 "$RUNNER_TEMP/gate" || true
+          python3 tools/diff/gate.py --cvd "$HOME/clamav-db/main.cvd" --cvd "$HOME/clamav-db/daily.cvd" --db $db/main --db $db/daily --tmp "$RUNNER_TEMP/gz" --show 120 "$RUNNER_TEMP/gate"
       - name: E13, zig-regex against PCRE2 on the PCRE subsigs and a public YARA rule set
         run: |
           git clone -q --depth 1 https://github.com/Yara-Rules/rules.git "$RUNNER_TEMP/yara-rules"

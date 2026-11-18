@@ -22,9 +22,10 @@
 //!   sample bin "A\x12C" => Diff.Name
 //!   sample 40*"A" x"00 ff" => OK
 //!
-//! Scanning follows clamscan: the hash stage, then the body stage over the raw bytes with the
-//! file's target type, then (for text) the normalised bytes with target type 7. Executables get
-//! their entry point and sections from zav's PE, ELF and Mach-O parsers.
+//! Scanning is the engine's layer scan (engine/layerscan.zig), libclamav's per-object semantics:
+//! hashes, file typing with the database's type magics (binary data with an HTML tag is HTML),
+//! the body stage over the raw bytes with the file's target type, HTML only through its
+//! normalised forms (target 3), text also normalised (target 7), and HandlerType re-scans.
 const std = @import("std");
 const Io = std.Io;
 const zav = @import("zav");
@@ -357,173 +358,11 @@ fn lessString(_: void, a: []const u8, b: []const u8) bool {
 
 // Scanning ---------------------------------------------------------------------------------------
 
-/// One compiled database, ready to scan with.
-pub const Engine = struct {
-    database: zav.db.reader.Database,
-    body: bodyscan.BodyIndex,
-    hashes: hashscan.HashIndex,
-    regex_mem: []align(8) u8 = &.{},
-    regex_scratch: ?regex.Scratch = null,
-
-    pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) !Engine {
-        const database = try zav.db.reader.open(io, dir, path, .{ .allow_unsigned = true });
-        errdefer database.close();
-        var e: Engine = .{ .database = database, .body = try .load(database), .hashes = try .load(database) };
-        if (e.body.regexes) |pool| {
-            const capacity = pool.capacity(256);
-            e.regex_mem = try gpa.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
-            e.regex_scratch = try regex.Scratch.initBuffer(e.regex_mem, capacity);
-            e.regex_scratch.?.step_budget = 1 << 22;
-        }
-        return e;
-    }
-
-    pub fn close(e: *Engine, gpa: std.mem.Allocator) void {
-        if (e.regex_mem.len > 0) gpa.free(e.regex_mem);
-        e.database.close();
-    }
-};
-
-pub const Result = union(enum) {
-    clean,
-    found: u32,
-    limited: zav.engine.limits.Event,
-};
-
-/// Per-worker scan state: logical state in scratch, PE/ELF/Mach-O tables, a text buffer.
-pub const Scanner = struct {
-    gpa: std.mem.Allocator,
-    io: Io,
-    scratch: zav.engine.scratch.Scratch,
-    state: logical.State,
-    block: []u8,
-    pe_sections: []zav.fmt.pe.Section,
-    elf_segments: []zav.fmt.elf.Segment,
-    elf_sections: []zav.fmt.elf.Section,
-    macho_segments: []zav.fmt.macho.Segment,
-    macho_sections: []zav.fmt.macho.Section,
-    vm_sections: []vm.Section,
-    norm: std.ArrayList(u8) = .empty,
-
-    pub fn init(gpa: std.mem.Allocator, io: Io) !*Scanner {
-        const s = try gpa.create(Scanner);
-        errdefer gpa.destroy(s);
-        s.* = .{
-            .gpa = gpa,
-            .io = io,
-            .scratch = try .init(zav.engine.scratch.default_reservation),
-            .state = undefined,
-            .block = try gpa.alloc(u8, 64 * 1024),
-            .pe_sections = try gpa.alloc(zav.fmt.pe.Section, 96),
-            .elf_segments = try gpa.alloc(zav.fmt.elf.Segment, 256),
-            .elf_sections = try gpa.alloc(zav.fmt.elf.Section, 1024),
-            .macho_segments = try gpa.alloc(zav.fmt.macho.Segment, 256),
-            .macho_sections = try gpa.alloc(zav.fmt.macho.Section, 1024),
-            .vm_sections = try gpa.alloc(vm.Section, 1024),
-        };
-        s.state = try logical.State.init(s.scratch.allocator());
-        return s;
-    }
-
-    pub fn deinit(s: *Scanner) void {
-        s.norm.deinit(s.gpa);
-        s.gpa.free(s.vm_sections);
-        s.gpa.free(s.macho_sections);
-        s.gpa.free(s.macho_segments);
-        s.gpa.free(s.elf_sections);
-        s.gpa.free(s.elf_segments);
-        s.gpa.free(s.pe_sections);
-        s.gpa.free(s.block);
-        s.scratch.deinit();
-        s.gpa.destroy(s);
-    }
-
-    /// What zav knows about a file before matching: its target type and executable layout.
-    pub const Classified = struct {
-        format: zav.fmt.detect.Format,
-        file: bodyscan.File,
-        pe: ?zav.fmt.pe.Info = null,
-    };
-
-    pub fn classify(s: *Scanner, data: []const u8) Classified {
-        const format = zav.fmt.detect.detect(data[0..@min(data.len, zav.fmt.detect.head_len)]);
-        var out: Classified = .{ .format = format, .file = .{ .info = .{ .size = data.len } } };
-        const src: zav.engine.source.Source = .{ .memory = data };
-        switch (format) {
-            .pe => if (zav.fmt.pe.parse(s.io, src, s.pe_sections)) |info| {
-                out.pe = info;
-                out.file.target = 1;
-                out.file.info.entry_point = info.ep_offset;
-                const n = @min(info.sections.len, s.vm_sections.len);
-                for (info.sections[0..n], s.vm_sections[0..n]) |sec, *v| v.* = .{ .offset = sec.raw_off, .size = sec.raw_size };
-                out.file.info.sections = s.vm_sections[0..n];
-            } else |_| {},
-            .elf => if (zav.fmt.elf.parse(s.io, src, s.elf_segments, s.elf_sections)) |info| {
-                out.file.target = 6;
-                out.file.info.entry_point = info.ep_offset;
-                const n = @min(info.sections.len, s.vm_sections.len);
-                for (info.sections[0..n], s.vm_sections[0..n]) |sec, *v| v.* = .{ .offset = sec.offset, .size = sec.size };
-                out.file.info.sections = s.vm_sections[0..n];
-            } else |_| {},
-            .macho => if (zav.fmt.macho.parse(s.io, src, s.macho_segments, s.macho_sections)) |info| {
-                out.file.target = 9;
-                out.file.info.entry_point = info.matchEntryPoint();
-                const n = @min(info.sections.len, s.vm_sections.len);
-                for (info.sections[0..n], s.vm_sections[0..n]) |sec, *v| v.* = .{ .offset = sec.offset, .size = sec.size };
-                out.file.info.sections = s.vm_sections[0..n];
-            } else |_| {},
-            else => {},
-        }
-        return out;
-    }
-
-    /// Scan one file's bytes with one database: the first detection, like clamscan without
-    /// --allmatch.
-    pub fn scan(s: *Scanner, e: *Engine, data: []const u8) !Result {
-        if (data.len < zav.engine.limits.min_scan_size) return .clean;
-        var tracker = zav.engine.limits.Tracker.init(.{});
-        const src: zav.engine.source.Source = .{ .memory = data };
-        switch (try hashscan.scanSource(s.io, &e.hashes, src, &tracker, s.block)) {
-            .infected => |sig| return .{ .found = sig },
-            .limited => |ev| return .{ .limited = ev },
-            .clean, .allowed => {},
-        }
-        const c = s.classify(data);
-        if (c.pe) |*info| switch (hashscan.scanPe(s.io, &e.hashes, src, info, s.block)) {
-            .infected => |sig| return .{ .found = sig },
-            else => {},
-        };
-
-        var limited: ?zav.engine.limits.Event = null;
-        switch (try s.body(e, data, c.file, &tracker)) {
-            .infected => |d| return .{ .found = d.sig },
-            .limited => |ev| limited = ev,
-            .clean => {},
-        }
-        if (c.format == .text) {
-            // Target 7 (and type-0) signatures also run over the normalised text.
-            s.norm.clearRetainingCapacity();
-            try s.norm.resize(s.gpa, data.len);
-            var n: zav.fmt.text_norm.Normalizer = .{};
-            const len = n.feed(data, s.norm.items);
-            const text = s.norm.items[0..len];
-            switch (try s.body(e, text, .{ .info = .{ .size = text.len }, .target = 7 }, &tracker)) {
-                .infected => |d| return .{ .found = d.sig },
-                .limited => |ev| limited = limited orelse ev,
-                .clean => {},
-            }
-        }
-        if (limited) |ev| return .{ .limited = ev };
-        return .clean;
-    }
-
-    fn body(s: *Scanner, e: *Engine, data: []const u8, file: bodyscan.File, tracker: *zav.engine.limits.Tracker) !bodyscan.Verdict {
-        s.state.reset();
-        s.state.regex_scratch = if (e.regex_scratch) |*r| r else null;
-        var budget: vm.Budget = .{};
-        return bodyscan.scanBuffer(&e.body, data, file, &budget, tracker, &s.state);
-    }
-};
+/// One compiled database, and the per-worker scanner: the engine's layer scan
+/// (engine/layerscan.zig), libclamav's per-object semantics.
+pub const Engine = zav.engine.layerscan.Engine;
+pub const Result = zav.engine.layerscan.Result;
+pub const Scanner = zav.engine.layerscan.Scanner;
 
 // Commands ---------------------------------------------------------------------------------------
 
@@ -776,7 +615,7 @@ fn check(app: App, args: []const []const u8) !u8 {
             }
             if (print) try app.out.print("LOAD {s} sig{d} {s}\n", .{ case.name, si + 1, if (compiled.rejected) "REJECTS" else "LOADS" });
             if (compiled.rejected or (sig.rejected and !print)) continue;
-            var engine = try Engine.open(app.gpa, app.io, tmp, compiled.path);
+            var engine = try Engine.open(app.gpa, app.io, tmp, compiled.path, .{ .allow_unsigned = true });
             defer engine.close(app.gpa);
             for (case.samples.items, results, own) |sample, *r, *o| {
                 const name: ?[]const u8 = switch (try scanner.scan(&engine, sample.bytes)) {
@@ -995,40 +834,21 @@ fn normalizeCmd(app: App, args: []const []const u8) !u8 {
     const Sink = struct {
         list: std.ArrayList(u8) = .empty,
         arena: std.mem.Allocator,
-        js: zav.fmt.js_norm.Normalizer = undefined,
-        start: usize = 0,
         fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.list.appendSlice(self.arena, bytes) catch return error.Stop;
         }
-        // libclamav's `javascript` file: each script as <script>...</script>, newline separated.
-        fn begin(ctx: *anyopaque) error{Stop}!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (self.list.items.len > 0) try write(ctx, "\n");
-            self.start = self.list.items.len;
-            try write(ctx, "<script>");
-            self.js = .init(.{ .ctx = ctx, .write = write });
-        }
-        fn piece(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            try self.js.feed(bytes);
-        }
-        fn end(ctx: *anyopaque) error{Stop}!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            try self.js.finish();
-            const out = self.list.items[self.start..];
-            if (out.len < 9 or !std.mem.endsWith(u8, out, "</script>")) try write(ctx, "</script>");
-        }
     };
     var sink: Sink = .{ .arena = app.arena };
     const writer: zav.fmt.html_norm.Output = .{ .ctx = &sink, .write = Sink.write };
+    var js: zav.engine.layerscan.JavascriptFile = .{ .out = writer };
     var outputs: zav.fmt.html_norm.Outputs = .{};
     if (std.mem.eql(u8, args[0], "html")) {
         outputs.nocomment = writer;
     } else if (std.mem.eql(u8, args[0], "notags")) {
         outputs.notags = writer;
     } else if (std.mem.eql(u8, args[0], "js")) {
-        outputs.scripts = .{ .ctx = &sink, .begin = Sink.begin, .data = Sink.piece, .end = Sink.end };
+        outputs.scripts = js.pieces();
     } else return usage(app);
     const norm = try app.arena.create(zav.fmt.html_norm.Normalizer);
     norm.* = .init(outputs);
@@ -1197,7 +1017,7 @@ fn scanCmd(app: App, args: []const []const u8) !u8 {
         group_start = group_end;
         const summary = try c.write(app.io, tmp, "scan.zavdb", .{ .db_version = 1 });
         if (summary.signatures == 0) continue;
-        var engine = try Engine.open(app.gpa, app.io, tmp, "scan.zavdb");
+        var engine = try Engine.open(app.gpa, app.io, tmp, "scan.zavdb", .{ .allow_unsigned = true });
         defer engine.close(app.gpa);
         var name_buf: [512]u8 = undefined;
         for (datas, results) |data, *r| {

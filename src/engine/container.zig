@@ -163,6 +163,9 @@ pub const Walker = struct {
         heuristics: ?*const @import("heuristics.zig").Config = null,
         /// Container metadata signatures, checked once per member by the archive parsers.
         cdb: ?*const CdbHook = null,
+        /// The database's file-type magics: text and binary data are re-typed from their
+        /// embedded type magics, as libclamav does (fmt/scan.zig `retype`).
+        types: ?*const @import("../fmt/ftm.zig").Ftm = null,
     };
 
     /// Scan a top-level object. Limit events are reported as notices; error.Halted means the walk

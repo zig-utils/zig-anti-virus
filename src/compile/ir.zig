@@ -423,6 +423,9 @@ pub const Tdb = struct {
     /// `Intermediates:A>B>C`, outermost first.
     intermediates: [max_intermediates]u16 = @splat(0),
     intermediate_count: u8 = 0,
+    /// `HandlerType:CL_TYPE_*`: when the signature matches, the file is scanned again as that
+    /// type (and the signature reports from that scan).
+    handler: ?u16 = null,
 };
 
 pub const RpnCode = enum(u8) {

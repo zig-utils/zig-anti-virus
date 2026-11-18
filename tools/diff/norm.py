@@ -32,7 +32,7 @@ def clamav_normalized(base, path, tmp):
         js = os.path.join(d, "javascript")
         out.append(("js", open(js, "rb").read() if os.path.exists(js) else b""))
         return out
-    text = glob.glob(os.path.join(tmp, "*", "clamav-*.tmp"))
+    text = [t for t in glob.glob(os.path.join(tmp, "*", "clamav-*.tmp")) if os.path.isfile(t)]
     if text:
         return [("text", open(text[0], "rb").read())]
     return []

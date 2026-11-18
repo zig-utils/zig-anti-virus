@@ -243,10 +243,9 @@ pub fn parseTdb(text: []const u8, flevel_min: *u16, flevel_max: *u16) LineError!
                 }
             },
             7, 8 => return error.IconUnsupported,
-            // HandlerType: when the signature matches, libclamav also hands the file to that
-            // type's handler; the match itself is reported as a detection, which is what zav
-            // does. The type must be known; the re-scan is the scan pipeline's (P5).
-            9 => _ = try fileType(value),
+            // HandlerType: when the signature matches, libclamav scans the file again as that
+            // type, where the signature matches again and reports (engine/layerscan.zig).
+            9 => tdb.handler = try fileType(value),
             else => unreachable,
         }
     }

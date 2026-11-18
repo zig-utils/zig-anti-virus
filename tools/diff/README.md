@@ -60,3 +60,13 @@ Every difference was fixed in zav or listed in `known.txt`:
 - Every part needs two consecutive literal bytes; plain .ndb literals under three bytes are
   refused where libclamav uses Boyer-Moore; `[x-y]` needs a single byte on one side.
 - Files of five bytes or fewer are not scanned.
+
+## Whole databases and normalisers
+
+- `gate.py` (P4.21 gate): samples built from the target-0 bodies of the real databases
+  (`realdb.py gate`), scanned with the whole databases by clamscan and by `zav-diff scan`, which
+  uses the engine's layer scan (`src/engine/layerscan.zig`): file typing with the database's type
+  magics, HTML through its normalised forms only, HandlerType re-scans. Every file must agree.
+- `norm.py`: zav's normalisers against the files `clamscan --leave-temps` keeps: the text form
+  (target 7) and, for HTML, nocomment.html, notags.html and `javascript`. `gen_html.py` writes
+  stress documents that reach every state of libclamav's HTML normaliser, chunk cuts included.

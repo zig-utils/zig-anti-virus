@@ -218,6 +218,170 @@ fn textType(head: []const u8) types.ClType {
     return if (std.unicode.utf8ValidateSlice(head)) .text_utf8 else .binary_data;
 }
 
+/// A file type's place in libclamav's enum (filetypes.h, CL_TYPENO = 500 onwards). libclamav
+/// decides between the type magics matching one buffer by that order, so zav needs it too.
+pub fn clamRank(t: types.ClType) u16 {
+    return switch (t) {
+        .any => 0,
+        .text_ascii => 500,
+        .text_utf8 => 501,
+        .text_utf16le => 502,
+        .text_utf16be => 503,
+        .binary_data => 504,
+        .msexe => 506,
+        .elf => 507,
+        .macho => 508,
+        .macho_unibin => 509,
+        .posix_tar => 510,
+        .old_tar => 511,
+        .cpio_old => 512,
+        .cpio_odc => 513,
+        .cpio_newc => 514,
+        .cpio_crc => 515,
+        .gz => 516,
+        .zip => 517,
+        .bz => 518,
+        .rar => 519,
+        .arj => 520,
+        .msszdd => 521,
+        .msole2 => 522,
+        .mscab => 523,
+        .mschm => 524,
+        .sis => 525,
+        .screnc => 526,
+        .graphics => 527,
+        .gif => 528,
+        .png => 529,
+        .jpeg => 530,
+        .tiff => 531,
+        .riff => 532,
+        .binhex => 533,
+        .tnef => 534,
+        .cryptff => 535,
+        .pdf => 536,
+        .uuencoded => 537,
+        .script => 538,
+        .html_utf16 => 539,
+        .rtf => 540,
+        .@"7z" => 541,
+        .swf => 542,
+        .java => 543,
+        .xar => 544,
+        .xz => 545,
+        .ooxml_word => 546,
+        .ooxml_ppt => 547,
+        .ooxml_xl => 548,
+        .internal => 549,
+        .hwp3 => 550,
+        .ooxml_hwp => 551,
+        .ps => 552,
+        .egg => 553,
+        .onenote => 554,
+        .python_compiled => 555,
+        .lha_lzh => 556,
+        .part_any => 558,
+        .part_hfsplus => 559,
+        .mbr => 560,
+        .html => 561,
+        .mail => 562,
+        .zipsfx => 564,
+        .rarsfx => 565,
+        .@"7zsfx" => 566,
+        .cabsfx => 567,
+        .arjsfx => 568,
+        .nulsft => 570,
+        .autoit => 571,
+        .ishield_msi => 572,
+        .iso9660 => 573,
+        .dmg => 574,
+        .gpt => 575,
+        .apm => 576,
+        .xdp => 577,
+        .xml_word => 578,
+        .xml_xl => 579,
+        .xml_hwp => 580,
+        .hwpole2 => 581,
+        .mhtml => 582,
+        .lnk => 583,
+        .udf => 584,
+        .alz => 585,
+        .ignored => 587,
+        else => 0,
+    };
+}
+
+const rank_sfx = 563;
+
+/// libclamav's embedded-type re-typing (cli_determine_fmap_type and scanraw): the body magics
+/// whose required type is ANY or `base` are searched in `data`, and in the order the matches end
+/// a match takes over when its type comes later in libclamav's enum, is an SFX type or later, or
+/// is CL_TYPE_MSEXE; CL_TYPE_IGNORED ends the search. Only the last match of each magic matters
+/// for that rule, so no list of matches is kept.
+///
+/// `whole`: `data` is the whole object, so EOF-relative magics apply (scanraw); the head that
+/// cli_determine_fmap_type reads (1024 bytes) passes false, since libclamav computes no relative
+/// offsets for it. Returns the type the matches settle on (CL_TYPE_ANY when none matched).
+pub fn embeddedType(f: Ftm, data: []const u8, base: types.ClType, whole: bool, budget: *vm.Budget) types.ClType {
+    const ps = f.programs orelse return .any;
+    const Last = struct { end: usize, entry: usize, rank: u16, t: types.ClType };
+    var last_sticky: ?Last = null;
+    // Up to the last sticky match only the sticky ones decide; after it, larger types still win.
+    var best_any: ?Last = null;
+    const later = struct {
+        fn after(a: Last, b: Last) bool {
+            return a.end > b.end or (a.end == b.end and a.entry > b.entry);
+        }
+    }.after;
+    var ends: [256]?Last = @splat(null);
+    var count: usize = 0;
+    for (f.entries, 0..) |entry, i| {
+        if (entry.kind != .body) continue;
+        if (entry.rtype != 0 and entry.rtype != @backingInt(base)) continue;
+        const p = ps.get(entry.prog);
+        switch (p.offset().kind) {
+            .any, .absolute => {},
+            .eof_minus => if (!whole) continue,
+            else => continue,
+        }
+        var scanner = vm.Scanner.init(p, data, .{ .size = data.len }, budget);
+        var end: ?usize = null;
+        while (scanner.next() catch null) |m| end = m.end;
+        const e = end orelse continue;
+        const t: types.ClType = @fromBackingInt(entry.type);
+        if (t == .ignored) return .ignored;
+        const l: Last = .{ .end = e, .entry = i, .rank = clamRank(t), .t = t };
+        if (l.rank >= rank_sfx or t == .msexe) {
+            if (last_sticky == null or later(l, last_sticky.?)) last_sticky = l;
+        } else if (count < ends.len) {
+            ends[count] = l;
+            count += 1;
+        }
+        if (best_any == null or l.rank > best_any.?.rank) best_any = l;
+    }
+    const s = last_sticky orelse return if (best_any) |b| b.t else .any;
+    var result = s;
+    if (s.t == .msexe) for (ends[0..count]) |maybe| {
+        const l = maybe.?;
+        if (later(l, s) and l.rank > result.rank) result = l;
+    };
+    return result.t;
+}
+
+/// cli_determine_fmap_type's correction of a text or binary-data file (`base`) from the first
+/// 1024 bytes: the embedded type when one matched and it is not a self-extractor (those are
+/// found by the raw scan), else null. HTML is what makes the difference in practice: binary
+/// data with an HTML tag near its start is scanned as HTML, so its raw bytes are not matched.
+pub fn retype(f: Ftm, data: []const u8, base: types.ClType, budget: *vm.Budget) ?types.ClType {
+    const t = embeddedType(f, data[0..@min(data.len, retype_window)], base, false, budget);
+    return switch (t) {
+        .any, .zipsfx, .arjsfx, .rarsfx, .cabsfx, .@"7zsfx" => null,
+        else => t,
+    };
+}
+
+/// How much of a file cli_determine_fmap_type types (CL_FILE_MBUFF_SIZE).
+pub const retype_window = 1024;
+
 /// Classify a file from its first bytes (4 KiB is plenty).
 pub fn classify(f: Ftm, head: []const u8, options: Options, budget: *vm.Budget) Classification {
     var c: Classification = .{ .type = .binary_data, .by_magic = false };

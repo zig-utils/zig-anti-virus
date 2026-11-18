@@ -41,6 +41,9 @@ const html_norm = @import("html_norm.zig");
 const js_norm = @import("js_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
+const ftm = @import("ftm.zig");
+const types = @import("types.zig");
+const vm = @import("../match/verify_vm.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -52,7 +55,7 @@ pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
 fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
     var head: [detect.head_len]u8 = undefined;
     const n = src.readAt(w.io, 0, &head) catch 0;
-    obj.format = deepPositional(w, src, detect.detect(head[0..n]));
+    obj.format = retype(w, obj, head[0..n], deepPositional(w, src, detect.detect(head[0..n])));
     try w.begin(obj);
     try w.feedSource(obj, src);
     checkName(w, obj);
@@ -160,6 +163,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     };
     obj.format = detect.detect(r.buffered());
     if (obj.format == .binary) obj.format = deepStream(r);
+    obj.format = retype(w, obj, r.buffered(), obj.format);
     try w.begin(obj);
     checkName(w, obj);
     const tee_buf = w.alloc(u8, container.block_len) orelse return w.drain(r);
@@ -204,6 +208,38 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         else => {},
     }
     try w.drain(&tee.interface);
+}
+
+/// libclamav's re-typing of text and binary data by the database's embedded type magics in the
+/// first 1024 bytes (`ftm.retype`; engine/layerscan.zig has the whole rule set): binary data
+/// with an HTML tag near its start is parsed as HTML, mail headers make mail. Without type magics
+/// zav's own detection stands. HTML objects, and objects typed CL_TYPE_IGNORED, are not matched
+/// raw (`Object.skip_raw`).
+fn retype(w: *Walker, obj: *Object, head: []const u8, f: Format) Format {
+    const out = retypeFormat(w, obj, head, f);
+    if (out == .html) obj.skip_raw = true;
+    return out;
+}
+
+fn retypeFormat(w: *Walker, obj: *Object, head: []const u8, f: Format) Format {
+    const magics = w.options.types orelse return f;
+    switch (f) {
+        .text, .binary, .html => {},
+        else => return f,
+    }
+    var budget: vm.Budget = .{};
+    const base: types.ClType = if (f == .binary) .binary_data else .text_ascii;
+    const t = ftm.retype(magics.*, head, base, &budget) orelse return if (f == .html) .text else f;
+    return switch (t) {
+        .html, .html_utf16 => .html,
+        .mail => .mail,
+        .pdf => .pdf,
+        .ignored => blk: {
+            obj.skip_raw = true;
+            break :blk f;
+        },
+        else => if (f == .html) .text else f,
+    };
 }
 
 /// Formats recognised past the detection head, for positional sources: ISO 9660 by its volume
@@ -893,5 +929,34 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
         try std.testing.expectEqual(c[1], hit);
         // The streamed pass cannot tell the cpio's size: that record is reported undecided.
         if (std.mem.eql(u8, c[0], "crc.cpio")) try std.testing.expect(rig.rec.hasLimit(.container_size_unknown));
+    }
+}
+
+test "with type magics, binary data with an HTML tag near its start is parsed as HTML" {
+    const Compiler = @import("../compile/compiler.zig").Compiler;
+    const reader = @import("../db/root.zig").reader;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = Compiler.init(std.testing.allocator);
+    defer c.deinit();
+    try c.addFile("t.ftm", "1:*:3c736372697074(3e|20):HTML data:CL_TYPE_ANY:CL_TYPE_HTML\n");
+    _ = try c.write(std.testing.io, tmp.dir, "t.zavdb", .{ .db_version = 1 });
+    const database = try reader.open(std.testing.io, tmp.dir, "t.zavdb", .{ .allow_unsigned = true });
+    defer database.close();
+    const progs = try @import("../match/prog.zig").Programs.init(database.section(.subsig_prog, 1).?);
+    const magics = try ftm.Ftm.init(database.section(.ftm_trie, 0).?, progs);
+
+    const bytes = "\x00\x01\x02\x03<script>Alert(1)</script><p>Text</p>";
+    for ([_]bool{ false, true }) |with_magics| {
+        var rig: TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        if (with_magics) rig.walker.options.types = &magics;
+        try rig.scanBoth(bytes, "x.bin");
+        var html: usize = 0;
+        for (rig.rec.objects.items) |e| {
+            if (std.mem.eql(u8, e.path, "x.bin/html") or std.mem.eql(u8, e.path, "x.bin/notags")) html += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (with_magics) 4 else 0), html);
     }
 }
