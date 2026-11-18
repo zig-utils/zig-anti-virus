@@ -75,6 +75,50 @@ fn buildAnchored(gpa: std.mem.Allocator, random: std.Random) !void {
     // The arena lives for the whole run; the programs and index point into it.
 }
 
+var logical_tables: [2]zav.match.ldb_table.LdbTable = undefined;
+var logical_state: zav.match.logical.State = undefined;
+var logical_i: u32 = 0;
+
+fn logicalFile(comptime which: usize) fn () void {
+    return struct {
+        /// 16 touched signatures, evaluation and the reset: one file's logical-state cost. The
+        /// touched signatures come from the same first 1000 records in both tables, so the
+        /// numbers differ only if the state's cost depended on the database size.
+        fn run() void {
+            const table = logical_tables[which];
+            const n: u32 = 1000;
+            for (0..16) |k| {
+                const ldb: u32 = (logical_i +% @as(u32, @intCast(k)) *% 7919) % n;
+                logical_state.touch(table, .{}, ldb, 0) catch unreachable;
+                logical_state.touch(table, .{}, ldb, 1) catch unreachable;
+            }
+            logical_i +%= 1;
+            var out: [4]u32 = undefined;
+            sink +%= logical_state.finalize(table, &out);
+            logical_state.reset();
+        }
+    }.run;
+}
+
+fn buildLogical(gpa: std.mem.Allocator) !void {
+    const zc = zav.compile;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    const a = arena.allocator();
+    var column: u32 = 0;
+    const rule = try a.create(zc.ir.LogicalRule);
+    rule.* = try zc.ldb.parseLine(a, "Bench.Logical-1-0;Target:0;(0|1)>1&2=0;aabb;ccdd;eeff", &column);
+    for ([_]usize{ 1_000, 100_000 }, 0..) |count, t| {
+        const entries = try a.alloc(zc.ldb_build.Entry, count);
+        for (entries, 0..) |*e, i| e.* = .{ .rule = rule, .sig = @intCast(i), .prog_first = 0, .prog_count = 0 };
+        const bytes = try zc.ldb_build.build(a, entries);
+        const image = try a.alignedAlloc(u8, .@"8", bytes.len);
+        @memcpy(image, bytes);
+        logical_tables[t] = try .init(image, null);
+    }
+    logical_state = try .init(a);
+    // The arena lives for the whole run.
+}
+
 /// Open and close a 200 MB database: header, signature and section-table checks only.
 fn dbOpen() void {
     const db = zav.db.reader.open(io_global, dir_global, "bench.zavdb", .{ .allow_unsigned = true }) catch unreachable;
@@ -137,6 +181,9 @@ pub fn main(init: std.process.Init) !void {
     try suite.add("hash lookup, 1M MD5 entries", hashLookup);
     try buildAnchored(init.gpa, random);
     try suite.add("anchored index, 20k signatures, one file", anchoredScan);
+    try buildLogical(init.gpa);
+    try suite.add("logical state, 16 touched, 1k-signature table", logicalFile(0));
+    try suite.add("logical state, 16 touched, 100k-signature table", logicalFile(1));
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);

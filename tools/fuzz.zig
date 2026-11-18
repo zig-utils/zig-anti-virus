@@ -65,6 +65,10 @@ pub fn main(init: std.process.Init) !void {
             ldbSection(random);
             cases += 1;
         }
+        if (selected(only, "logicalDiff")) {
+            logicalDiff(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
         // Format parsers and decoders (fmt/): one per iteration in rotation, or every target whose
@@ -538,6 +542,73 @@ fn ldbSection(random: std.Random) void {
     const table = match.ldb_table.LdbTable.init(image[0 .. random.uintAtMost(usize, image.len) & ~@as(usize, 7)], programs) catch return;
     var counts: [zc.ir.max_subsigs]u32 = @splat(1);
     for (table.records) |rec| _ = match.ldb_table.evalRpn(table.expr(rec), counts[0..rec.nsub]);
+}
+
+var logical_fixture: ?struct { table: zav.match.ldb_table.LdbTable, state: zav.match.logical.State } = null;
+var logical_mem: [2 * 1024 * 1024]u8 align(8) = undefined;
+
+/// Random touches through the sparse logical state against a dense reference: the same
+/// signatures must match, with target descriptions decided on first touch.
+fn logicalDiff(random: std.Random) void {
+    const zc = zav.compile;
+    const lt = zav.match.ldb_table;
+    const lines = [_][]const u8{
+        "A;Target:0;0&1;aa;bb",
+        "B;Target:1;0|1;aa;bb",
+        "C;Target:0;0>2;aa",
+        "D;Target:0,FileSize:10-20;0&1=0;aa;bb",
+        "E;Target:0;(0|1|2)=2,2;aa;bb;cc",
+        "F;Target:0;((0&1)|2)>1;aa;bb;cc",
+        "G;Target:6,EntryPoint:0-100;0<3&1;aa;bb",
+        "H;Target:0,NumberOfSections:1-3;0;aa",
+    };
+    if (logical_fixture == null) {
+        var fba: std.heap.FixedBufferAllocator = .init(&logical_mem);
+        const a = fba.allocator();
+        const rules = a.alloc(zc.ir.LogicalRule, lines.len) catch unreachable;
+        const entries = a.alloc(zc.ldb_build.Entry, lines.len) catch unreachable;
+        for (lines, rules, entries, 0..) |line, *r, *e, i| {
+            var column: u32 = 0;
+            r.* = zc.ldb.parseLine(a, line, &column) catch unreachable;
+            e.* = .{ .rule = r, .sig = @intCast(i), .prog_first = 0, .prog_count = 0 };
+        }
+        const bytes = zc.ldb_build.build(a, entries) catch unreachable;
+        const image = a.alignedAlloc(u8, .@"8", bytes.len) catch unreachable;
+        @memcpy(image, bytes);
+        logical_fixture = .{ .table = lt.LdbTable.init(image, null) catch unreachable, .state = zav.match.logical.State.init(a) catch unreachable };
+    }
+    const fx = &logical_fixture.?;
+    fx.state.reset();
+    fx.state.all_match = true;
+    const ctx: lt.FileContext = .{
+        .target = random.uintAtMost(u8, 7),
+        .size = random.uintAtMost(u64, 30),
+        .entry_point = if (random.boolean()) random.uintAtMost(u64, 200) else null,
+        .section_count = if (random.boolean()) random.uintAtMost(u64, 5) else null,
+    };
+    var counts: [lines.len][3]u32 = @splat(@splat(0));
+    var touched: [lines.len]bool = @splat(false);
+    for (0..random.uintAtMost(usize, 12)) |_| {
+        const l = random.uintLessThan(u32, lines.len);
+        const nsub = fx.table.records[l].nsub;
+        const sub = random.uintLessThan(u16, nsub);
+        fx.state.touch(fx.table, ctx, l, sub) catch @panic("fuzz: logical touch failed");
+        touched[l] = true;
+        counts[l][sub] += 1;
+    }
+    var want: [lines.len]bool = @splat(false);
+    for (0..lines.len) |l| {
+        if (!touched[l] or !lt.tdbMatches(fx.table.tdbs[l], ctx)) continue;
+        const rec = fx.table.records[l];
+        var c: [3]u32 = undefined;
+        for (0..rec.nsub) |i| c[i] = if (rec.flags & lt.flag_counts != 0) counts[l][i] else @intFromBool(counts[l][i] > 0);
+        want[l] = lt.evalRpn(fx.table.expr(rec), c[0..rec.nsub]);
+    }
+    var out: [lines.len]u32 = undefined;
+    const n = fx.state.finalize(fx.table, &out);
+    var got: [lines.len]bool = @splat(false);
+    for (out[0..n]) |l| got[l] = true;
+    if (!std.mem.eql(bool, &want, &got)) @panic("fuzz: sparse logical state disagrees with the dense reference");
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.
