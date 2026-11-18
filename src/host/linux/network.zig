@@ -563,5 +563,18 @@ test "live: a reverse shell over a loopback socket is detected" {
         };
         if (!found) try io.sleep(.fromMilliseconds(20), .awake);
     }
+    if (!found) {
+        var path_buf: [64]u8 = undefined;
+        var link_buf: [128]u8 = undefined;
+        for ([_][]const u8{ "exe", "fd/0", "fd/1" }) |what| {
+            const p = try std.fmt.bufPrint(&path_buf, "/proc/{d}/{s}", .{ pid, what });
+            const link = h.readLink(p, &link_buf) orelse "(unreadable)";
+            std.debug.print("{s} -> {s}\n", .{ p, link });
+        }
+        var socks: std.ArrayList(Socket) = .empty;
+        defer socks.deinit(gpa);
+        try readInet(gpa, h, "/proc", &socks);
+        std.debug.print("{d} inet sockets in /proc/net\n", .{socks.items.len});
+    }
     try std.testing.expect(found);
 }

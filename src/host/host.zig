@@ -75,9 +75,18 @@ pub const Host = struct {
         return h.read(path, buf) catch null;
     }
 
-    /// Read a whole file of up to `limit` bytes. /proc files report size 0, so this reads to EOF.
+    /// Read a whole file of up to `limit` bytes, to EOF. /proc and /sys files report size 0 in
+    /// stat, and `Dir.readFileAlloc` trusts that size (it returns nothing for them), so this reads
+    /// in streaming mode, which never consults the size.
     pub fn readAlloc(h: Host, gpa: std.mem.Allocator, path: []const u8, limit: usize) ReadError![]u8 {
-        return h.root.readFileAlloc(h.io, rel(path), gpa, .limited(limit)) catch |e| return mapError(e);
+        var file = h.root.openFile(h.io, rel(path), .{}) catch |e| return mapError(e);
+        defer file.close(h.io);
+        var reader = file.readerStreaming(h.io, &.{});
+        return reader.interface.allocRemaining(gpa, .limited(limit)) catch |e| switch (e) {
+            error.ReadFailed => mapError(reader.err orelse error.ReadFailed),
+            error.OutOfMemory => error.OutOfMemory,
+            error.StreamTooLong => error.StreamTooLong,
+        };
     }
 
     pub fn readLink(h: Host, path: []const u8, buf: []u8) ?[]u8 {
@@ -152,6 +161,11 @@ pub const Fixture = struct {
 
     pub fn fileMode(f: *Fixture, path: []const u8, data: []const u8, mode: u32) !void {
         try f.file(path, data);
+        try f.chmod(path, mode);
+    }
+
+    pub fn chmod(f: *Fixture, path: []const u8, mode: u32) !void {
+        if (builtin.os.tag == .windows) return error.SkipZigTest;
         try f.tmp.dir.setFilePermissions(std.testing.io, Host.rel(path), .fromMode(@intCast(mode)), .{});
     }
 
@@ -170,6 +184,18 @@ pub const Fixture = struct {
         try f.tmp.dir.deleteFile(std.testing.io, Host.rel(path));
     }
 };
+
+test "readAlloc reads files whose stat size is zero" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const h = try Host.openLive(std.testing.io);
+    defer h.close();
+    const text = try h.readAlloc(std.testing.allocator, "/proc/self/status", 1 << 20);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Pid:") != null);
+    const cmdline = try h.readAlloc(std.testing.allocator, "/proc/self/cmdline", 1 << 20);
+    defer std.testing.allocator.free(cmdline);
+    try std.testing.expect(cmdline.len > 0);
+}
 
 test "fixture paths resolve under the root" {
     var fx = try Fixture.init();
