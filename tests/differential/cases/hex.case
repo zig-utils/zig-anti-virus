@@ -1,0 +1,175 @@
+# Body (hex) signature grammar: one case per construct of the ClamAV body signature format.
+# Samples start and end with `bin` (8 bytes with NULs) so libclamav types them as binary data
+# and scans only the raw bytes.
+
+case hex-literal
+ndb Diff.Hex.Literal:0:*:48656c6c6f576f726c64
+sample bin "HelloWorld" bin => Diff.Hex.Literal
+sample bin "xxHelloWorldxx" bin => Diff.Hex.Literal
+sample bin "HelloWorl" bin => OK
+sample bin "helloworld" bin => OK
+sample "HelloWorld" bin => Diff.Hex.Literal
+sample bin "HelloWorld" => Diff.Hex.Literal
+
+case hex-wildcard-byte
+ndb Diff.Hex.AnyByte:0:*:41424344??45464748
+ndb Diff.Hex.TwoAny:0:*:41424344????45464748
+sample bin "ABCDxEFGH" bin => Diff.Hex.AnyByte
+sample bin "ABCD\x00EFGH" bin => Diff.Hex.AnyByte
+sample bin "ABCDEFGH" bin => OK
+sample bin "ABCDxyEFGH" bin => Diff.Hex.TwoAny
+sample bin "ABCDxyzEFGH" bin => OK
+
+case hex-nibbles
+ndb Diff.Hex.HighNibble:0:*:41424344a?45464748
+ndb Diff.Hex.LowNibble:0:*:41424344?b45464748
+sample bin "ABCD\xa0EFGH" bin => Diff.Hex.HighNibble
+sample bin "ABCD\xafEFGH" bin => Diff.Hex.HighNibble
+sample bin "ABCD\xb0EFGH" bin => OK
+sample bin "ABCD\x0bEFGH" bin => Diff.Hex.LowNibble
+sample bin "ABCD\xfbEFGH" bin => Diff.Hex.LowNibble
+sample bin "ABCD\xabEFGH" bin => Diff.Hex.HighNibble Diff.Hex.LowNibble
+sample bin "ABCD\xbaEFGH" bin => OK
+
+case hex-gap-fixed
+ndb Diff.Hex.Gap3:0:*:41424344{3}45464748
+ndb Diff.Hex.Gap0:0:*:41424344{0}45464748
+sample bin "ABCDEFGH" bin => Diff.Hex.Gap0
+sample bin "ABCDxxEFGH" bin => Diff.Hex.Gap0
+sample bin "ABCDxxxEFGH" bin => Diff.Hex.Gap0 Diff.Hex.Gap3
+sample bin "ABCDxxxxEFGH" bin => Diff.Hex.Gap0
+
+case hex-gap-upto
+ndb Diff.Hex.UpTo3:0:*:41424344{-3}45464748
+sample bin "ABCDEFGH" bin => Diff.Hex.UpTo3
+sample bin "ABCDxEFGH" bin => Diff.Hex.UpTo3
+sample bin "ABCDxxxEFGH" bin => Diff.Hex.UpTo3
+sample bin "ABCDxxxxEFGH" bin => OK
+
+case hex-gap-atleast
+ndb Diff.Hex.AtLeast3:0:*:41424344{3-}45464748
+sample bin "ABCDxxEFGH" bin => OK
+sample bin "ABCDxxxEFGH" bin => Diff.Hex.AtLeast3
+sample bin "ABCD" 300*"x" "EFGH" bin => Diff.Hex.AtLeast3
+
+case hex-gap-range
+ndb Diff.Hex.Range2to4:0:*:41424344{2-4}45464748
+sample bin "ABCDxEFGH" bin => OK
+sample bin "ABCDxxEFGH" bin => Diff.Hex.Range2to4
+sample bin "ABCDxxxEFGH" bin => Diff.Hex.Range2to4
+sample bin "ABCDxxxxEFGH" bin => Diff.Hex.Range2to4
+sample bin "ABCDxxxxxEFGH" bin => OK
+sample bin "ABCDxABCDxxxEFGH" bin => Diff.Hex.Range2to4
+
+case hex-gap-large
+ndb Diff.Hex.Gap200:0:*:41424344{200}45464748
+ndb Diff.Hex.Range100to300:0:*:41424344{100-300}45464748
+sample bin "ABCD" 200*"x" "EFGH" bin => Diff.Hex.Gap200 Diff.Hex.Range100to300
+sample bin "ABCD" 199*"x" "EFGH" bin => Diff.Hex.Range100to300
+sample bin "ABCD" 99*"x" "EFGH" bin => OK
+sample bin "ABCD" 300*"x" "EFGH" bin => Diff.Hex.Range100to300
+sample bin "ABCD" 301*"x" "EFGH" bin => OK
+
+case hex-star
+ndb Diff.Hex.Star:0:*:41424344*45464748
+sample bin "ABCDEFGH" bin => Diff.Hex.Star
+sample bin "ABCD" 5000*"x" "EFGH" bin => Diff.Hex.Star
+sample bin "EFGHxxABCD" bin => OK
+sample bin "ABCDEFG" bin => OK
+
+case hex-multipart
+ndb Diff.Hex.ThreeParts:0:*:4142{1-2}4344*4546{-1}4748
+sample bin "ABxCD....EFGH" bin => Diff.Hex.ThreeParts
+sample bin "ABxxCD....EFxGH" bin => Diff.Hex.ThreeParts
+sample bin "ABxxxCD....EFGH" bin => OK
+sample bin "ABxCD....EFxxGH" bin => OK
+sample bin "ABxCDABxxCD..EFxGH" bin => Diff.Hex.ThreeParts
+
+case hex-anchored-byte
+# HEXSIG[x-y]BYTE and BYTE[x-y]HEXSIG
+ndb Diff.Hex.ByteAfter:0:*:41424344[2-3]5a
+ndb Diff.Hex.ByteBefore:0:*:5a[1-2]45464748
+sample bin "ABCDxxZ" bin => Diff.Hex.ByteAfter
+sample bin "ABCDxxxZ" bin => Diff.Hex.ByteAfter
+sample bin "ABCDxZ" bin => OK
+sample bin "ABCDxxxxZ" bin => OK
+sample bin "ZxEFGH" bin => Diff.Hex.ByteBefore
+sample bin "ZxxEFGH" bin => Diff.Hex.ByteBefore
+sample bin "ZEFGH" bin => OK
+sample bin "ZxxxEFGH" bin => OK
+
+case hex-alternation-bytes
+ndb Diff.Hex.AltByte:0:*:41424344(58|59|5a)45464748
+sample bin "ABCDXEFGH" bin => Diff.Hex.AltByte
+sample bin "ABCDZEFGH" bin => Diff.Hex.AltByte
+sample bin "ABCDWEFGH" bin => OK
+sample bin "ABCDEFGH" bin => OK
+
+case hex-alternation-strings
+ndb Diff.Hex.AltFixed:0:*:41424344(6f6e65|74776f)45464748
+ndb Diff.Hex.AltGeneric:0:*:41424344(78|797a|313233)45464748
+sample bin "ABCDoneEFGH" bin => Diff.Hex.AltFixed
+sample bin "ABCDtwoEFGH" bin => Diff.Hex.AltFixed
+sample bin "ABCDsixEFGH" bin => OK
+sample bin "ABCDxEFGH" bin => Diff.Hex.AltGeneric
+sample bin "ABCDyzEFGH" bin => Diff.Hex.AltGeneric
+sample bin "ABCD123EFGH" bin => Diff.Hex.AltGeneric
+sample bin "ABCDyEFGH" bin => OK
+sample bin "ABCDxyzEFGH" bin => OK
+
+case hex-alternation-nibbles
+ndb Diff.Hex.AltNibble:0:*:41424344(5?|6?)45464748
+ndb Diff.Hex.AltWild:0:*:41424344(3132|??33)45464748
+sample bin "ABCDPEFGH" bin => Diff.Hex.AltNibble
+sample bin "ABCDaEFGH" bin => Diff.Hex.AltNibble
+sample bin "ABCD\x70EFGH" bin => OK
+sample bin "ABCD12EFGH" bin => Diff.Hex.AltWild
+sample bin "ABCDz3EFGH" bin => Diff.Hex.AltWild
+sample bin "ABCD14EFGH" bin => OK
+
+case hex-negation
+ndb Diff.Hex.NotByte:0:*:41424344!(58|59)45464748
+ndb Diff.Hex.NotString:0:*:41424344!(6f6e65|74776f)45464748
+sample bin "ABCDXEFGH" bin => OK
+sample bin "ABCDYEFGH" bin => OK
+sample bin "ABCDZEFGH" bin => Diff.Hex.NotByte
+sample bin "ABCDoneEFGH" bin => OK
+sample bin "ABCDsixEFGH" bin => Diff.Hex.NotString
+sample bin "ABCDtwoEFGH" bin => OK
+
+case hex-boundary-word
+# (B): word boundary, including the start and end of the file.
+ndb Diff.Hex.WordBefore:0:*:(B)6576696c
+ndb Diff.Hex.WordAfter:0:*:6576696c(B)
+sample bin "an evil thing" bin => Diff.Hex.WordAfter Diff.Hex.WordBefore
+sample bin "devilish" bin => OK
+sample bin "evil" => Diff.Hex.WordAfter
+sample bin "x_evil_x" bin => Diff.Hex.WordAfter Diff.Hex.WordBefore
+sample bin "1evil1" bin => OK
+sample bin ".evil." bin => Diff.Hex.WordBefore
+sample bin "\x80evil\x80" bin => OK
+
+case hex-boundary-line
+# (L): CR, LF, CRLF or the start or end of the file.
+ndb Diff.Hex.LineBefore:0:*:(L)6576696c
+ndb Diff.Hex.LineAfter:0:*:6576696c(L)
+sample bin "\nevil\n" bin => Diff.Hex.LineAfter Diff.Hex.LineBefore
+sample bin "\r\nevil\r\n" bin => Diff.Hex.LineAfter Diff.Hex.LineBefore
+sample bin "\revil\r" bin => OK
+sample bin " evil " bin => OK
+sample "evil" bin => Diff.Hex.LineBefore
+sample bin "evil" => Diff.Hex.LineAfter
+
+case hex-boundary-nonalnum
+# (W): a non-alphanumeric byte.
+ndb Diff.Hex.NonAlnum:0:*:6576696c(W)
+sample bin "evil!" bin => Diff.Hex.NonAlnum
+sample bin "evil " bin => Diff.Hex.NonAlnum
+sample bin "evilx" bin => OK
+sample bin "evil9" bin => OK
+sample bin "evil" => Diff.Hex.NonAlnum
+
+case hex-modifiers-ndb
+# Modifiers are a logical-subsignature feature; .ndb lines carry plain bodies.
+ndb! Diff.Hex.NdbNocase:0:*:6576696c::i
+sample bin "EVIL" bin => OK

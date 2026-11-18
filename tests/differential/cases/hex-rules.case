@@ -1,0 +1,191 @@
+# What libclamav accepts as a body and how it reads edge cases of gaps and ranges.
+
+case hex-gap-max-zero
+# A maximum of 0 means no maximum.
+ndb Diff.Gap.Zero:0:*:41424344{0}45464748
+ndb Diff.Gap.ZeroZero:0:*:41424344{0-0}45464748
+ndb Diff.Gap.UptoZero:0:*:41424344{-0}45464748
+ndb Diff.Gap.FromZero:0:*:41424344{0-}45464748
+ndb Diff.Gap.OneZero:0:*:41424344{1-0}45464748
+sample bin "ABCDEFGH" bin => Diff.Gap.FromZero Diff.Gap.UptoZero Diff.Gap.Zero Diff.Gap.ZeroZero
+sample bin "ABCDxEFGH" bin => Diff.Gap.FromZero Diff.Gap.OneZero Diff.Gap.UptoZero Diff.Gap.Zero Diff.Gap.ZeroZero
+sample bin "ABCD" 1000*"x" "EFGH" bin => Diff.Gap.FromZero Diff.Gap.OneZero Diff.Gap.UptoZero Diff.Gap.Zero Diff.Gap.ZeroZero
+
+case hex-gap-swapped
+# A minimum above the maximum loads and never matches.
+ndb Diff.Gap.ThreeOne:0:*:41424344{3-1}45464748
+ndb Diff.Gap.FiveThree:0:*:41424344{5-3}45464748
+ndb Diff.Gap.FourFour:0:*:41424344{4-4}45464748
+sample bin "ABCDEFGH" bin => OK
+sample bin "ABCDxEFGH" bin => OK
+sample bin "ABCDxxxEFGH" bin => OK
+sample bin "ABCDxxxxEFGH" bin => Diff.Gap.FourFour
+sample bin "ABCDxxxxxEFGH" bin => OK
+
+case hex-gap-inline-limit
+# {n} below 128 stays inside its part; from 128 on it splits the body, and every part needs two
+# literal bytes in a row.
+ndb Diff.Gap.Inline127:0:*:4142{127}43
+ndb! Diff.Gap.Split128:0:*:4142{128}43
+ndb Diff.Gap.Split128Two:0:*:4142{128}4344
+ndb Diff.Gap.EdgeStart:0:*:{2}41424344
+ndb Diff.Gap.EdgeEnd:0:*:41424344{2}
+sample bin "AB" 127*"x" "C" bin => Diff.Gap.Inline127
+sample bin "AB" 128*"x" "CD" bin => Diff.Gap.Split128Two
+sample bin "ABCD" bin => Diff.Gap.EdgeEnd Diff.Gap.EdgeStart
+
+case hex-bracket-after
+ndb Diff.Bracket.A0_0:0:*:41424344[0-0]5a
+ndb Diff.Bracket.A1_3:0:*:41424344[1-3]5a
+ndb Diff.Bracket.A5_10:0:*:41424344[5-10]5a
+ndb Diff.Bracket.A0_32:0:*:41424344[0-32]5a
+ndb Diff.Bracket.A31_32:0:*:41424344[31-32]5a
+ndb! Diff.Bracket.A0_33:0:*:41424344[0-33]5a
+ndb! Diff.Bracket.A3_1:0:*:41424344[3-1]5a
+ndb! Diff.Bracket.BothMulti:0:*:4142[1-2]4344
+sample bin "ABCDZ" bin => Diff.Bracket.A0_0 Diff.Bracket.A0_32
+sample bin "ABCD" 1*"x" "Z" bin => Diff.Bracket.A0_32 Diff.Bracket.A1_3
+sample bin "ABCD" 3*"x" "Z" bin => Diff.Bracket.A0_32 Diff.Bracket.A1_3
+sample bin "ABCD" 4*"x" "Z" bin => Diff.Bracket.A0_32
+sample bin "ABCD" 5*"x" "Z" bin => Diff.Bracket.A0_32 Diff.Bracket.A5_10
+sample bin "ABCD" 10*"x" "Z" bin => Diff.Bracket.A0_32 Diff.Bracket.A5_10
+sample bin "ABCD" 11*"x" "Z" bin => Diff.Bracket.A0_32
+sample bin "ABCD" 30*"x" "Z" bin => Diff.Bracket.A0_32
+sample bin "ABCD" 31*"x" "Z" bin => Diff.Bracket.A0_32 Diff.Bracket.A31_32
+sample bin "ABCD" 32*"x" "Z" bin => Diff.Bracket.A0_32 Diff.Bracket.A31_32
+sample bin "ABCD" 33*"x" "Z" bin => OK
+sample bin "ABxCD" bin => OK
+
+case hex-bracket-before
+ndb Diff.Bracket.B0_0:0:*:5a[0-0]45464748
+ndb Diff.Bracket.B1_3:0:*:5a[1-3]45464748
+ndb Diff.Bracket.B5_10:0:*:5a[5-10]45464748
+ndb Diff.Bracket.B0_26:0:*:5a[0-26]45464748
+sample bin "ZEFGH" bin => Diff.Bracket.B0_0 Diff.Bracket.B0_26
+sample bin "Z" 1*"x" "EFGH" bin => Diff.Bracket.B0_26 Diff.Bracket.B1_3
+sample bin "Z" 3*"x" "EFGH" bin => Diff.Bracket.B0_26 Diff.Bracket.B1_3
+sample bin "Z" 4*"x" "EFGH" bin => Diff.Bracket.B0_26
+sample bin "Z" 5*"x" "EFGH" bin => Diff.Bracket.B0_26 Diff.Bracket.B5_10
+sample bin "Z" 10*"x" "EFGH" bin => Diff.Bracket.B0_26 Diff.Bracket.B5_10
+sample bin "Z" 11*"x" "EFGH" bin => Diff.Bracket.B0_26
+sample bin "Z" 26*"x" "EFGH" bin => Diff.Bracket.B0_26
+sample bin "Z" 27*"x" "EFGH" bin => OK
+
+case hex-bracket-before-far
+# libclamav finds the leading byte of BYTE[x-y]HEXSIG only within a window that shrinks with the
+# signature's length: up to a distance of 34 minus min(length, 8). zav applies [x-y] as written
+# (tests/differential/known.txt).
+ndb Diff.Bracket.Far2:0:*:5a[0-32]4546
+ndb Diff.Bracket.Far4:0:*:5a[0-32]45464748
+ndb Diff.Bracket.Far8:0:*:5a[0-32]45464748494a4b4c
+sample bin "Z" 26*"x" "EFGHIJKLMNOP" bin => Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.Far8
+sample bin "Z" 27*"x" "EFGHIJKLMNOP" bin => Diff.Bracket.Far2 Diff.Bracket.Far4
+sample bin "Z" 30*"x" "EFGHIJKLMNOP" bin => Diff.Bracket.Far2 Diff.Bracket.Far4
+sample bin "Z" 31*"x" "EFGHIJKLMNOP" bin => Diff.Bracket.Far2
+sample bin "Z" 32*"x" "EFGHIJKLMNOP" bin => Diff.Bracket.Far2
+
+case hex-static-bytes-ndb
+# Every part needs two literal bytes in a row (alternations, nibbles and gaps do not count), and
+# a plain literal body under three bytes is refused where libclamav uses Boyer-Moore: target type
+# 0, or any offset other than *.
+ndb! Diff.Static.One:0:*:41
+ndb! Diff.Static.Two:0:*:4142
+ndb Diff.Static.Three:0:*:414243
+ndb! Diff.Static.TwoAt8:0:8:4142
+ndb! Diff.Static.TwoEof:0:EOF-10:4142
+ndb Diff.Static.TwoPeAny:1:*:4142
+ndb! Diff.Static.TwoPeEp:1:EP+0:4142
+ndb! Diff.Static.Split:0:*:41??42
+ndb Diff.Static.TwoWild:0:*:4142??
+ndb Diff.Static.WildTwo:0:*:??4142
+ndb Diff.Static.TwoGap:0:*:4142{2}
+ndb Diff.Static.InlineGap:0:*:4142{1}43
+ndb! Diff.Static.InlineGapShort:0:*:41{1}42
+ndb! Diff.Static.StarShort:0:*:4142*43
+ndb! Diff.Static.StarShortFirst:0:*:41*4243
+ndb Diff.Static.StarTwoTwo:0:*:4142*4344
+ndb! Diff.Static.RangeShort:0:*:41{2-3}4243
+ndb! Diff.Static.AltOnly:0:*:(4142|4344)45
+ndb! Diff.Static.AltAfter:0:*:45(4142|4344)
+ndb! Diff.Static.AltWhole:0:*:(414243|444546)
+ndb! Diff.Static.AltSplit:0:*:41(42|43)44
+ndb Diff.Static.AltThenTwo:0:*:(41|42)4344
+ndb Diff.Static.TwoThenAlt:0:*:4142(43|44)
+ndb Diff.Static.Negation:0:*:4142!(43)
+ndb Diff.Static.NibbleSplit:0:*:4?4142
+ndb Diff.Static.BoundaryTwo:0:*:(B)4142
+ndb! Diff.Static.BoundarySplit:0:*:78(B)79
+sample bin "ABxC" bin => Diff.Static.InlineGap Diff.Static.Negation Diff.Static.TwoGap Diff.Static.TwoWild Diff.Static.WildTwo
+sample bin "ABxxC" bin => Diff.Static.Negation Diff.Static.TwoGap Diff.Static.TwoWild Diff.Static.WildTwo
+sample bin "ABCDEF" bin => Diff.Static.AltThenTwo Diff.Static.StarTwoTwo Diff.Static.Three Diff.Static.TwoGap Diff.Static.TwoThenAlt Diff.Static.TwoWild Diff.Static.WildTwo
+sample bin "AB" bin => Diff.Static.Negation Diff.Static.TwoGap Diff.Static.TwoWild Diff.Static.WildTwo
+sample pe pad(0x600) => OK
+sample pe "AB" pad(0x600) => Diff.Static.Negation Diff.Static.TwoGap Diff.Static.TwoPeAny Diff.Static.TwoWild Diff.Static.WildTwo
+
+case hex-static-bytes-ldb
+# The same rules for logical subsignatures, minus Boyer-Moore: two bytes are enough.
+ldb! Diff.LStatic.One;Engine:51-255,Target:0;0;41
+ldb Diff.LStatic.Two;Engine:51-255,Target:0;0;4142
+ldb! Diff.LStatic.Split;Engine:51-255,Target:0;0;41??42
+ldb! Diff.LStatic.Star;Engine:51-255,Target:0;0;41*42
+ldb! Diff.LStatic.StarShort;Engine:51-255,Target:0;0;41424344*45
+ldb! Diff.LStatic.AltOnly;Engine:51-255,Target:0;0;(4142|4344)45
+ldb! Diff.LStatic.AltSplit;Engine:51-255,Target:0;0;41(42|43)44
+ldb Diff.LStatic.Bracket;Engine:51-255,Target:0;0;4142[1-2]43
+ldb! Diff.LStatic.BracketMulti;Engine:51-255,Target:0;0;4142[1-2]4344
+sample bin "ABxC" bin => Diff.LStatic.Bracket Diff.LStatic.Two
+sample bin "AB" bin => Diff.LStatic.Two
+
+case hex-boundary-stacked
+# Two anchors before a signature must both hold. (libclamav 1.5.4 crashes with SIGBUS when this
+# signature matches at offset 0, so no sample starts with the match.)
+ndb Diff.Bound.TwoBefore:0:*:(B)(L)6576696c
+sample bin " evil " bin => OK
+sample bin "\nevil\n" bin => OK
+sample bin "x\nevil" bin => OK
+
+case hex-boundary-combined
+# Anchors stack at the edges (all must hold) and consume one byte in the middle.
+ndb Diff.Bound.TwoAfter:0:*:6576696c(B)(W)
+ndb Diff.Bound.BothEnds:0:*:(B)6576*6c6c(B)
+ndb Diff.Bound.BeforeAlt:0:*:(B)(6576|4556)696c
+ndb Diff.Bound.AfterNegation:0:*:6576696c!(41|42)(B)
+ndb Diff.Bound.AfterWild:0:*:6576696c??(B)
+ndb Diff.Bound.MiddleWord:0:*:6576(B)696c
+ndb Diff.Bound.MiddleSpace:0:*:6576(B)20696c
+ndb Diff.Bound.MiddleNonAlnum:0:*:6576(W)21696c
+ndb Diff.Bound.MiddleLine:0:*:6576(L)696c
+ndb Diff.Bound.AtOffset8:0:8:(B)6576696c
+ndb Diff.Bound.AtOffset9:0:9:(B)6576696c
+ndb Diff.Bound.AtEof13:0:EOF-13:6576696c(B)
+ldb Diff.Bound.LdbStart;Engine:51-255,Target:0;0;(B)6576696c
+ldb Diff.Bound.LdbMiddle;Engine:51-255,Target:0;0;6576(B)696c
+sample bin " evil " bin => Diff.Bound.AtEof13 Diff.Bound.AtOffset9 Diff.Bound.BeforeAlt Diff.Bound.LdbStart Diff.Bound.TwoAfter
+sample bin "\nevil\n" bin => Diff.Bound.AtEof13 Diff.Bound.TwoAfter
+sample bin "-evil-" bin => Diff.Bound.AtEof13 Diff.Bound.AtOffset9 Diff.Bound.BeforeAlt Diff.Bound.LdbStart Diff.Bound.TwoAfter
+sample bin " evxil " bin => OK
+sample bin " ev" 5*"z" "ll " bin => Diff.Bound.BothEnds
+sample bin "ev il" bin => Diff.Bound.LdbMiddle Diff.Bound.MiddleWord
+sample bin "ev  il" bin => Diff.Bound.MiddleSpace
+sample bin "ev-_il" bin => OK
+sample bin "ev!!il" bin => Diff.Bound.MiddleNonAlnum
+sample bin "ev\nil" bin => Diff.Bound.LdbMiddle Diff.Bound.MiddleLine Diff.Bound.MiddleWord
+sample bin "ev\r\nil" bin => OK
+sample bin "ev\ril" bin => Diff.Bound.LdbMiddle Diff.Bound.MiddleWord
+sample "evil" bin => Diff.Bound.BeforeAlt Diff.Bound.LdbStart
+sample bin "evil" => Diff.Bound.TwoAfter
+sample "evil  " => Diff.Bound.AfterNegation Diff.Bound.AfterWild Diff.Bound.BeforeAlt Diff.Bound.LdbStart Diff.Bound.TwoAfter
+
+case hex-negated-nibble
+# ~ (documented for functionality level 240) is not parsed by libclamav 1.5.
+ndb! Diff.Tilde.Byte:0:*:6576~69696c
+ndb! Diff.Tilde.Nibble:0:*:6576~6?696c
+sample bin "evxil" bin => OK
+sample bin "evil" bin => OK
+
+case hex-file-too-small
+# libclamav ignores files of five bytes or fewer.
+ndb Diff.Small.Evil:0:*:6576696c
+sample "evil" => OK
+sample "evil\x00" => OK
+sample "evil\x00\x00" => Diff.Small.Evil

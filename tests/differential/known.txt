@@ -1,0 +1,13 @@
+# Known, intentional differences between zav and libclamav 1.5.4, each with its reason. zav-diff
+# check reports these without failing, and fails when a listed difference stops occurring, so
+# this list is exact. Format: CASE sN|sigN zav=RESULT  # reason
+#
+# BYTE[x-y]HEXSIG: libclamav finds the leading byte only within 34 - min(length, 8) bytes of the
+# signature, whatever y says; zav applies the range as written.
+hex-bracket-before-far s2 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.Far8
+hex-bracket-before-far s3 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.Far8
+hex-bracket-before-far s4 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.Far8
+hex-bracket-before-far s5 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.Far8
+# ~aa and ~a? are documented for functionality level 240; libclamav 1.5 does not parse them yet.
+hex-negated-nibble sig1 zav=LOADS
+hex-negated-nibble sig2 zav=LOADS

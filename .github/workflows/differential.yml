@@ -1,0 +1,56 @@
+name: Differential
+
+# zav against libclamav (and yara): tools/diff/README.md. The case files under
+# tests/differential/cases record libclamav's verdicts; this workflow checks that the pinned
+# ClamAV release still gives them, and that zav does.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * *'
+
+env:
+  ZIG_VERSION: '0.17.0-dev.1857+3c46da14d'
+  # The official Cisco-Talos build, the same release the expectations were recorded with.
+  CLAMAV_VERSION: '1.5.4'
+
+jobs:
+  grammar:
+    name: Signature grammar against libclamav
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
+          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb"
+          clamscan=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')
+          certs=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")
+          echo "CLAMSCAN=$clamscan" >> "$GITHUB_ENV"
+          echo "CLAMAV_CERTS=$certs" >> "$GITHUB_ENV"
+          "$clamscan" --version
+      - run: zig build diff-tool
+      - name: libclamav still gives the recorded verdicts
+        run: python3 tools/diff/clamav.py --work "$RUNNER_TEMP/work" tests/differential/cases
+      - name: zav gives them too
+        run: zig build diff
+      - name: On failure, record what libclamav says
+        if: failure()
+        run: |
+          python3 tools/diff/clamav.py --work "$RUNNER_TEMP/work" --record tests/differential/cases || true
+          git diff > "$RUNNER_TEMP/recorded.diff"
+          cat "$RUNNER_TEMP/recorded.diff" | head -200
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: recorded-verdicts
+          path: ${{ runner.temp }}/recorded.diff

@@ -109,6 +109,34 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // The differential suite against libclamav: zav-diff checks zav's verdicts on every case in
+    // tests/differential against the expectations recorded from clamscan (tools/diff/README.md).
+    // The clamscan side runs in .github/workflows/differential.yml.
+    const diff_exe = b.addExecutable(.{
+        .name = "zav-diff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/diff/zav_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    const install_diff = b.addInstallArtifact(diff_exe, .{});
+    b.step("diff-tool", "Build zav-diff, the zav side of the differential suite").dependOn(&install_diff.step);
+    const run_diff = b.addRunArtifact(diff_exe);
+    run_diff.addArgs(&.{ "check", "--known" });
+    run_diff.addFileArg(b.path("tests/differential/known.txt"));
+    run_diff.addArg("--tmp");
+    _ = run_diff.addOutputDirectoryArg("zav-diff-tmp");
+    run_diff.addDirectoryArg(b.path("tests/differential/cases"));
+    // Case files are read from a directory, which the cache does not hash: always run.
+    run_diff.has_side_effects = true;
+    run_diff.expectExitCode(0);
+    b.step("diff", "Check zav against the recorded libclamav verdicts").dependOn(&run_diff.step);
+    test_step.dependOn(&run_diff.step);
+    const diff_tests = b.addTest(.{ .root_module = diff_exe.root_module });
+    test_step.dependOn(&b.addRunArtifact(diff_tests).step);
+
     // Deterministic fuzzing.
     const fuzz_exe = b.addExecutable(.{
         .name = "fuzz",
