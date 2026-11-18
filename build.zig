@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_iterations = b.option(usize, "fuzz-iterations", "Deterministic fuzz case count") orelse 10_000;
     const fuzz_seed = b.option(u64, "fuzz-seed", "Deterministic fuzz seed") orelse 0x5eed_5eed;
     run_fuzz.addArgs(&.{ b.fmt("{d}", .{fuzz_iterations}), b.fmt("{d}", .{fuzz_seed}) });
+    if (b.option([]const u8, "fuzz-target", "Run only fuzz targets whose name contains this")) |only| run_fuzz.addArg(only);
     b.step("fuzz", "Run deterministic fuzz cases").dependOn(&run_fuzz.step);
 
     // Kernel benchmarks (zig-bench is a lazy dependency, fetched only by this step).

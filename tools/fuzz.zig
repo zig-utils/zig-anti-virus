@@ -1,5 +1,6 @@
 //! Deterministic fuzzing: `zig build fuzz -Dfuzz-iterations=N -Dfuzz-seed=S`. Same seed, same
 //! cases. Each target mutates valid inputs and must never crash, hang or leak; errors are fine.
+//! `-Dfuzz-target=name` runs only the targets whose function name contains `name`.
 const std = @import("std");
 const zav = @import("zav");
 
@@ -7,6 +8,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const iterations = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 10_000;
     const seed = if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else 0x5eed_5eed;
+    const only: []const u8 = if (args.len > 3) args[3] else "";
 
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
@@ -15,12 +17,82 @@ pub fn main(init: std.process.Init) !void {
 
     var cases: usize = 0;
     for (0..iterations) |i| {
-        try cvdContainer(gpa.allocator(), random, if (i % 2 == 0) zav.compile.cvd.fixture_cvd else zav.compile.cvd.fixture_cld);
-        hashLine(random);
-        hashSections(random);
-        cases += 3;
+        if (selected(only, "cvdContainer")) {
+            try cvdContainer(gpa.allocator(), random, if (i % 2 == 0) zav.compile.cvd.fixture_cvd else zav.compile.cvd.fixture_cld);
+            cases += 1;
+        }
+        if (selected(only, "hashLine")) {
+            hashLine(random);
+            cases += 1;
+        }
+        if (selected(only, "hashSections")) {
+            hashSections(random);
+            cases += 1;
+        }
+        if (selected(only, "hexBody")) {
+            hexBody(random);
+            cases += 1;
+        }
     }
     std.debug.print("fuzz: {d} cases, seed {d}, ok\n", .{ cases, seed });
+}
+
+fn selected(only: []const u8, name: []const u8) bool {
+    return only.len == 0 or std.mem.indexOf(u8, name, only) != null;
+}
+
+/// Mutate a valid input in place: random byte flips, inserted grammar characters, truncation.
+fn mutate(random: std.Random, buf: []u8, len: usize, alphabet: []const u8) []u8 {
+    var n = len;
+    for (0..random.uintLessThan(usize, 6)) |_| {
+        if (n == 0) break;
+        const at = random.uintLessThan(usize, n);
+        switch (random.uintLessThan(u8, 3)) {
+            0 => buf[at] = random.int(u8),
+            1 => buf[at] = alphabet[random.uintLessThan(usize, alphabet.len)],
+            else => if (n < buf.len) {
+                std.mem.copyBackwards(u8, buf[at + 1 .. n + 1], buf[at..n]);
+                buf[at] = alphabet[random.uintLessThan(usize, alphabet.len)];
+                n += 1;
+            },
+        }
+    }
+    if (random.uintLessThan(u8, 4) == 0) n = random.uintLessThan(usize, n + 1);
+    return buf[0..n];
+}
+
+/// Hex bodies: parse in a fixed arena (so allocation is bounded), print, re-parse the printed
+/// form and require the same text (the printer is a fixed point), then expand modifiers.
+fn hexBody(random: std.Random) void {
+    const hexsig = zav.compile.hexsig;
+    const seeds = [_][]const u8{
+        "6869*6a6b{3-4}6c6d??6e(6f|70)[2-5]71",
+        "dead!(aabb|ccdd)be?f{-10}cafe{10-}babe",
+        "(B)4142(43|44??|{3}45)~4?(L)46{200}47(W)48",
+        "aa~bb~c?~?dd[1-32]ee",
+    };
+    var mem: [256 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    const arena = fba.allocator();
+    var buf: [256]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const body = mutate(random, &buf, seed.len, "0123456789abcdef?*{}[]()|!~-BLW");
+    var diag: hexsig.Diag = .{};
+    const p = hexsig.parse(arena, body, &diag) catch {
+        if (diag.pos > body.len) @panic("fuzz: hex diag out of range");
+        return;
+    };
+    var out1: [4096]u8 = undefined;
+    var w1: std.Io.Writer = .fixed(&out1);
+    hexsig.format(p, &w1) catch return;
+    const again = hexsig.parse(arena, w1.buffered(), &diag) catch @panic("fuzz: printed hex body does not parse");
+    var out2: [4096]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&out2);
+    hexsig.format(again, &w2) catch @panic("fuzz: reprint failed");
+    if (!std.mem.eql(u8, w1.buffered(), w2.buffered())) @panic("fuzz: hex print is not a fixed point");
+    const mods: zav.compile.ir.Modifiers = @bitCast(random.int(u8) & 0x0f);
+    _ = hexsig.expand(arena, p, mods) catch {};
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.

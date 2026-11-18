@@ -12,6 +12,9 @@ pub const Source = enum(u8) {
     imp,
     malwarebazaar,
     guardian,
+    ndb,
+    ldb,
+    cdb,
 };
 
 pub const HashAlgo = enum(u8) {
@@ -87,12 +90,201 @@ pub const Reason = enum(u8) {
     ignored,
     flevel_out_of_range,
     bytecode,
+    // Hex bodies (docs/DESIGN.md section 4.1).
+    hex_empty,
+    hex_odd_nibble,
+    hex_bad_char,
+    hex_bad_range,
+    hex_bad_alternation,
+    hex_bad_negation,
+    hex_empty_part,
+    hex_no_static_byte,
+    hex_too_complex,
+    bad_modifier,
 };
 
 pub const Rejection = struct {
     source_name: []const u8,
     line_number: u32,
     reason: Reason,
+    /// Byte position inside the line where the rejected construct starts, when known.
+    column: u32 = 0,
+};
+
+// ---------------------------------------------------------------------------------------------
+// Hex-signature IR (docs/DESIGN.md sections 3.4 and 4.1).
+//
+// A body is a pattern: a flat list of fixed-size ops plus a data area the ops point into with
+// u32 offsets. The same bytes are the compiler's model and the serialised SUBSIG_PROG program,
+// so the verify VM runs exactly what the compiler built. Parts are separated by `part_end` ops
+// that carry the gap window to the next part; everything inside a part has a bounded length.
+// ---------------------------------------------------------------------------------------------
+
+pub const OpCode = enum(u8) {
+    /// `len` literal bytes at `data[a..]`.
+    lit = 1,
+    /// `len` bytes; values at `data[a..]`, masks at `data[a + len ..]`. A byte matches when
+    /// `(byte & mask) == value`. With `op_negate` (only for `len == 1`) the byte must not match.
+    masked = 2,
+    /// One of `len` alternatives; table of `AltEntry` at `data[a..]`. `b` is
+    /// `min_len | max_len << 16`. Alternatives hold only lit, masked and gapf ops.
+    alt = 3,
+    /// Any window of `b & 0xffff` bytes equal to none of the `len` literal alternatives.
+    nalt = 4,
+    /// Skip exactly `a` bytes (`{n}` with n below 128).
+    gapf = 5,
+    /// A character class (`Bound` in `flags`).
+    bound = 6,
+    /// End of a part: the next part starts `a` to `b` bytes later (`b == unbounded` for none).
+    /// `flags` holds the `GapSyntax` it was written with, so printing round-trips.
+    part_end = 7,
+    _,
+};
+
+pub const Op = extern struct {
+    code: OpCode,
+    flags: u8 = 0,
+    len: u16 = 0,
+    a: u32 = 0,
+    b: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Op) == 12);
+    std.debug.assert(@alignOf(Op) == 4);
+}
+
+/// Op flag bit for lit and alt: compare ASCII letters case-insensitively.
+pub const op_nocase: u8 = 1 << 0;
+/// Op flag bit for a one-byte masked op written `~..`: the byte must not match.
+pub const op_negate: u8 = 1 << 1;
+
+/// One alternative of an alt or nalt op, in the data area.
+pub const AltEntry = extern struct {
+    /// Data offset of the alternative's ops (4-byte aligned).
+    ops_off: u32,
+    op_count: u16,
+    /// Bytes the alternative consumes.
+    byte_len: u16,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(AltEntry) == 8);
+}
+
+pub const Bound = enum(u8) {
+    /// `(B)`: one non-alphanumeric byte, or nothing at the start or end of the data.
+    word = 0,
+    /// `(L)`: CR, LF or CRLF, or nothing at the start or end of the data.
+    line = 1,
+    /// `(W)`: one non-alphanumeric byte.
+    nonalnum = 2,
+};
+
+/// How a part break was written.
+pub const GapSyntax = enum(u8) {
+    /// `*`
+    star = 0,
+    /// `{n-m}`
+    range = 1,
+    /// `{-n}`
+    upto = 2,
+    /// `{n-}`
+    from = 3,
+    /// `{n}` with n of 128 or more
+    exact = 4,
+    /// `[n-m]`
+    bracket = 5,
+};
+
+pub const unbounded: u32 = std.math.maxInt(u32);
+/// `{n}` below this stays inside its part as a fixed skip; from here on it splits the body.
+pub const inline_gap_limit: u32 = 128;
+/// Largest `y` in `[x-y]`.
+pub const bracket_limit: u32 = 32;
+
+pub const Pattern = struct {
+    ops: []const Op,
+    data: []align(4) const u8,
+
+    pub fn alternatives(p: Pattern, op: Op) []const AltEntry {
+        const table: [*]const AltEntry = @ptrCast(@alignCast(p.data.ptr + op.a));
+        return table[0..op.len];
+    }
+
+    pub fn altOps(p: Pattern, entry: AltEntry) []const Op {
+        const ops: [*]const Op = @ptrCast(@alignCast(p.data.ptr + entry.ops_off));
+        return ops[0..entry.op_count];
+    }
+
+    pub fn bytes(p: Pattern, op: Op) []const u8 {
+        return p.data[op.a..][0..op.len];
+    }
+
+    pub fn masks(p: Pattern, op: Op) []const u8 {
+        return p.data[op.a + op.len ..][0..op.len];
+    }
+
+    pub fn partCount(p: Pattern) usize {
+        var n: usize = 1;
+        for (p.ops) |op| n += @intFromBool(op.code == .part_end);
+        return n;
+    }
+};
+
+/// Subsignature modifiers `::i ::w ::a ::f`.
+pub const Modifiers = packed struct(u8) {
+    nocase: bool = false,
+    wide: bool = false,
+    ascii: bool = false,
+    fullword: bool = false,
+    _: u4 = 0,
+};
+
+/// Where a match has to start, relative to the file (docs: ExtendedSignatures, Offset).
+pub const OffsetKind = enum(u8) {
+    /// `*`
+    any = 0,
+    /// `n`
+    absolute = 1,
+    /// `EOF-n` (`a` holds n)
+    eof_minus = 2,
+    /// `EP+n` / `EP-n`
+    entry_point = 3,
+    /// `Sx+n`
+    section_start = 4,
+    /// `SEx`: anywhere inside section x
+    section_entire = 5,
+    /// `SL+n`
+    last_section = 6,
+    _,
+};
+
+pub const Offset = struct {
+    kind: OffsetKind = .any,
+    a: i32 = 0,
+    section: u16 = 0,
+    /// The `,maxshift` window: the match may start anywhere in `[offset, offset + shift]`.
+    shift: u32 = 0,
+};
+
+pub const Subsig = struct {
+    pattern: Pattern,
+    mods: Modifiers = .{},
+    offset: Offset = .{},
+};
+
+/// An `.ndb` extended signature: one subsignature, a target type and a name.
+pub const BodyRule = struct {
+    name: []const u8,
+    /// ClamAV target type, 0 to 14; also the partition.
+    target: u8,
+    subsig: Subsig,
+    flevel_min: u16 = 0,
+    flevel_max: u16 = 0,
+    source: Source,
+    flags: Flags = .{},
+    line: []const u8 = "",
 };
 
 /// A ClamAV signature name split for compact storage: `Win.Trojan.Agent-1234567-0` becomes the
