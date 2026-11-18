@@ -7,6 +7,16 @@ const zav = @import("zav");
 var io_global: std.Io = undefined;
 var dir_global: std.Io.Dir = undefined;
 var sink: u64 = 0;
+var lookup_table: zav.match.hashidx.Table = undefined;
+var lookup_probes: [4096][16]u8 = undefined;
+var lookup_i: usize = 0;
+
+/// One hash-index lookup in a 1M-entry MD5 table: a random digest at a populated size.
+fn hashLookup() void {
+    const d = &lookup_probes[lookup_i & 4095];
+    lookup_i +%= 1;
+    if (lookup_table.lookup(1000 + (lookup_i % 4096), d)) |sig| sink +%= sig;
+}
 
 /// Open and close a 200 MB database: header, signature and section-table checks only.
 fn dbOpen() void {
@@ -42,9 +52,26 @@ pub fn main(init: std.process.Init) !void {
     if (before != null and after != null)
         std.debug.print("db open: private dirty delta {d} KiB\n", .{after.? -| before.?});
 
+    // A 1M-entry MD5 table spread over 4096 sizes.
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    const rules = try init.gpa.alloc(zav.compile.ir.HashRule, 1_000_000);
+    defer init.gpa.free(rules);
+    for (rules, 0..) |*r, i| {
+        var digest: [32]u8 = @splat(0);
+        random.bytes(digest[0..16]);
+        r.* = .{ .algo = .md5, .scope = .file, .digest = digest, .size = 1000 + (i % 4096), .name = "Bench.Sig", .source = .hdb };
+    }
+    var built = try zav.compile.hash_build.build(init.gpa, rules);
+    defer built.deinit();
+    const t = zav.match.hashidx.tableVariant(.md5, .file);
+    lookup_table = try .init(built.hot[t].?, built.cold[t].?);
+    for (&lookup_probes) |*p| random.bytes(p);
+
     var suite = bench.BenchmarkSuite.init(init.gpa, init.io);
     defer suite.deinit();
     try suite.add("db open 200 MB (warm cache)", dbOpen);
+    try suite.add("hash lookup, 1M MD5 entries", hashLookup);
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);

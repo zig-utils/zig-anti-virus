@@ -17,7 +17,8 @@ pub fn main(init: std.process.Init) !void {
     for (0..iterations) |i| {
         try cvdContainer(gpa.allocator(), random, if (i % 2 == 0) zav.compile.cvd.fixture_cvd else zav.compile.cvd.fixture_cld);
         hashLine(random);
-        cases += 2;
+        hashSections(random);
+        cases += 3;
     }
     std.debug.print("fuzz: {d} cases, seed {d}, ok\n", .{ cases, seed });
 }
@@ -61,4 +62,30 @@ fn hashLine(random: std.Random) void {
     for (0..random.uintLessThan(usize, 6)) |_| line[random.uintLessThan(usize, line.len)] = random.int(u8);
     if (random.boolean()) line = line[0..random.uintLessThan(usize, line.len + 1)];
     _ = hashsig.parseLine(hashsig.formatFor(exts[random.uintLessThan(usize, exts.len)]).?, line) catch {};
+}
+
+/// Hash-index section validation must reject corrupt sections instead of reading out of bounds.
+fn hashSections(random: std.Random) void {
+    const hashidx = zav.match.hashidx;
+    var buf: [hashidx.top_entries * 4 + 64 + 4096 + 64]u8 align(8) = @splat(0);
+    random.bytes(buf[0..random.uintLessThan(usize, 256)]);
+    @memcpy(buf[0..4], "NEED");
+    buf[4] = 1;
+    for (0..random.uintLessThan(usize, 16)) |_| buf[random.uintLessThan(usize, buf.len)] = random.int(u8);
+    if (hashidx.NeedMap.init(buf[0..random.uintLessThan(usize, buf.len + 1)])) |map| {
+        _ = map.mask(random.int(u64) % (hashidx.dense_limit * 2));
+    } else |_| {}
+    var hot: [512]u8 align(8) = @splat(0);
+    var cold: [512]u8 = @splat(0);
+    random.bytes(&hot);
+    random.bytes(&cold);
+    @memcpy(hot[0..4], "HASH");
+    hot[4] = 1;
+    hot[8] = random.uintLessThan(u8, 3);
+    hot[9] = random.uintLessThan(u8, 3);
+    if (hashidx.Table.init(&hot, &cold)) |t| {
+        var d: [32]u8 = undefined;
+        random.bytes(&d);
+        _ = t.lookup(random.int(u16), d[0..t.algo.digestLen()]);
+    } else |_| {}
 }

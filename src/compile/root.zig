@@ -4,10 +4,12 @@
 pub const cvd = @import("cvd.zig");
 pub const ir = @import("ir.zig");
 pub const hashsig = @import("hashsig.zig");
+pub const hash_build = @import("hash_build.zig");
 
 test {
     _ = cvd;
     _ = ir;
     _ = hashsig;
+    _ = hash_build;
     _ = @This();
 }
