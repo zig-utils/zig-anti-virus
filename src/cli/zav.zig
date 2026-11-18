@@ -4,8 +4,14 @@
 //!   zav info DB
 //!   zav coverage DB
 //!   zav scan [--db FILE] [--json] PATH...
+//!   zav host [--deep] [--json] [--min-severity S] [--category C]... [--config FILE] [--list]
+//!   zav audit [--json] [--min-severity S] [--installed] [--cve-index FILE] [PATH...]
+//!   zav cve fetch [--feeds DIR] [--nvd] [--osv ECOSYSTEM]...    (explicit network access)
+//!   zav cve compile [--feeds DIR] [--out FILE]
 //!
-//! Exit codes follow clamscan: 0 clean, 1 something found, 2 an error. Databases are opened with
+//! scan follows clamscan: 0 clean, 1 something found, 2 an error. host and audit exit 0 when
+//! nothing at low or above was found, 11, 12, 13 or 14 for a highest finding of low, medium, high
+//! or critical, and 2 on an error. Databases are opened with
 //! signature checks; `--allow-unsigned` (or ZAV_ALLOW_UNSIGNED=1) accepts locally compiled,
 //! unsigned databases.
 const std = @import("std");
@@ -78,7 +84,49 @@ fn buildCommands(gpa: std.mem.Allocator) !*Command {
     _ = try scan.addArgument(Argument.init("paths", "Files to scan", .string).withVariadic(true));
     _ = scan.setActionWithCode(scanAction);
     _ = try root.addCommand(scan);
+
+    const host = try Command.init(gpa, "host", "Check this machine: processes, network, kernel, persistence, privileges, hardening");
+    try addReportOptions(host);
+    _ = try host.addOption(Option.init("deep", "deep", "Run the deep tier too (hashes, full walks, pid probes)", .bool));
+    _ = try host.addOption(Option.init("category", "category", "Only this category (repeatable)", .string).withRepeatable(true));
+    _ = try host.addOption(Option.init("check", "check", "Only this check id or dotted prefix (repeatable)", .string).withRepeatable(true));
+    _ = try host.addOption(Option.init("config", "config", "Suppression config (JSON); default /etc/zav/host.json", .string));
+    _ = try host.addOption(Option.init("update-baseline", "update-baseline", "Accept the current state as the new baseline", .bool));
+    _ = try host.addOption(Option.init("db", "db", "Signature database to scan unowned executables with", .string));
+    _ = try host.addOption(Option.init("allow-unsigned", "allow-unsigned", "Accept an unsigned signature database", .bool));
+    _ = try host.addOption(Option.init("list", "list", "List the checks for this system and exit", .bool));
+    _ = host.setActionWithCode(hostAction);
+    _ = try root.addCommand(host);
+
+    const audit = try Command.init(gpa, "audit", "Match lockfiles, packages and binaries against known vulnerabilities");
+    try addReportOptions(audit);
+    _ = try audit.addOption(Option.init("installed", "installed", "Also audit installed OS packages, Homebrew, pantry and apps", .bool));
+    _ = try audit.addArgument(Argument.init("paths", "Directories or files to audit (default .)", .string).withVariadic(true).withRequired(false));
+    _ = audit.setActionWithCode(auditAction);
+    _ = try root.addCommand(audit);
+
+    const cve = try Command.init(gpa, "cve", "Fetch vulnerability feeds and compile the .zavcve index");
+    const fetch = try Command.init(gpa, "fetch", "Download CISA KEV, OSV exports and (with --nvd) NVD into the feeds directory");
+    _ = try fetch.addOption(Option.init("feeds", "feeds", "Feeds directory (default <state>/feeds)", .string));
+    _ = try fetch.addOption(Option.init("state", "state", "State directory", .string));
+    _ = try fetch.addOption(Option.init("nvd", "nvd", "Sync NVD (initial mirror or incremental; NVD_API_KEY raises the rate limit)", .bool));
+    _ = try fetch.addOption(Option.init("osv", "osv", "OSV ecosystem export to fetch (repeatable; default npm, PyPI, Go, crates.io)", .string).withRepeatable(true));
+    _ = fetch.setActionWithCode(cveFetchAction);
+    _ = try cve.addCommand(fetch);
+    const cve_compile = try Command.init(gpa, "compile", "Compile the feeds directory into a .zavcve index");
+    _ = try cve_compile.addOption(Option.init("feeds", "feeds", "Feeds directory (default <state>/feeds)", .string));
+    _ = try cve_compile.addOption(Option.init("state", "state", "State directory", .string));
+    _ = try cve_compile.addOption(Option.init("out", "out", "Output index (default <state>/cve.zavcve)", .string).withShort('o'));
+    _ = cve_compile.setActionWithCode(cveCompileAction);
+    _ = try cve.addCommand(cve_compile);
+    _ = try root.addCommand(cve);
     return root;
+}
+
+fn addReportOptions(cmd: *Command) !void {
+    _ = try cmd.addOption(Option.init("min-severity", "min-severity", "Leave out findings below this severity (info, low, medium, high, critical)", .string));
+    _ = try cmd.addOption(Option.init("state", "state", "State directory for baselines, caches and the CVE index", .string));
+    _ = try cmd.addOption(Option.init("cve-index", "cve-index", "CVE index (default <state>/cve.zavcve)", .string));
 }
 
 fn flag(ctx: *Command.ParseContext, name: []const u8) bool {
@@ -224,4 +272,272 @@ fn report(ctx: *Command.ParseContext, path: []const u8, status: []const u8, deta
         // clamscan's line format, so existing tooling can parse it.
         if (std.mem.eql(u8, status, "FOUND")) try app.out.print("{s}: {s} FOUND\n", .{ path, d }) else try app.out.print("{s}: {s} ({s})\n", .{ path, status, d });
     } else try app.out.print("{s}: {s}\n", .{ path, status });
+}
+
+// Host checks and audits -----------------------------------------------------------------------
+
+/// /var/lib/zav for root, $XDG_STATE_HOME/zav or ~/.local/state/zav otherwise.
+fn stateDir(ctx: *Command.ParseContext, buf: []u8) ![]const u8 {
+    if (ctx.getOption("state")) |s| return s;
+    if (zav.host.sys.euid() == 0) return "/var/lib/zav";
+    if (std.c.getenv("XDG_STATE_HOME")) |x| return std.fmt.bufPrint(buf, "{s}/zav", .{std.mem.span(x)});
+    const home = std.c.getenv("HOME") orelse return error.NoHome;
+    return std.fmt.bufPrint(buf, "{s}/.local/state/zav", .{std.mem.span(home)});
+}
+
+fn openState(path: []const u8) ?std.Io.Dir {
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(app.io, path) catch return null;
+    return cwd.openDir(app.io, path, .{}) catch null;
+}
+
+fn minSeverity(ctx: *Command.ParseContext) !zav.host.Severity {
+    const text = ctx.getOption("min-severity") orelse return .info;
+    return zav.host.Severity.parse(text) orelse {
+        try app.err.print("zav: unknown severity '{s}' (info, low, medium, high, critical)\n", .{text});
+        return error.BadArgument;
+    };
+}
+
+fn openCveIndex(ctx: *Command.ParseContext, state: []const u8, required: bool) !?zav.cve.index.Index {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = ctx.getOption("cve-index") orelse try std.fmt.bufPrint(&buf, "{s}/cve.zavcve", .{state});
+    // Indexes compiled locally from the public feeds are unsigned; a signed one is checked when
+    // a trusted key is configured.
+    return zav.cve.index.Index.open(app.io, std.Io.Dir.cwd(), path, .{ .allow_unsigned = true }) catch |e| {
+        if (!required and e == error.FileNotFound) return null;
+        try app.err.print("zav: cannot open CVE index {s}: {t} (run zav cve fetch, then zav cve compile)\n", .{ path, e });
+        return e;
+    };
+}
+
+/// Scans unowned executables with a signature database for `zav host --db`.
+const EngineScanner = struct {
+    index: zav.engine.hashscan.HashIndex,
+    scratch: zav.engine.scratch.Scratch,
+    block: []u8,
+    name_buf: [512]u8 = undefined,
+
+    fn scanFn(ctx: *anyopaque, h: zav.host.Host, path: []const u8) ?[]const u8 {
+        const self: *EngineScanner = @ptrCast(@alignCast(ctx));
+        const file = h.root.openFile(h.io, zav.host.host.Host.rel(path), .{}) catch return null;
+        defer file.close(h.io);
+        const size = (file.stat(h.io) catch return null).size;
+        var tracker = zav.engine.limits.Tracker.init(.{});
+        const verdict = zav.engine.hashscan.scanSource(h.io, &self.index, .{ .file = .{ .file = file, .len = size } }, &tracker, self.block) catch return null;
+        return switch (verdict) {
+            .infected => |sig| if (self.index.meta) |m| (m.name(sig, &self.name_buf) catch "unknown") else "unknown",
+            else => null,
+        };
+    }
+};
+
+fn emit(ctx: *Command.ParseContext, s: *zav.host.Scan) !u8 {
+    if (ctx.wantsJson()) {
+        try s.writeJson(app.out, .{ .whitespace = .indent_2 });
+        try app.out.writeByte('\n');
+    } else try zav.host.render.writeText(s, app.out);
+    return s.exitCode();
+}
+
+const all_checks = zav.host.registry ++ zav.cve.registry;
+
+fn hostAction(ctx: *Command.ParseContext) !u8 {
+    const h = zav.host.Host.openLive(app.io) catch {
+        try app.err.writeAll("zav: host checks support Linux and macOS\n");
+        return 2;
+    };
+    defer h.close();
+    if (flag(ctx, "list")) {
+        for (all_checks) |c| if (c.os == h.os) try app.out.print("{s:<34} {t:<6} {t:<8} {s}\n", .{ c.id, c.tier, c.privilege, c.summary });
+        return 0;
+    }
+    const min = minSeverity(ctx) catch return 2;
+    var cats: ?std.EnumSet(zav.host.Category) = null;
+    for (ctx.getOptionValues("category")) |c| {
+        const cat = zav.host.Category.parse(c) orelse {
+            try app.err.print("zav: unknown category '{s}'\n", .{c});
+            return 2;
+        };
+        if (cats == null) cats = .empty;
+        cats.?.insert(cat);
+    }
+    var cfg: zav.host.suppress.Config = .{};
+    defer cfg.deinit();
+    const cfg_path = ctx.getOption("config") orelse "/etc/zav/host.json";
+    if (std.Io.Dir.cwd().readFileAlloc(app.io, cfg_path, app.gpa, .limited(16 * 1024 * 1024))) |text| {
+        defer app.gpa.free(text);
+        cfg = zav.host.suppress.Config.parse(app.gpa, text) catch |e| {
+            try app.err.print("zav: {s}: {t}\n", .{ cfg_path, e });
+            return 2;
+        };
+    } else |e| if (ctx.getOption("config") != null) {
+        try app.err.print("zav: {s}: {t}\n", .{ cfg_path, e });
+        return 2;
+    }
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_path = stateDir(ctx, &state_buf) catch "";
+    var state = if (state_path.len > 0) openState(state_path) else null;
+    defer if (state) |*d| d.close(app.io);
+
+    var engine: ?EngineScanner = null;
+    var database: ?zav.db.reader.Database = null;
+    defer if (database) |d| d.close();
+    defer if (engine) |*e| e.scratch.deinit();
+    if (ctx.getOption("db")) |db_path| {
+        database = openDb(ctx, db_path) catch return 2;
+        engine = .{ .index = zav.engine.hashscan.HashIndex.load(database.?) catch |e| {
+            try app.err.print("zav: {s}: {t}\n", .{ db_path, e });
+            return 2;
+        }, .scratch = try zav.engine.scratch.Scratch.init(zav.engine.scratch.default_reservation), .block = undefined };
+        engine.?.block = try engine.?.scratch.allocator().alloc(u8, 256 * 1024);
+    }
+    var cve_index = openCveIndex(ctx, state_path, false) catch return 2;
+    defer if (cve_index) |i| i.close();
+
+    // pantry's global install root, inventoried for vulnerability.packages.
+    var pantry_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var pantry_roots: [1][]const u8 = undefined;
+    var pantry_n: usize = 0;
+    if (std.c.getenv("HOME")) |home| {
+        pantry_roots[0] = std.fmt.bufPrint(&pantry_buf, "{s}/.local/share/pantry/global/packages", .{std.mem.span(home)}) catch "";
+        pantry_n = 1;
+    }
+    var s = zav.host.Scan.init(app.gpa, h, .{
+        .pantry_roots = pantry_roots[0..pantry_n],
+        .tier = if (flag(ctx, "deep")) .deep else .fast,
+        .categories = cats,
+        .min_severity = min,
+        .suppressions = &cfg,
+        .only = ctx.getOptionValues("check"),
+        .state_dir = state,
+        .update_baseline = flag(ctx, "update-baseline"),
+        .scanner = if (engine) |*e| .{ .ctx = e, .scanFn = EngineScanner.scanFn } else null,
+        .cve_index = if (cve_index) |*i| i else null,
+    });
+    defer s.deinit();
+    s.runChecks(&all_checks) catch |e| {
+        try app.err.print("zav: host scan failed: {t}\n", .{e});
+        return 2;
+    };
+    return emit(ctx, &s);
+}
+
+fn auditAction(ctx: *Command.ParseContext) !u8 {
+    const h = zav.host.Host.openLive(app.io) catch {
+        try app.err.writeAll("zav: audit supports Linux and macOS\n");
+        return 2;
+    };
+    defer h.close();
+    const min = minSeverity(ctx) catch return 2;
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_path = stateDir(ctx, &state_buf) catch "";
+    const index = (openCveIndex(ctx, state_path, true) catch return 2).?;
+    defer index.close();
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    const given: []const []const u8 = if (ctx.arguments.items.len > 0) ctx.arguments.items else &.{"."};
+    for (given) |p| {
+        const abs = std.Io.Dir.cwd().realPathFileAlloc(app.io, p, arena.allocator()) catch |e| {
+            try app.err.print("zav: {s}: {t}\n", .{ p, e });
+            return 2;
+        };
+        try paths.append(arena.allocator(), abs);
+    }
+    const only: []const []const u8 = if (flag(ctx, "installed")) &.{ "vulnerability.paths", "vulnerability.packages" } else &.{"vulnerability.paths"};
+    var pantry_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var pantry_roots: [1][]const u8 = undefined;
+    var pantry_n: usize = 0;
+    if (std.c.getenv("HOME")) |home| {
+        pantry_roots[0] = std.fmt.bufPrint(&pantry_buf, "{s}/.local/share/pantry/global/packages", .{std.mem.span(home)}) catch "";
+        pantry_n = 1;
+    }
+    var s = zav.host.Scan.init(app.gpa, h, .{ .only = only, .min_severity = min, .audit_paths = paths.items, .cve_index = &index, .pantry_roots = pantry_roots[0..pantry_n] });
+    defer s.deinit();
+    s.runChecks(&all_checks) catch |e| {
+        try app.err.print("zav: audit failed: {t}\n", .{e});
+        return 2;
+    };
+    return emit(ctx, &s);
+}
+
+// CVE feeds ------------------------------------------------------------------------------------
+
+fn feedsDir(ctx: *Command.ParseContext, buf: []u8) !std.Io.Dir {
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = ctx.getOption("feeds") orelse try std.fmt.bufPrint(buf, "{s}/feeds", .{try stateDir(ctx, &state_buf)});
+    return openState(path) orelse {
+        try app.err.print("zav: cannot create {s}\n", .{path});
+        return error.NoFeedsDir;
+    };
+}
+
+fn cveFetchAction(ctx: *Command.ParseContext) !u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir = feedsDir(ctx, &buf) catch return 2;
+    defer dir.close(app.io);
+    var http = zav.cve.feeds.HttpFetcher.init(app.gpa, app.io);
+    defer http.deinit();
+    const f = http.fetcher();
+    const now = @divFloor(std.Io.Clock.real.now(app.io).toNanoseconds(), std.time.ns_per_s);
+    var failed = false;
+
+    const kev = zav.cve.feeds.fetchFile(app.gpa, app.io, dir, f, zav.cve.feeds.kev_url, "kev/known_exploited_vulnerabilities.json", @intCast(now));
+    if (kev) |n| try app.out.print("kev: {d} bytes\n", .{n}) else |e| {
+        try app.err.print("zav: KEV: {t}\n", .{e});
+        failed = true;
+    }
+    const default_osv = [_][]const u8{ "npm", "PyPI", "Go", "crates.io" };
+    const ecos = if (ctx.getOptionValues("osv").len > 0) ctx.getOptionValues("osv") else &default_osv;
+    for (ecos) |eco| {
+        var url_buf: [256]u8 = undefined;
+        var name_buf: [256]u8 = undefined;
+        var enc: std.ArrayList(u8) = .empty;
+        defer enc.deinit(app.gpa);
+        for (eco) |c| if (c == ' ') try enc.appendSlice(app.gpa, "%20") else try enc.append(app.gpa, c);
+        const url = try std.fmt.bufPrint(&url_buf, "{s}/{s}/all.zip", .{ zav.cve.feeds.osv_url, enc.items });
+        const name = try std.fmt.bufPrint(&name_buf, "osv/{s}/all.zip", .{eco});
+        if (zav.cve.feeds.fetchFile(app.gpa, app.io, dir, f, url, name, @intCast(now))) |n| try app.out.print("osv {s}: {d} bytes\n", .{ eco, n }) else |e| {
+            try app.err.print("zav: OSV {s}: {t}\n", .{ eco, e });
+            failed = true;
+        }
+    }
+    if (flag(ctx, "nvd")) {
+        try dir.createDirPath(app.io, "nvd");
+        var nvd = try dir.openDir(app.io, "nvd", .{});
+        defer nvd.close(app.io);
+        const key = if (std.c.getenv("NVD_API_KEY")) |k| std.mem.span(k) else null;
+        if (zav.cve.feeds.syncNvd(app.gpa, app.io, nvd, f, .{ .api_key = key, .now = @intCast(now) })) |r| {
+            try app.out.print("nvd: {d} pages, {d} CVEs, synced until {d}\n", .{ r.pages, r.cves, r.state.synced_until });
+        } else |e| {
+            try app.err.print("zav: NVD: {t} (progress is saved; run again to resume)\n", .{e});
+            failed = true;
+        }
+    }
+    return if (failed) 2 else 0;
+}
+
+fn cveCompileAction(ctx: *Command.ParseContext) !u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir = feedsDir(ctx, &buf) catch return 2;
+    defer dir.close(app.io);
+    var b = zav.cve.index.Builder.init(app.gpa);
+    defer b.deinit();
+    b.addFeedsDir(app.io, dir) catch |e| {
+        try app.err.print("zav: reading feeds: {t}\n", .{e});
+        return 2;
+    };
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const out = ctx.getOption("out") orelse try std.fmt.bufPrint(&out_buf, "{s}/cve.zavcve", .{stateDir(ctx, &state_buf) catch "."});
+    const now: u64 = @intCast(@divFloor(std.Io.Clock.real.now(app.io).toNanoseconds(), std.time.ns_per_s));
+    const summary = b.write(app.io, std.Io.Dir.cwd(), out, .{ .db_version = now, .build_unix_time = now }) catch |e| {
+        try app.err.print("zav: writing {s}: {t}\n", .{ out, e });
+        return 2;
+    };
+    if (ctx.wantsJson()) {
+        try ctx.writeJson(.{ .out = out, .records = summary.records, .kev = summary.kev, .packages = summary.packages, .cpes = summary.cpes, .ranges = summary.ranges });
+    } else try app.out.print("{s}: {d} vulnerabilities ({d} in KEV), {d} packages, {d} CPEs, {d} ranges\n", .{ out, summary.records, summary.kev, summary.packages, summary.cpes, summary.ranges });
+    return 0;
 }

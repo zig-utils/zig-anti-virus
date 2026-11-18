@@ -275,7 +275,7 @@ pub fn report(s: *scan.Scan, idx: index_mod.Index, items: []const Item) !void {
 
 fn needIndex(s: *scan.Scan) ?index_mod.Index {
     const idx = s.options.cve_index orelse {
-        s.reduced("no .zavcve index loaded; run zav update cve and zav compile-cve", .{}) catch {};
+        s.reduced("no .zavcve index loaded; run zav cve fetch, then zav cve compile", .{}) catch {};
         return null;
     };
     return idx.*;

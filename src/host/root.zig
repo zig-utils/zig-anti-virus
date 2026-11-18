@@ -15,6 +15,7 @@ pub const suppress = @import("suppress.zig");
 pub const scan = @import("scan.zig");
 pub const schema = @import("schema.zig");
 pub const tokens = @import("tokens.zig");
+pub const render = @import("render.zig");
 pub const cache = @import("cache.zig");
 pub const baseline = @import("baseline.zig");
 pub const linux = struct {
@@ -55,6 +56,7 @@ test {
     _ = scan;
     _ = schema;
     _ = tokens;
+    _ = render;
     _ = cache;
     _ = linux.packages;
     _ = linux.sqlite;

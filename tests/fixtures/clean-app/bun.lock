@@ -1,0 +1,16 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "fixture-clean-app",
+      "dependencies": {
+        "@stacksjs/stx": "0.2.908",
+        "lodash": "^4.17.21",
+      },
+    },
+  },
+  "packages": {
+    "@stacksjs/stx": ["@stacksjs/stx@0.2.908", "", {}, "sha512-AAAA"],
+    "lodash": ["lodash@4.17.21", "", {}, "sha512-BBBB"],
+  }
+}

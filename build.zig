@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     const zig_cli = b.dependency("cli", .{ .target = target, .optimize = optimize }).module("zig_cli");
 
     // Executables: the CLI and the daemon.
+    var zav_exe: ?*std.Build.Step.Compile = null;
     for ([_][]const u8{ "zav", "zavd" }) |exe_name| {
         const exe = b.addExecutable(.{
             .name = exe_name,
@@ -31,6 +32,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         b.installArtifact(exe);
+        if (std.mem.eql(u8, exe_name, "zav")) zav_exe = exe;
         const run = b.addRunArtifact(exe);
         run.step.dependOn(b.getInstallStep());
         run.addPassthruArgs();
@@ -64,6 +66,40 @@ pub fn build(b: *std.Build) void {
     c_smoke.root_module.addIncludePath(b.path("include"));
     c_smoke.root_module.linkLibrary(static_lib);
     test_step.dependOn(&b.addRunArtifact(c_smoke).step);
+
+    // CLI: compile the recorded CVE feeds, then check zav audit's severity exit codes on a
+    // fixture Stacks app with a vulnerable lodash (medium: 12) and a patched one (0).
+    // Host checks and audits support Linux and macOS only.
+    if (zav_exe != null and target.result.os.tag != .windows) {
+        const exe = zav_exe.?;
+        const cve_index = blk: {
+            const run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "cve", "compile", "--feeds" });
+            run.addDirectoryArg(b.path("tests/fixtures/cve-feeds"));
+            run.addArg("--out");
+            const out = run.addOutputFileArg("fixture.zavcve");
+            run.expectExitCode(0);
+            break :blk out;
+        };
+        const cases = [_]struct { app: []const u8, extra: []const []const u8, code: u8, out: []const u8 = "", err: []const u8 = "" }{
+            .{ .app = "tests/fixtures/stacks-app", .extra = &.{}, .code = 12, .out = "CVE-2021-23337" },
+            .{ .app = "tests/fixtures/stacks-app", .extra = &.{"--json"}, .code = 12, .out = "\"exit_code\": 12" },
+            .{ .app = "tests/fixtures/stacks-app", .extra = &.{ "--min-severity", "high" }, .code = 0 },
+            .{ .app = "tests/fixtures/stacks-app", .extra = &.{ "--min-severity", "bogus" }, .code = 2, .err = "unknown severity" },
+            .{ .app = "tests/fixtures/clean-app", .extra = &.{}, .code = 0, .out = "0 findings" },
+        };
+        for (cases) |c| {
+            const run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "audit", "--cve-index" });
+            run.addFileArg(cve_index);
+            run.addArgs(c.extra);
+            run.addDirectoryArg(b.path(c.app));
+            run.expectExitCode(c.code);
+            if (c.out.len > 0) run.expectStdOutMatch(c.out);
+            if (c.err.len > 0) run.expectStdErrMatch(c.err);
+            test_step.dependOn(&run.step);
+        }
+    }
 
     // Deterministic fuzzing.
     const fuzz_exe = b.addExecutable(.{

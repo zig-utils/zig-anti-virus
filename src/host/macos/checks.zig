@@ -95,7 +95,26 @@ pub const Job = struct {
     program: []const u8,
     args: []const []const u8,
     command: []const u8,
+    working_directory: []const u8 = "",
+    /// PATH from EnvironmentVariables, or launchd's default.
+    path: []const u8 = "/usr/bin:/bin:/usr/sbin:/sbin",
 };
+
+/// The executable launchd will run: relative names resolve against WorkingDirectory, bare
+/// names through the job's PATH (launchd execs ProgramArguments with a PATH search).
+pub fn resolveProgram(s: *scan.Scan, job: Job) !?[]const u8 {
+    if (job.program.len > 0 and job.program[0] == '/') return job.program;
+    if (std.mem.indexOfScalar(u8, job.program, '/') != null) {
+        if (job.working_directory.len == 0) return null;
+        return try s.print("{s}/{s}", .{ std.mem.trimEnd(u8, job.working_directory, "/"), job.program });
+    }
+    var dirs = std.mem.tokenizeScalar(u8, job.path, ':');
+    while (dirs.next()) |d| {
+        const candidate = try s.print("{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), job.program });
+        if (s.host.exists(candidate)) return candidate;
+    }
+    return null;
+}
 
 pub fn jobOf(arena: std.mem.Allocator, v: plist.Value) !?Job {
     if (v != .dict) return null;
@@ -108,7 +127,11 @@ pub fn jobOf(arena: std.mem.Allocator, v: plist.Value) !?Job {
         try cmd.appendSlice(arena, a);
     }
     if (args.items.len == 0) try cmd.appendSlice(arena, program);
-    return .{ .label = v.getString("Label") orelse "", .program = program, .args = args.items, .command = cmd.items };
+    var path: []const u8 = "/usr/bin:/bin:/usr/sbin:/sbin";
+    if (v.dict.get("EnvironmentVariables")) |env| if (env == .dict) if (env.dict.get("PATH")) |p| if (p == .string) {
+        path = p.string;
+    };
+    return .{ .label = v.getString("Label") orelse "", .program = program, .args = args.items, .command = cmd.items, .working_directory = v.getString("WorkingDirectory") orelse "", .path = path };
 }
 
 fn checkLaunchd(s: *scan.Scan) !void {
@@ -163,39 +186,41 @@ fn judgeJob(s: *scan.Scan, path: []const u8, job: Job) !void {
         });
         return;
     }
-    if (systemOwner(job.program) != null) return;
-    const st = s.host.stat(job.program, true) catch {
+    const resolved = try resolveProgram(s, job);
+    const program = resolved orelse job.program;
+    if (systemOwner(program) != null) return;
+    const st = (if (resolved) |r| s.host.stat(r, true) catch null else null) orelse {
         try s.add(.{
             .severity = .low,
             .category = .persistence,
             .title = "launchd job points at a missing program",
-            .description = try s.print("{s} ({s}) runs {s}, which does not exist. Leftovers of uninstalled software look like this; so does a job waiting for a payload.", .{ path, job.label, job.program }),
+            .description = try s.print("{s} ({s}) runs {s}, which does not exist{s}. Leftovers of uninstalled software look like this; so does a job waiting for a payload.", .{ path, job.label, program, if (resolved == null) " in its working directory or PATH" else "" }),
             .remediation = "Remove the plist if the software is gone.",
             .subject = path,
         });
         return;
     };
     if (st.kind() != .file) return;
-    if (s.options.scanner) |scanner| if (scanner.scan(s.host, job.program)) |name| {
+    if (s.options.scanner) |scanner| if (scanner.scan(s.host, program)) |name| {
         try s.add(.{
             .severity = .critical,
             .category = .malware,
             .title = "launchd job runs known malware",
-            .description = try s.print("{s} runs {s}, detected as {s}.", .{ path, job.program, name }),
+            .description = try s.print("{s} runs {s}, detected as {s}.", .{ path, program, name }),
             .remediation = "Unload the job, delete the plist and the program, and investigate.",
             .subject = path,
         });
         return;
     };
-    const signing = macho.classifyPath(s.host, job.program) catch return;
+    const signing = macho.classifyPath(s.host, program) catch return;
     if (signing == .unsigned) try s.add(.{
         .severity = .medium,
         .category = .persistence,
         .title = "launchd job runs an unsigned program",
-        .description = try s.print("{s} ({s}) runs {s}, a Mach-O binary with no code signature. Distributed macOS software is signed; unsigned persistent programs deserve a look.", .{ path, job.label, job.program }),
-        .remediation = try s.print("Verify the program (codesign -dv {s}; spctl -a -vv {s}) and remove the job if you do not recognise it.", .{ job.program, job.program }),
+        .description = try s.print("{s} ({s}) runs {s}, a Mach-O binary with no code signature. Distributed macOS software is signed; unsigned persistent programs deserve a look.", .{ path, job.label, program }),
+        .remediation = try s.print("Verify the program (codesign -dv {s}; spctl -a -vv {s}) and remove the job if you do not recognise it.", .{ program, program }),
         .subject = path,
-        .details = try s.details(&.{.{ .key = "program", .value = job.program }}),
+        .details = try s.details(&.{.{ .key = "program", .value = program }}),
     });
 }
 
