@@ -51,6 +51,25 @@ pub fn compileTime() Features {
     };
 }
 
+/// The CPU's marketing name, for benchmark reports. Null where the platform has no cheap source.
+pub fn brand(buf: *[64]u8) ?[]const u8 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (cpuid(0x8000_0000, 0)[0] < 0x8000_0004) return null;
+            for (0..3) |i| {
+                const regs = cpuid(0x8000_0002 + @as(u32, @intCast(i)), 0);
+                for (regs, 0..) |reg, j| std.mem.writeInt(u32, buf[i * 16 + j * 4 ..][0..4], reg, .little);
+            }
+            return std.mem.trim(u8, std.mem.sliceTo(buf[0..48], 0), " ");
+        },
+        else => if (builtin.os.tag.isDarwin()) {
+            var len: usize = buf.len;
+            if (std.c.sysctlbyname("machdep.cpu.brand_string", buf, &len, null, 0) != 0) return null;
+            return std.mem.sliceTo(buf[0..len], 0);
+        } else return null,
+    }
+}
+
 fn cpuid(leaf: u32, subleaf: u32) [4]u32 {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
@@ -154,6 +173,11 @@ test "detected features include the compile-time target's" {
     }
     // Levels nest.
     if (detected.x86_64_v3) try std.testing.expect(detected.x86_64_v2);
+}
+
+test brand {
+    var buf: [64]u8 = undefined;
+    if (brand(&buf)) |name| try std.testing.expect(name.len > 0 and name.len <= buf.len);
 }
 
 test "Apple silicon reports the ARMv8 crypto extensions" {

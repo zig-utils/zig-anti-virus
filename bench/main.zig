@@ -155,6 +155,8 @@ fn hashBenchmarks(io: std.Io, suite: *bench.BenchmarkSuite) !void {
     const hash = zav.hash;
     const features = zav.simd.arch.detect();
     const all_kernels = comptime hash.dispatch.all ++ [_]hash.Kernels{hash.dispatch.portable};
+    var brand_buf: [64]u8 = undefined;
+    std.debug.print("hash: cpu {s}, {s}\n", .{ zav.simd.arch.brand(&brand_buf) orelse "unknown", @tagName(@import("builtin").os.tag) });
     std.debug.print("hash: active variant {s}; MB/s (10^6 bytes) over a 1 MiB buffer, best of 5\n", .{hash.dispatch.active().name});
     std.debug.print("hash: {s:<18} {s:>9} {s:>9} {s:>9}  hw sha1/sha256\n", .{ "variant", "md5", "sha1", "sha256" });
     inline for (all_kernels) |*k| {
