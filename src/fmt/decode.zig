@@ -101,8 +101,8 @@ pub fn childFrom(
             const token = w.window(s.window_len, s.buffer_len - s.window_len) orelse return;
             defer token.release();
             const buffer = w.alloc(u8, s.buffer_len) orelse return;
-            var dec = std.compress.zstd.Decompress.init(in, buffer, .{ .window_len = s.window_len });
-            var meter: container.Meter = .init(w, &dec.reader, pulled, meter_buf);
+            var dec = zstd.decode.Decoder.init(in, buffer, s.window_len);
+            var meter: container.Meter = .init(w, &dec.interface, pulled, meter_buf);
             try emit(w, name, &meter, size_hint, kind);
             if (dec.err) |e| if (meter.tripped == null) switch (e) {
                 error.WindowOversize => w.limit(.window_size),

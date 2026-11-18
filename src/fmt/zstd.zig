@@ -1,13 +1,15 @@
-//! zstd (RFC 8878) over std.compress.zstd. The window is decided before decoding: the first
-//! frame header is peeked and its window size (or single-segment content size) sets the buffer,
-//! with a floor that keeps small frames under the 1 MiB token-free size. A window over the cap
-//! (8 MiB by default) is a limit event; so is a later frame that needs more than the first.
+//! zstd (RFC 8878) over our decoder (zstd/decode.zig). The window is decided before decoding:
+//! the first frame header is peeked and its window size (or single-segment content size) sets
+//! the buffer, with a floor that keeps small frames under the 1 MiB token-free size. A window
+//! over the cap (8 MiB by default) is a limit event; so is a later frame that needs more than
+//! the first.
 const std = @import("std");
 const Io = std.Io;
-const zstd = std.compress.zstd;
+pub const decode = @import("zstd/decode.zig");
+const container = @import("../engine/container.zig");
 
 /// Buffers up to this many bytes need no big-window token, so small windows round up to it.
-pub const floor_window: u32 = 1024 * 1024 - zstd.block_size_max;
+pub const floor_window: u32 = 1024 * 1024 - decode.block_size_max;
 
 pub const Error = error{ BadMagic, Truncated };
 
@@ -42,17 +44,19 @@ pub fn frameWindow(head: []const u8, fallback: u64) Error!u64 {
     };
 }
 
-/// Window length to configure and the buffer size it needs.
-/// The buffer is twice the window plus one block. std's decoder keeps the whole window in its
-/// buffer and slides it with a memmove whenever the buffer fills; with only one block of slack
-/// that is a window-sized copy per 128 KiB block (E7 measured 12 MB/s), with a window of slack
-/// it is one copy per window of output.
+/// Window length to configure and the memory the decoder needs for it. The output buffer is
+/// twice the window plus one block, so the window slides once per window of output rather than
+/// once per 128 KiB block (E7 measured std's one-block slack at 12 MB/s).
 pub fn sizing(window: u64) struct { window_len: u32, buffer_len: usize } {
     const w: u32 = @intCast(@max(window, floor_window));
-    return .{ .window_len = w, .buffer_len = 2 * @as(usize, w) + zstd.block_size_max };
+    return .{ .window_len = w, .buffer_len = decode.workLen(w) };
 }
 
 const fixtures = @import("fixtures/fixtures.zig");
+
+test {
+    _ = decode;
+}
 
 test "decodes reference zstd streams; oversized windows are refused" {
     const gpa = std.testing.allocator;
@@ -68,17 +72,17 @@ test "decodes reference zstd streams; oversized windows are refused" {
         const buffer = try gpa.alloc(u8, s.buffer_len);
         defer gpa.free(buffer);
         var in: Io.Reader = .fixed(v.compressed);
-        var d = zstd.Decompress.init(&in, buffer, .{ .window_len = s.window_len });
+        var d = decode.Decoder.init(&in, buffer, s.window_len);
         var crc = std.hash.Crc32.init();
         var total: usize = 0;
+        var chunk: [9000]u8 = undefined;
         while (true) {
-            const chunk = d.reader.peekGreedy(1) catch |e| switch (e) {
+            const n = container.readSome(&d.interface, &chunk) catch |e| switch (e) {
                 error.EndOfStream => break,
                 error.ReadFailed => return d.err.?,
             };
-            crc.update(chunk);
-            total += chunk.len;
-            d.reader.toss(chunk.len);
+            crc.update(chunk[0..n]);
+            total += n;
         }
         try std.testing.expectEqual(v.plain_len, total);
         try std.testing.expectEqual(v.plain_crc, crc.final());

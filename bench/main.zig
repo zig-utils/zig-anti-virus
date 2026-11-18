@@ -365,10 +365,16 @@ var e7_dict: []u8 = undefined;
 var e7_probs: []u16 = undefined;
 var e7_zbuf: []u8 = undefined;
 
+/// The decoded corpus file, when the output should be checked (once per case, untimed).
+var e7_expect: ?[]const u8 = null;
+
 fn drainAll(r: *std.Io.Reader) usize {
     var n: usize = 0;
     while (true) {
         const got = zav.engine.container.readSome(r, &e7_out) catch break;
+        if (e7_expect) |want| {
+            if (n + got > want.len or !std.mem.eql(u8, want[n..][0..got], e7_out[0..got])) @panic("e7: decoded bytes differ from the corpus");
+        }
         n += got;
     }
     return n;
@@ -395,8 +401,8 @@ fn e7Xz() void {
 fn e7Zstd() void {
     var in: std.Io.Reader = .fixed(e7_input);
     const s = zav.fmt.zstd.sizing(zav.fmt.zstd.frameWindow(e7_input, 8 << 20) catch unreachable);
-    var d = std.compress.zstd.Decompress.init(&in, e7_zbuf[0..s.buffer_len], .{ .window_len = s.window_len });
-    if (drainAll(&d.reader) != e7_plain_len) @panic("e7: zstd length");
+    var d = zav.fmt.zstd.decode.Decoder.init(&in, e7_zbuf[0..s.buffer_len], s.window_len);
+    if (drainAll(&d.interface) != e7_plain_len) @panic("e7: zstd length");
 }
 
 /// Best-of-5 MB/s of decompressed output, each round at least 300 ms.
@@ -432,7 +438,7 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator, filter: []const u8) !vo
     defer gpa.free(e7_dict);
     e7_probs = try gpa.alloc(u16, zav.fmt.lzma.Lzma2.probs_len);
     defer gpa.free(e7_probs);
-    e7_zbuf = try gpa.alloc(u8, 2 * (8 << 20) + std.compress.zstd.block_size_max);
+    e7_zbuf = try gpa.alloc(u8, zav.fmt.zstd.sizing(8 << 20).buffer_len);
     defer gpa.free(e7_zbuf);
 
     var results: std.ArrayList(u8) = .empty;
@@ -441,10 +447,10 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator, filter: []const u8) !vo
     const cases = [_]struct { file: []const u8, decoder: []const u8, f: *const fn () void }{
         .{ .file = "text.gz", .decoder = "zav inflate", .f = e7Gzip },
         .{ .file = "binary.gz", .decoder = "zav inflate", .f = e7Gzip },
-        .{ .file = "text.zst", .decoder = "std.compress.zstd", .f = e7Zstd },
-        .{ .file = "binary.zst", .decoder = "std.compress.zstd", .f = e7Zstd },
-        .{ .file = "text.zst19", .decoder = "std.compress.zstd", .f = e7Zstd },
-        .{ .file = "binary.zst19", .decoder = "std.compress.zstd", .f = e7Zstd },
+        .{ .file = "text.zst", .decoder = "zav zstd", .f = e7Zstd },
+        .{ .file = "binary.zst", .decoder = "zav zstd", .f = e7Zstd },
+        .{ .file = "text.zst19", .decoder = "zav zstd", .f = e7Zstd },
+        .{ .file = "binary.zst19", .decoder = "zav zstd", .f = e7Zstd },
         .{ .file = "text.bz2", .decoder = "zav bzip2", .f = e7Bzip2 },
         .{ .file = "binary.bz2", .decoder = "zav bzip2", .f = e7Bzip2 },
         .{ .file = "text.xz", .decoder = "zav xz/lzma2", .f = e7Xz },
@@ -460,6 +466,16 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator, filter: []const u8) !vo
         defer gpa.free(data);
         e7_input = data;
         e7_plain_len = 16 * 1024 * 1024;
+        // Check the output once against the raw corpus file, then time.
+        const raw_name = c.file[0 .. std.mem.indexOfScalar(u8, c.file, '.') orelse c.file.len];
+        const raw_path = try std.fmt.allocPrint(gpa, "{s}.raw", .{raw_name});
+        defer gpa.free(raw_path);
+        if (dir.readFileAlloc(io, raw_path, gpa, .limited(1 << 30))) |raw| {
+            defer gpa.free(raw);
+            e7_expect = raw;
+            c.f();
+            e7_expect = null;
+        } else |_| {}
         const rate = e7Measure(io, c.f);
         std.debug.print("e7: {s:<14} {s:<20} {d:>6.0} MB/s\n", .{ c.file, c.decoder, rate });
         const line = try std.fmt.allocPrint(gpa, "{s}  {{\"file\": \"{s}\", \"decoder\": \"{s}\", \"mbps\": {d:.1}}}", .{ if (written > 0) ",\n" else "", c.file, c.decoder, rate });
