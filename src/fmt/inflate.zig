@@ -25,7 +25,7 @@ const container = @import("../engine/container.zig");
 
 pub const history_len = 32 * 1024;
 /// New output decoded per refill of the output buffer.
-const out_room = 128 * 1024;
+const out_room = 64 * 1024;
 /// Over-long match copies (up to 15 bytes) land here, past the decode limit.
 const slack = 64;
 const max_match = 258;
@@ -67,10 +67,11 @@ const entry_invalid: u32 = flag_exc | (1 << 16);
 const lit_root = 11;
 const dist_root = 8;
 const pre_root = 7;
-// Second-level tables are sized by the longest code under each root prefix, so each takes at
-// most 2^(15 - root) entries and there is at most one per code longer than the root.
-const lit_table_len = (1 << lit_root) + 288 * (1 << (15 - lit_root));
-const dist_table_len = (1 << dist_root) + 32 * (1 << (15 - dist_root));
+// Second-level tables are sized by the longest code under each root prefix (as zlib and
+// libdeflate size theirs), so the largest tables any valid code can need are the counts from
+// zlib's examples/enough.c: `enough 288 11 15` and `enough 32 8 15`. `build` still checks.
+const lit_table_len = 2342;
+const dist_table_len = 402;
 
 const Tables = struct {
     lit: [lit_table_len]u32,
@@ -176,7 +177,7 @@ fn build(comptime kind: Kind, table: []u32, lens: []const u8, comptime root: u5)
             sub_bits = longest - root;
             sub_off = sub_next;
             sub_next += @as(u32, 1) << @intCast(sub_bits);
-            std.debug.assert(sub_next <= table.len);
+            if (sub_next > table.len) return error.InvalidDynamicBlockHeader;
             table[reverse(prefix, root)] = flag_sub | (sub_off << 16) | (sub_bits << 8) | root;
         }
         const rest = len - root;
@@ -843,5 +844,38 @@ test "agrees with std's decoder on mutated streams" {
             }
             try std.testing.expectEqualSlices(u8, want.written(), got);
         }
+    }
+}
+
+test "tables fit every complete code, long codes included" {
+    // Random complete codes over 288 and 32 symbols, grown by splitting leaves, often the
+    // deepest, so many codes reach 15 bits and the second-level tables are as large as they get.
+    const tables = try std.testing.allocator.create(Tables);
+    defer std.testing.allocator.destroy(tables);
+    var prng = std.Random.DefaultPrng.init(8);
+    const r = prng.random();
+    for (0..2000) |round| {
+        const n: usize = if (round % 2 == 0) 288 else 32;
+        var depth: [288]u8 = undefined;
+        var leaves: usize = 1;
+        depth[0] = 0;
+        while (leaves < n) {
+            var pick = r.uintLessThan(usize, leaves);
+            if (r.boolean()) {
+                for (0..leaves) |k| if (depth[k] > depth[pick]) {
+                    pick = k;
+                };
+            }
+            if (depth[pick] >= 15) {
+                var k: usize = 0;
+                while (depth[k] >= 15) k += 1;
+                pick = k;
+            }
+            depth[pick] += 1;
+            depth[leaves] = depth[pick];
+            leaves += 1;
+        }
+        r.shuffle(u8, depth[0..n]);
+        if (n == 288) try build(.lit, &tables.lit, depth[0..n], lit_root) else try build(.dist, &tables.dist, depth[0..n], dist_root);
     }
 }
