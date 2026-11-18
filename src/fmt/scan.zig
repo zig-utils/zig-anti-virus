@@ -22,6 +22,7 @@ const decode = @import("decode.zig");
 const archive = @import("archive.zig");
 const tar = @import("tar.zig");
 const cpio = @import("cpio.zig");
+const zip = @import("zip.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -50,6 +51,12 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
             var cursor: archive.Cursor = .{ .w = w, .positional = src };
             try cpio.walk(w, &cursor);
         },
+        .zip => try zip.walk(w, src),
+        .binary, .text => if (zip.hasTrailer(w, src)) {
+            // Data with a zip appended (a self-extractor stub, a polyglot): walk the zip too.
+            w.notice(.mismatch, "zip: archive appended to other data");
+            try zip.walk(w, src);
+        },
         else => {},
     }
 }
@@ -74,6 +81,11 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         .cpio => {
             var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
             try cpio.walk(w, &cursor);
+        },
+        .zip => {
+            var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
+            defer mat.deinit(w.io);
+            try zip.walk(w, mat.source);
         },
         else => {},
     }
@@ -239,9 +251,9 @@ test "a decompression bomb of each format stops at the ratio limit with an event
     }
 }
 
-test "archives: every tar and cpio variant, positional and streamed" {
+test "archives: every tar, cpio and zip variant, positional and streamed" {
     for (fixtures.archives) |a| {
-        if (std.mem.indexOf(u8, a.name, ".tar") == null and std.mem.indexOf(u8, a.name, ".cpio") == null) continue;
+        if (std.mem.indexOf(u8, a.name, "bomb") != null) continue;
         var rig: TestRig = undefined;
         try rig.init(.{});
         defer rig.deinit();
@@ -258,7 +270,9 @@ test "archives: every tar and cpio variant, positional and streamed" {
                 };
                 try std.testing.expectEqual(m.crc, e.crc);
             };
-            if (seen != 2) {
+            // Appended zips are found by their trailer, which only positional sources can reach.
+            const want: usize = if (std.mem.eql(u8, a.name, "sfx.zip")) 1 else 2;
+            if (seen != want) {
                 std.debug.print("{s}: member {s} seen {d} times\n", .{ a.name, path, seen });
                 rig.rec.dump();
                 return error.TestUnexpectedResult;
@@ -269,6 +283,39 @@ test "archives: every tar and cpio variant, positional and streamed" {
             rig.rec.dump();
             return error.TestUnexpectedResult;
         }
+        const Expect = struct { name: []const u8, what: std.meta.Tag(container.Notice.What) };
+        for ([_]Expect{
+            .{ .name = "hidden-entry.zip", .what = .mismatch },
+            .{ .name = "method-mismatch.zip", .what = .mismatch },
+            .{ .name = "encrypted.zip", .what = .encrypted },
+            .{ .name = "deflate64.zip", .what = .unsupported },
+        }) |x| if (std.mem.eql(u8, a.name, x.name) and !rig.rec.has(x.what)) {
+            std.debug.print("{s}: expected a {t} notice\n", .{ a.name, x.what });
+            rig.rec.dump();
+            return error.TestUnexpectedResult;
+        };
+        if (std.mem.eql(u8, a.name, "encrypted.zip")) try std.testing.expect(rig.rec.find("encrypted.zip/secret.bin") == null);
         try std.testing.expectEqual(@as(usize, 0), rig.scratch.used());
+    }
+}
+
+test "overlapping-entry zip bombs are reported and bounded" {
+    for (fixtures.archives) |a| {
+        if (std.mem.indexOf(u8, a.name, "bomb.zip") == null) continue;
+        var rig: TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(a.bytes, a.name);
+        try std.testing.expect(rig.rec.has(.overlap));
+        var members: usize = 0;
+        var bytes: u64 = 0;
+        for (rig.rec.objects.items) |e| if (e.depth == 1) {
+            members += 1;
+            bytes += e.bytes;
+        };
+        // One entry per scan decoded (the rest share its bytes), and that one stopped by the
+        // ratio guard: nowhere near the 2 GB and 8 GB the entries claim.
+        try std.testing.expectEqual(@as(usize, 2), members);
+        try std.testing.expect(bytes < 16 * 1024 * 1024);
     }
 }

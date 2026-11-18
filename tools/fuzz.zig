@@ -682,6 +682,7 @@ const Formats = struct {
         .{ .name = "fmt.bomb", .inputs = vectors(&fixtures.bomb_vectors) },
         .{ .name = "fmt.tar", .inputs = archives(".tar") },
         .{ .name = "fmt.cpio", .inputs = archives(".cpio") },
+        .{ .name = "fmt.zip", .inputs = archives(".zip") },
     };
 
     fn vectors(comptime vs: []const fixtures.Vector) []const []const u8 {
