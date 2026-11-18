@@ -4,7 +4,12 @@
 //!
 //!     SectionHeader (16 bytes)
 //!     index: [count]u32   byte offset of each program from the section start (4-byte aligned)
-//!     program: ProgHeader (40 bytes), [op_count]ir.Op (12 bytes each), [data_len]u8
+//!     program: PackedHeader (24 bytes), PackedOffset (12 bytes, only when the program has an
+//!              offset), [op_count]ir.Op (12 bytes each), [data_len]u8
+//!
+//! Version 2 stores headers packed: 85% of the 1.63 million programs of main and daily are a
+//! single literal, so the old 40-byte header was the largest part of the section, and only 3.6%
+//! have an offset. `Programs.get` decodes a program's header into `ProgHeader`.
 //!
 //! Ops and data are the hex-signature IR exactly as the compiler built it (compile/ir.zig).
 //! `Programs.init` validates every program before any is used: every offset and length lands
@@ -15,7 +20,7 @@ const ir = @import("../compile/ir.zig");
 
 pub const SectionHeader = extern struct {
     magic: [4]u8 = "PROG".*,
-    version: u32 = 1,
+    version: u32 = 2,
     count: u32,
     _reserved: u32 = 0,
 };
@@ -57,12 +62,64 @@ pub const ProgHeader = extern struct {
     _reserved: u32 = 0,
 };
 
+/// The on-disk form of a header without its offset fields.
+pub const PackedHeader = extern struct {
+    sig: u32,
+    subsig: u8,
+    target: u8,
+    flags: u8,
+    off_kind: ir.OffsetKind,
+    op_count: u16,
+    part_count: u8,
+    anchor_part: u8,
+    data_len: u32,
+    min_len: u32,
+    anchor_op: u16,
+    anchor_delta: u16,
+};
+
+/// The offset fields, stored only for programs whose `off_kind` is not `any`.
+pub const PackedOffset = extern struct {
+    off_section: u16,
+    _pad: u16 = 0,
+    off_a: i32,
+    off_shift: u32,
+};
+
 comptime {
     std.debug.assert(@sizeOf(SectionHeader) == 16);
     std.debug.assert(@sizeOf(ProgHeader) == 40);
     std.debug.assert(@alignOf(ProgHeader) == 4);
-    std.debug.assert(@offsetOf(ProgHeader, "off_a") == 12);
-    std.debug.assert(@offsetOf(ProgHeader, "op_count") == 20);
+    std.debug.assert(@sizeOf(PackedHeader) == 24);
+    std.debug.assert(@sizeOf(PackedOffset) == 12);
+}
+
+/// The packed bytes of a header: 24, or 36 with an offset. `h` must fit (subsig and part count
+/// below 256).
+pub fn pack(h: ProgHeader, out: *[@sizeOf(PackedHeader) + @sizeOf(PackedOffset)]u8) []const u8 {
+    const ph: PackedHeader = .{
+        .sig = h.sig,
+        .subsig = @intCast(h.subsig),
+        .target = h.target,
+        .flags = h.flags,
+        .off_kind = h.off_kind,
+        .op_count = h.op_count,
+        .part_count = @intCast(h.part_count),
+        .anchor_part = h.anchor_part,
+        .data_len = h.data_len,
+        .min_len = h.min_len,
+        .anchor_op = h.anchor_op,
+        .anchor_delta = h.anchor_delta,
+    };
+    out[0..@sizeOf(PackedHeader)].* = std.mem.toBytes(ph);
+    if (h.off_kind == .any) return out[0..@sizeOf(PackedHeader)];
+    const po: PackedOffset = .{ .off_section = h.off_section, .off_a = h.off_a, .off_shift = h.off_shift };
+    out[@sizeOf(PackedHeader)..].* = std.mem.toBytes(po);
+    return out;
+}
+
+fn headerLen(kind: ir.OffsetKind) usize {
+    return @sizeOf(PackedHeader) + @as(usize, if (kind == .any) 0 else @sizeOf(PackedOffset));
 }
 
 /// Bounds the verify VM relies on for its recursion depth.
@@ -70,7 +127,8 @@ pub const max_parts: usize = 255;
 pub const max_branches: usize = 64;
 
 pub const Program = struct {
-    header: *const ProgHeader,
+    /// Decoded from the packed form.
+    header: ProgHeader,
     pattern: ir.Pattern,
 
     pub fn offset(p: Program) ir.Offset {
@@ -88,7 +146,7 @@ pub const Programs = struct {
         if (section.len < @sizeOf(SectionHeader) or @intFromPtr(section.ptr) % 4 != 0) return error.BadProgram;
         const bytes: []align(4) const u8 = @alignCast(section);
         const h: *const SectionHeader = @ptrCast(bytes.ptr);
-        if (!std.mem.eql(u8, &h.magic, "PROG") or h.version != 1) return error.BadProgram;
+        if (!std.mem.eql(u8, &h.magic, "PROG") or h.version != 2) return error.BadProgram;
         if (h.count > (bytes.len - @sizeOf(SectionHeader)) / 4) return error.BadProgram;
         const index_ptr: [*]const u32 = @ptrCast(@alignCast(bytes.ptr + @sizeOf(SectionHeader)));
         const progs: Programs = .{ .bytes = bytes, .index = index_ptr[0..h.count] };
@@ -110,8 +168,28 @@ pub const Programs = struct {
     }
 
     fn at(progs: Programs, off: u32) Program {
-        const h: *const ProgHeader = @ptrCast(@alignCast(progs.bytes.ptr + off));
-        const ops_at = off + @sizeOf(ProgHeader);
+        const ph: *const PackedHeader = @ptrCast(@alignCast(progs.bytes.ptr + off));
+        var h: ProgHeader = .{
+            .sig = ph.sig,
+            .subsig = ph.subsig,
+            .target = ph.target,
+            .flags = ph.flags,
+            .off_kind = ph.off_kind,
+            .anchor_part = ph.anchor_part,
+            .op_count = ph.op_count,
+            .part_count = ph.part_count,
+            .data_len = ph.data_len,
+            .min_len = ph.min_len,
+            .anchor_op = ph.anchor_op,
+            .anchor_delta = ph.anchor_delta,
+        };
+        if (ph.off_kind != .any) {
+            const po: *const PackedOffset = @ptrCast(@alignCast(progs.bytes.ptr + off + @sizeOf(PackedHeader)));
+            h.off_section = po.off_section;
+            h.off_a = po.off_a;
+            h.off_shift = po.off_shift;
+        }
+        const ops_at = off + headerLen(ph.off_kind);
         const ops: [*]const ir.Op = @ptrCast(@alignCast(progs.bytes.ptr + ops_at));
         const data_at = ops_at + @as(usize, h.op_count) * @sizeOf(ir.Op);
         const data: []align(4) const u8 = @alignCast(progs.bytes[data_at..][0..h.data_len]);
@@ -120,9 +198,9 @@ pub const Programs = struct {
 
     fn checked(progs: Programs, off: u32) Error!Program {
         const len = progs.bytes.len;
-        if (@as(usize, off) + @sizeOf(ProgHeader) > len) return error.BadProgram;
-        const h: *const ProgHeader = @ptrCast(@alignCast(progs.bytes.ptr + off));
-        const end = @as(usize, off) + @sizeOf(ProgHeader) + @as(usize, h.op_count) * @sizeOf(ir.Op) + h.data_len;
+        if (@as(usize, off) + @sizeOf(PackedHeader) > len) return error.BadProgram;
+        const ph: *const PackedHeader = @ptrCast(@alignCast(progs.bytes.ptr + off));
+        const end = @as(usize, off) + headerLen(ph.off_kind) + @as(usize, ph.op_count) * @sizeOf(ir.Op) + ph.data_len;
         if (end > len) return error.BadProgram;
         const p = progs.at(off);
         try validate(p);

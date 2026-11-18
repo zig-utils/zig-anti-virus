@@ -159,12 +159,14 @@ keys:    [N]u32 first 4 digest bytes, big-endian, sorted within each size bucket
 
 **`SUBSIG_PROG`:** one program per subsignature.
 - Header: ldb, index, target, modifiers (nocase, wide, ascii, fullword), offset kind and values, anchor location, min and max length.
+- Headers are packed (24 bytes, plus 12 for the offset fields only when the program has an offset): of the 1.63 million programs compiled from main and daily, 85% are one literal and 3.6% have an offset, so a fixed 40-byte header was the largest part of the section [M].
 - Ops: `LIT`, `MASKED`, `ALT`, `NALT`, `GAPF n`, `PART_END min max`, `BOUND`.
 
 **`ANCHORED_INDEX[p]`:** signatures with a non-"any" offset kind, grouped by (offset kind, offset value). Each group is a small hash table keyed by the 4 bytes at that offset.
 
 **`LDB_TABLE`:**
 - Per signature: subsignature count, an RPN expression and a predicate list (FileSize, EntryPoint, NumberOfSections, Container, Intermediates, Engine).
+- Predicate lists (target descriptions) are stored once each and referenced by index: 322,204 logical signatures share 460 distinct ones [M].
 - RPN ops: `HIT i`, `COUNT i`, `CMP{EQ,GT,LT} k`, `AND`, `OR`, `DISTINCT_GE k`, `OFFSETS i`.
 
 ## 4. Compiler pipeline

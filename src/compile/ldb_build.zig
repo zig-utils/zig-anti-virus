@@ -35,7 +35,8 @@ pub fn build(gpa: std.mem.Allocator, entries: []const Entry) ![]u8 {
 
 /// LDB_TABLE built one rule at a time, so rules need not stay alive until the table is written.
 /// The layout is the one `build` always produced: records, main expressions, PCRE triggers,
-/// target descriptions, byte compares, PCRE records and the always-evaluated record list.
+/// distinct target descriptions, byte compares, PCRE records, the always-evaluated record list
+/// and each record's target description index.
 pub const Builder = struct {
     gpa: std.mem.Allocator,
     records: std.ArrayList(ldb_table.LdbRecord) = .empty,
@@ -47,6 +48,9 @@ pub const Builder = struct {
     pcres: std.ArrayList(ldb_table.PcreRecord) = .empty,
     /// Records whose expression holds with no hits: evaluated for every file.
     always: std.ArrayList(u32) = .empty,
+    /// Each record's target description, an index into `tdbs` (stored once each).
+    tdb_of: std.ArrayList(u32) = .empty,
+    tdb_ids: std.AutoHashMapUnmanaged([@sizeOf(ldb_table.TdbRecord)]u8, u32) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Builder {
         return .{ .gpa = gpa };
@@ -60,6 +64,8 @@ pub const Builder = struct {
         b.bcs.deinit(b.gpa);
         b.pcres.deinit(b.gpa);
         b.always.deinit(b.gpa);
+        b.tdb_of.deinit(b.gpa);
+        b.tdb_ids.deinit(b.gpa);
         b.* = undefined;
     }
 
@@ -117,7 +123,13 @@ pub const Builder = struct {
             if (ldb_table.evalRpn(e.rule.expr, zeros[0..e.rule.subsigs.len])) try b.always.append(gpa, @intCast(b.records.items.len - 1));
         }
         try b.exprs.appendSlice(gpa, e.rule.expr);
-        try b.tdbs.append(gpa, ldb_table.TdbRecord.from(e.rule.tdb));
+        const t = ldb_table.TdbRecord.from(e.rule.tdb);
+        const gop = try b.tdb_ids.getOrPut(gpa, std.mem.toBytes(t));
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(b.tdbs.items.len);
+            try b.tdbs.append(gpa, t);
+        }
+        try b.tdb_of.append(gpa, gop.value_ptr.*);
     }
 
     /// The section bytes, allocated with `gpa`.
@@ -128,6 +140,7 @@ pub const Builder = struct {
             .bc_count = @intCast(b.bcs.items.len),
             .pcre_count = @intCast(b.pcres.items.len),
             .always_count = @intCast(b.always.items.len),
+            .tdb_count = @intCast(b.tdbs.items.len),
         };
         // PCRE triggers follow the main expressions in the RPN pool.
         const base: u32 = @intCast(b.exprs.items.len);
@@ -146,6 +159,7 @@ pub const Builder = struct {
         try out.appendSlice(gpa, std.mem.sliceAsBytes(b.bcs.items));
         try out.appendSlice(gpa, std.mem.sliceAsBytes(b.pcres.items));
         try out.appendSlice(gpa, std.mem.sliceAsBytes(b.always.items));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.tdb_of.items));
         return out.toOwnedSlice(gpa);
     }
 };

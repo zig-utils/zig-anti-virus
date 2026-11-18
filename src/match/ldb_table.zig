@@ -5,10 +5,15 @@
 //!     LdbHeader (32 bytes)
 //!     records: [count]LdbRecord (32 bytes)   {sig, nsub, flags, expr_len, expr_off, prog range}
 //!     rpn:     [rpn_count]ir.RpnOp (8 bytes)
-//!     tdbs:    [count]TdbRecord (96 bytes)    record i's target description
+//!     tdbs:    [tdb_count]TdbRecord (96 bytes) distinct target descriptions
 //!     bcs:     [bc_count]BcRecord (32 bytes)  byte-compare subsigs, by record
 //!     pcres:   [pcre_count]PcreRecord (24 bytes)  PCRE subsigs, by record, in subsig order
 //!     always:  [always_count]u32               records evaluated for every file, ascending
+//!     tdb_of:  [count]u32                      record i's target description in `tdbs`
+//!
+//! Target descriptions are stored once each (version 2): the 322,204 logical signatures of
+//! main 63 and daily 28187 have 460 distinct ones, so the table no longer spends 96 bytes on
+//! every record.
 //!
 //! libclamav evaluates a logical signature whose expression holds with no subsig matched
 //! (`0=0`, `1<3`) for every file, so those records are listed and the scan gives them state
@@ -27,14 +32,15 @@ const regex_pool = @import("regex_pool.zig");
 
 pub const LdbHeader = extern struct {
     magic: [4]u8 = "LDBT".*,
-    version: u32 = 1,
+    version: u32 = 2,
     count: u32,
     rpn_count: u32,
     bc_count: u32 = 0,
     pcre_count: u32 = 0,
     /// Records whose expression holds with no subsig matched; listed after the PCRE records.
     always_count: u32 = 0,
-    _reserved: [4]u8 = @splat(0),
+    /// Distinct target descriptions.
+    tdb_count: u32 = 0,
 };
 
 /// Record flag: the expression compares counts, so per-subsig counters are needed.
@@ -253,7 +259,9 @@ pub fn usesCounts(ops: []const ir.RpnOp) bool {
 pub const LdbTable = struct {
     records: []const LdbRecord,
     rpn: []const ir.RpnOp,
+    /// Distinct target descriptions; `tdb(i)` is record i's.
     tdbs: []const TdbRecord,
+    tdb_of: []const u32 = &.{},
     bcs: []const BcRecord,
     pcres: []const PcreRecord = &.{},
     regexes: ?regex_pool.RegexPool = null,
@@ -273,26 +281,30 @@ pub const LdbTable = struct {
     pub fn initWith(section: []const u8, programs: ?prog.Programs, regexes: ?regex_pool.RegexPool) Error!LdbTable {
         if (section.len < @sizeOf(LdbHeader) or @intFromPtr(section.ptr) % 8 != 0) return error.BadLdbTable;
         const h: *const LdbHeader = @ptrCast(@alignCast(section.ptr));
-        if (!std.mem.eql(u8, &h.magic, "LDBT") or h.version != 1) return error.BadLdbTable;
+        if (!std.mem.eql(u8, &h.magic, "LDBT") or h.version != 2) return error.BadLdbTable;
         const records_at = @sizeOf(LdbHeader);
         const rpn_at = records_at + @as(usize, h.count) * @sizeOf(LdbRecord);
         const tdb_at = std.mem.alignForward(usize, rpn_at + @as(usize, h.rpn_count) * @sizeOf(ir.RpnOp), 8);
-        const bc_at = tdb_at + @as(usize, h.count) * @sizeOf(TdbRecord);
+        const bc_at = tdb_at + @as(usize, h.tdb_count) * @sizeOf(TdbRecord);
         const pcre_at = bc_at + @as(usize, h.bc_count) * @sizeOf(BcRecord);
         const always_at = pcre_at + @as(usize, h.pcre_count) * @sizeOf(PcreRecord);
-        const end = always_at + @as(usize, h.always_count) * 4;
+        const tdb_of_at = always_at + @as(usize, h.always_count) * 4;
+        const end = tdb_of_at + @as(usize, h.count) * 4;
         if (end > section.len) return error.BadLdbTable;
+        const tof: [*]const u32 = @ptrCast(@alignCast(section.ptr + tdb_of_at));
         const al: [*]const u32 = @ptrCast(@alignCast(section.ptr + always_at));
         const pc: [*]const PcreRecord = @ptrCast(@alignCast(section.ptr + pcre_at));
         const b: [*]const BcRecord = @ptrCast(@alignCast(section.ptr + bc_at));
         const r: [*]const LdbRecord = @ptrCast(@alignCast(section.ptr + records_at));
         const o: [*]const ir.RpnOp = @ptrCast(@alignCast(section.ptr + rpn_at));
         const t: [*]const TdbRecord = @ptrCast(@alignCast(section.ptr + tdb_at));
-        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count], .bcs = b[0..h.bc_count], .pcres = pc[0..h.pcre_count], .regexes = regexes, .always = al[0..h.always_count] };
+        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.tdb_count], .tdb_of = tof[0..h.count], .bcs = b[0..h.bc_count], .pcres = pc[0..h.pcre_count], .regexes = regexes, .always = al[0..h.always_count] };
         var next_always: usize = 0;
         const nregex = if (regexes) |pool| pool.count() else 0;
         const nprog = if (programs) |ps| ps.count() else 0;
-        for (table.records, table.tdbs, 0..) |rec, tdb, i| {
+        for (table.tdbs) |t_rec| if (t_rec.target > 14 or t_rec.intermediate_count > ir.max_intermediates) return error.BadLdbTable;
+        for (table.records, table.tdb_of, 0..) |rec, tdb_index, i| {
+            if (tdb_index >= table.tdbs.len) return error.BadLdbTable;
             if (rec.nsub == 0 or rec.nsub > ir.max_subsigs) return error.BadLdbTable;
             if (@as(u64, rec.expr_off) + rec.expr_len > h.rpn_count) return error.BadLdbTable;
             if (rec.flags & ~(flag_counts | flag_yara) != 0) return error.BadLdbTable;
@@ -325,7 +337,6 @@ pub const LdbTable = struct {
                 counts_needed = counts_needed or usesCounts(trig);
             }
             if (!yara and (rec.flags & flag_counts != 0) != counts_needed) return error.BadLdbTable;
-            if (tdb.target > 14 or tdb.intermediate_count > ir.max_intermediates) return error.BadLdbTable;
             if (@as(u64, rec.prog_first) + rec.prog_count > nprog) return error.BadLdbTable;
             if (@as(u64, rec.bc_first) + rec.bc_count > h.bc_count) return error.BadLdbTable;
             // Subsigs that have programs, and those that are byte compares, never overlap.
@@ -347,6 +358,11 @@ pub const LdbTable = struct {
         }
         if (next_always != table.always.len) return error.BadLdbTable;
         return table;
+    }
+
+    /// Record `i`'s target description.
+    pub fn tdb(table: LdbTable, i: usize) TdbRecord {
+        return table.tdbs[table.tdb_of[i]];
     }
 
     pub fn expr(table: LdbTable, rec: LdbRecord) []const ir.RpnOp {

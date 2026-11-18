@@ -632,7 +632,7 @@ fn logicalDiff(random: std.Random) void {
     }
     var want: [lines.len]bool = @splat(false);
     for (0..lines.len) |l| {
-        if (!touched[l] or !lt.tdbMatches(fx.table.tdbs[l], ctx)) continue;
+        if (!touched[l] or !lt.tdbMatches(fx.table.tdb(l), ctx)) continue;
         const rec = fx.table.records[l];
         var c: [3]u32 = undefined;
         for (0..rec.nsub) |i| c[i] = if (rec.flags & lt.flag_counts != 0) counts[l][i] else @intFromBool(counts[l][i] > 0);

@@ -125,8 +125,8 @@ pub const Writer = struct {
         const n = w.count();
         try w.bodies.alignTo(4);
         try w.index.append(w.gpa, @intCast(w.bodies.len));
-        const h = header(in);
-        try w.bodies.append(std.mem.asBytes(&h));
+        var packed_buf: [@sizeOf(prog.PackedHeader) + @sizeOf(prog.PackedOffset)]u8 = undefined;
+        try w.bodies.append(prog.pack(header(in), &packed_buf));
         try w.bodies.append(std.mem.sliceAsBytes(in.pattern.ops));
         try w.bodies.append(in.pattern.data);
         return n;

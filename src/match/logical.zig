@@ -154,7 +154,7 @@ pub const State = struct {
     pub fn ensure(s: *State, table: lt.LdbTable, ctx: lt.FileContext, ldb: u32) !void {
         if (s.find(ldb) != null or s.findSpilled(ldb) != null) return;
         const rec = table.records[ldb];
-        const dead = !lt.tdbMatches(table.tdbs[ldb], ctx);
+        const dead = !lt.tdbMatches(table.tdb(ldb), ctx);
         const wants_counts = rec.flags & lt.flag_counts != 0 and !dead;
         if (s.touched_len < table_limit and (!wants_counts or s.counts_used + rec.nsub <= s.counts.len)) {
             var i = hash(ldb);
@@ -215,9 +215,9 @@ pub const State = struct {
             if (rec.bc_count > 0 or rec.flags & lt.flag_yara != 0) try s.recordTrigger(table, rec, ldb, subsig, start);
             return;
         }
-        if ((rec.bc_count > 0 or rec.flags & lt.flag_yara != 0) and lt.tdbMatches(table.tdbs[ldb], ctx)) try s.recordTrigger(table, rec, ldb, subsig, start);
+        if ((rec.bc_count > 0 or rec.flags & lt.flag_yara != 0) and lt.tdbMatches(table.tdb(ldb), ctx)) try s.recordTrigger(table, rec, ldb, subsig, start);
         // First touch: the target description decides whether the signature can match at all.
-        const dead = !lt.tdbMatches(table.tdbs[ldb], ctx);
+        const dead = !lt.tdbMatches(table.tdb(ldb), ctx);
         const wants_counts = rec.flags & lt.flag_counts != 0 and !dead;
         if (s.touched_len < table_limit and (!wants_counts or s.counts_used + rec.nsub <= s.counts.len)) {
             var i = hash(ldb);
