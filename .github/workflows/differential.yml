@@ -43,6 +43,10 @@ jobs:
         run: python3 tools/diff/clamav.py --work "$RUNNER_TEMP/work" tests/differential/cases
       - name: zav gives them too
         run: zig build diff
+      - name: zav agrees with yara on the YARA rules
+        run: |
+          python3 -m pip install --quiet yara-python
+          python3 tools/diff/yara_check.py --work "$RUNNER_TEMP/ywork" tests/differential/cases
       - name: On failure, record what libclamav says
         if: failure()
         run: |

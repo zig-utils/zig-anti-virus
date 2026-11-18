@@ -1,0 +1,47 @@
+# Byte-compare subsignatures: trigger(>>offset#[h|d|a|i][l|b][e]width#op value[,op value]).
+# The trigger is 4c454e3d (LEN=).
+
+case bytecompare-text
+ldb Diff.Bc.DecGt;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#de3#>100)
+ldb Diff.Bc.DecEq;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#de3#=512)
+ldb Diff.Bc.DecLt;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#de3#<100)
+ldb Diff.Bc.DecNonExact;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#d3#>100)
+ldb Diff.Bc.HexBig;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#hbe4#=0x1fff)
+ldb Diff.Bc.HexLittle;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#hle4#=0xff1f)
+ldb Diff.Bc.Auto;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ae6#=0x1fff)
+ldb Diff.Bc.AutoDec;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ae3#=512)
+ldb Diff.Bc.Two;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#de3#>100,<600)
+ldb Diff.Bc.Back;Engine:81-255,Target:0;0&1;4c454e3d;0(<<3#de3#=123)
+ldb Diff.Bc.AutoBig;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#abe3#=512)
+ldb Diff.Bc.AutoBigHex;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#abe6#=0x1fff)
+ldb Diff.Bc.AutoLittleHex;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ale6#=0xff1f)
+ldb Diff.Bc.HexDefault;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#he4#=0xff1f)
+ldb! Diff.Bc.DecLittle;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#dle3#=512)
+ldb Diff.Bc.DecBig;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#dbe3#=512)
+sample bin "LEN=512;" bin => Diff.Bc.AutoBig Diff.Bc.DecBig Diff.Bc.DecEq Diff.Bc.DecGt Diff.Bc.DecNonExact Diff.Bc.Two
+sample bin "LEN=099;" bin => Diff.Bc.DecLt
+sample bin "LEN=5xx;" bin => OK
+sample bin "LEN=1fff" bin => Diff.Bc.HexBig Diff.Bc.HexLittle
+sample bin "LEN=0x1fff" bin => Diff.Bc.AutoBigHex
+sample bin "123LEN=000" bin => Diff.Bc.Back Diff.Bc.DecLt
+sample bin "LEN=600" bin => Diff.Bc.DecGt Diff.Bc.DecNonExact
+sample bin "LEN=" => OK
+
+case bytecompare-binary
+ldb Diff.Bc.I1;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ib1#=0x7f)
+ldb Diff.Bc.I2Little;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#il2#=0x1234)
+ldb Diff.Bc.I2Big;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ib2#=0x1234)
+ldb Diff.Bc.I4Gt;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#il4#>1000)
+ldb Diff.Bc.I8;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ib8#=1)
+ldb! Diff.Bc.I3;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#ib3#=1)
+ldb Diff.Bc.INoEndian;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#i2#=0x1234)
+sample bin "LEN=\x7f\x00\x00\x00\x00\x00\x00\x00" bin => Diff.Bc.I1
+sample bin "LEN=\x34\x12\x00\x00\x00\x00\x00\x00" bin => Diff.Bc.I2Little Diff.Bc.I4Gt
+sample bin "LEN=\x12\x34\x00\x00\x00\x00\x00\x00" bin => Diff.Bc.I2Big Diff.Bc.I4Gt
+sample bin "LEN=\x00\x00\x00\x00\x00\x00\x00\x01" bin => Diff.Bc.I8
+sample bin "LEN=\xe9\x03\x00\x00\x00\x00\x00\x00" bin => Diff.Bc.I4Gt
+
+case bytecompare-triggers
+ldb Diff.Bc.Many;Engine:81-255,Target:0;0&1;4c454e3d;0(>>4#de1#=9)
+sample bin "LEN=1 LEN=2 LEN=9" bin => Diff.Bc.Many
+sample bin "LEN=1 LEN=1 LEN=1 LEN=1 LEN=1 LEN=1 LEN=1 LEN=1 LEN=9" bin => Diff.Bc.Many

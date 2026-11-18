@@ -1,0 +1,98 @@
+# PCRE subsignatures: flags, offsets (exact, rolling, encompass), anchoring, global counts and
+# triggers. Subsig 0 is 54524947 (TRIG).
+
+case pcre-basic
+ldb Diff.Pcre.Plain;Engine:81-255,Target:0;0&1;54524947;0/ev[a-z]l/
+ldb Diff.Pcre.Nocase;Engine:81-255,Target:0;0&1;54524947;0/ev[a-z]l/i
+ldb Diff.Pcre.Dotall;Engine:81-255,Target:0;0&1;54524947;0/a.b/s
+ldb Diff.Pcre.NoDotall;Engine:81-255,Target:0;0&1;54524947;0/a.b/
+ldb Diff.Pcre.Multiline;Engine:81-255,Target:0;0&1;54524947;0/^line$/m
+ldb Diff.Pcre.NoMultiline;Engine:81-255,Target:0;0&1;54524947;0/^line$/
+ldb Diff.Pcre.Extended;Engine:81-255,Target:0;0&1;54524947;0/e v i l # comment/x
+ldb Diff.Pcre.Ungreedy;Engine:81-255,Target:0;0&1;54524947;0/e.+l/U
+ldb Diff.Pcre.DollarEnd;Engine:81-255,Target:0;0&1;54524947;0/tail$/E
+ldb Diff.Pcre.NoDollarEnd;Engine:81-255,Target:0;0&1;54524947;0/tail$/
+sample bin "TRIG evil" bin => Diff.Pcre.Extended Diff.Pcre.Nocase Diff.Pcre.Plain Diff.Pcre.Ungreedy
+sample bin "TRIG EvIl" bin => Diff.Pcre.Nocase
+sample bin "TRIG a\nb" bin => Diff.Pcre.Dotall
+sample bin "TRIG axb" bin => Diff.Pcre.Dotall Diff.Pcre.NoDotall
+sample bin "TRIG\nline\nmore" bin => Diff.Pcre.Multiline
+sample "line\nTRIG\x00\x00\x00\x00" => Diff.Pcre.Multiline
+sample bin "TRIG tail" => Diff.Pcre.DollarEnd Diff.Pcre.NoDollarEnd
+sample bin "TRIG tail\n" => Diff.Pcre.NoDollarEnd
+sample bin "TRIG tail\n\n" => OK
+sample bin "evil" bin => OK
+
+case pcre-offsets
+ldb Diff.Pcre.Exact;Engine:81-255,Target:0;0&1;54524947;20:0/evil/
+ldb Diff.Pcre.ExactShift;Engine:81-255,Target:0;0&1;54524947;20,4:0/evil/
+ldb Diff.Pcre.Rolling;Engine:81-255,Target:0;0&1;54524947;20:0/evil/r
+ldb Diff.Pcre.Encompass;Engine:81-255,Target:0;0&1;54524947;20,6:0/evil/e
+ldb Diff.Pcre.Anchored;Engine:81-255,Target:0;0&1;54524947;0/evil/A
+ldb Diff.Pcre.AnchoredOffset;Engine:81-255,Target:0;0&1;54524947;20:0/evil/A
+ldb Diff.Pcre.Eof;Engine:81-255,Target:0;0&1;54524947;EOF-12:0/evil/
+ldb Diff.Pcre.EncompassNoShift;Engine:81-255,Target:0;0&1;54524947;20:0/evil/e
+ldb Diff.Pcre.EncompassAny;Engine:81-255,Target:0;0&1;54524947;0/evil/e
+ldb Diff.Pcre.RollingAny;Engine:81-255,Target:0;0&1;54524947;0/evil/r
+sample bin "TRIG" 8*"x" "evil" bin => Diff.Pcre.AnchoredOffset Diff.Pcre.Encompass Diff.Pcre.EncompassAny Diff.Pcre.EncompassNoShift Diff.Pcre.Eof Diff.Pcre.Exact Diff.Pcre.ExactShift Diff.Pcre.Rolling Diff.Pcre.RollingAny
+sample bin "TRIG" 9*"x" "evil" bin => Diff.Pcre.Encompass Diff.Pcre.EncompassAny Diff.Pcre.Eof Diff.Pcre.ExactShift Diff.Pcre.Rolling Diff.Pcre.RollingAny
+sample bin "TRIG" 10*"x" "evil" bin => Diff.Pcre.Encompass Diff.Pcre.EncompassAny Diff.Pcre.Eof Diff.Pcre.ExactShift Diff.Pcre.Rolling Diff.Pcre.RollingAny
+sample bin "TRIG" 12*"x" "evil" bin => Diff.Pcre.EncompassAny Diff.Pcre.Eof Diff.Pcre.ExactShift Diff.Pcre.Rolling Diff.Pcre.RollingAny
+sample bin "TRIG" 13*"x" "evil" bin => Diff.Pcre.EncompassAny Diff.Pcre.Eof Diff.Pcre.Rolling Diff.Pcre.RollingAny
+sample bin "TRIG" 30*"x" "evil" bin => Diff.Pcre.EncompassAny Diff.Pcre.Eof Diff.Pcre.Rolling Diff.Pcre.RollingAny
+sample "evil" "TRIG" bin => Diff.Pcre.Anchored Diff.Pcre.EncompassAny Diff.Pcre.RollingAny
+sample bin "TRIG evil" bin => Diff.Pcre.EncompassAny Diff.Pcre.Eof Diff.Pcre.RollingAny
+
+case pcre-global
+ldb Diff.Pcre.Global2;Engine:81-255,Target:0;0&1>2;54524947;0/frag[0-9]/g
+ldb Diff.Pcre.NoGlobal2;Engine:81-255,Target:0;0&1>1;54524947;0/frag[0-9]/
+ldb Diff.Pcre.GlobalEq;Engine:81-255,Target:0;0&1=2;54524947;0/frag[0-9]/g
+ldb Diff.Pcre.GlobalOverlap;Engine:81-255,Target:0;0&1>1;54524947;0/aa/g
+ldb Diff.Pcre.GlobalAlt;Engine:81-255,Target:0;0&1=2;54524947;0/a|aba/g
+sample bin "TRIG frag1" bin => OK
+sample bin "TRIG frag1 frag2" bin => Diff.Pcre.GlobalAlt Diff.Pcre.GlobalEq
+sample bin "TRIG frag1 frag2 frag3" bin => Diff.Pcre.Global2
+sample bin "TRIG frag1frag2frag3frag4" bin => Diff.Pcre.Global2
+sample bin "TRIG aaa" bin => OK
+sample bin "TRIG aaaa" bin => Diff.Pcre.GlobalOverlap
+sample bin "TRIG aba" bin => Diff.Pcre.GlobalAlt
+sample bin "TRIG abab" bin => Diff.Pcre.GlobalAlt
+sample bin "TRIG ababa" bin => OK
+
+case pcre-triggers
+ldb Diff.Pcre.TrigAnd;Engine:81-255,Target:0;0&1&2;54524947;42424242;0&1/evil/
+ldb Diff.Pcre.TrigOr;Engine:81-255,Target:0;(0|1)&2;54524947;42424242;0|1/evil/
+ldb Diff.Pcre.TrigCount;Engine:81-255,Target:0;0&1;54524947;0>1/evil/
+ldb! Diff.Pcre.PcreOnly;Engine:81-255,Target:0;0&1;54524947;1/evil/
+ldb! Diff.Pcre.PcreOnlyFirst;Engine:81-255,Target:0;0;0/evil/
+ldb Diff.Pcre.TwoPcre;Engine:81-255,Target:0;0&1&2;54524947;0/evil/;0/good/
+ldb Diff.Pcre.ChainedTrigger;Engine:81-255,Target:0;0&1&2;54524947;0/evil/;1/good/
+sample bin "TRIG evil" bin => Diff.Pcre.TrigOr
+sample bin "BBBB evil" bin => Diff.Pcre.TrigOr
+sample bin "TRIG BBBB evil" bin => Diff.Pcre.TrigAnd Diff.Pcre.TrigOr
+sample bin "TRIG TRIG evil" bin => Diff.Pcre.TrigCount Diff.Pcre.TrigOr
+sample bin "TRIG evil good" bin => Diff.Pcre.ChainedTrigger Diff.Pcre.TrigOr Diff.Pcre.TwoPcre
+sample bin "TRIG good" bin => OK
+sample bin "evil" bin => OK
+
+case pcre-syntax
+ldb Diff.Pcre.Class;Engine:81-255,Target:0;0&1;54524947;0/\x90{4,}/
+ldb Diff.Pcre.RepAlt;Engine:81-255,Target:0;0&1;54524947;0/(?:\x90|\xcc){4,}/
+ldb Diff.Pcre.Lazy;Engine:81-255,Target:0;0&1;54524947;0/\[tag.+?\]/
+ldb Diff.Pcre.WordBoundary;Engine:81-255,Target:0;0&1;54524947;0/\bevil\b/
+ldb Diff.Pcre.Backref;Engine:81-255,Target:0;0&1;54524947;0/(ab)\1/
+ldb Diff.Pcre.Lookahead;Engine:81-255,Target:0;0&1;54524947;0/evil(?=!)/
+ldb Diff.Pcre.InlineNocase;Engine:81-255,Target:0;0&1;54524947;0/(?i)evil/
+ldb Diff.Pcre.NamedGroup;Engine:81-255,Target:0;0&1;54524947;0/(?P<x>ev)il/
+ldb! Diff.Pcre.BadFlag;Engine:81-255,Target:0;0&1;54524947;0/evil/q
+ldb! Diff.Pcre.Empty;Engine:81-255,Target:0;0&1;54524947;0//
+ldb Diff.Pcre.EscapedSlash;Engine:81-255,Target:0;0&1;54524947;0/a\/b/
+sample bin "TRIG \x90\x90\x90\x90" bin => Diff.Pcre.Class Diff.Pcre.RepAlt
+sample bin "TRIG \x90\xcc\x90\xcc" bin => Diff.Pcre.RepAlt
+sample bin "TRIG [tag type=x]" bin => Diff.Pcre.Lazy
+sample bin "TRIG an evil thing" bin => Diff.Pcre.InlineNocase Diff.Pcre.NamedGroup Diff.Pcre.WordBoundary
+sample bin "TRIG devil" bin => Diff.Pcre.InlineNocase Diff.Pcre.NamedGroup
+sample bin "TRIG abab" bin => Diff.Pcre.Backref
+sample bin "TRIG evil!" bin => Diff.Pcre.InlineNocase Diff.Pcre.Lookahead Diff.Pcre.NamedGroup Diff.Pcre.WordBoundary
+sample bin "TRIG EVIL" bin => Diff.Pcre.InlineNocase
+sample bin "TRIG a/b" bin => Diff.Pcre.EscapedSlash

@@ -1,0 +1,12 @@
+# Hash signatures (.hdb .hsb .mdb .msb .imp) and allowlists (.fp .sfp). The digests are of the
+# samples below: md5/sha1/sha256 of `bin "hash me" bin` (23 bytes).
+
+case hash-file
+hdb e6765b0d9f6d1dc1a66474e9b2ce7076:23:Diff.Hash.Md5
+hsb c41f6d2d3b8ea1ca30bfac2b8e8e8305c20e3b82:23:Diff.Hash.Sha1
+hsb 3c4e94a8ac793d1ee05efc4d40aa08f61f0ecfcc41f44a94f81280a207782345:23:Diff.Hash.Sha256
+hdb e6765b0d9f6d1dc1a66474e9b2ce7076:*:Diff.Hash.Md5AnySize:73
+hdb e6765b0d9f6d1dc1a66474e9b2ce7076:24:Diff.Hash.WrongSize
+hdb! e6765b0d9f6d1dc1a66474e9b2ce7076:*:Diff.Hash.AnySizeNoFlevel
+sample bin "hash me" bin => Diff.Hash.Md5 Diff.Hash.Md5AnySize Diff.Hash.Sha1 Diff.Hash.Sha256
+sample bin "hash mf" bin => OK

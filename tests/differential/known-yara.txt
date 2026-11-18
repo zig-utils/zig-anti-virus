@@ -1,0 +1,12 @@
+# Known differences between zav and yara on the YARA rules of the differential cases
+# (tools/diff/yara_check.py). Format as in known.txt: CASE sN|sigN zav=RESULT  # reason
+#
+# xor without a range is 256 keys; zav expands at most 16 (yara_xor_range).
+yara-xor sig1 zav=REJECTS
+# Rules without strings: zav's YARA subset evaluates conditions over string matches only
+# (yara_no_strings).
+yara-no-strings sig1 zav=REJECTS
+# Outside zav's YARA subset by design: for loops, entrypoint, strings under two bytes.
+yara-unsupported sig2 zav=REJECTS
+yara-unsupported sig3 zav=REJECTS
+yara-unsupported sig4 zav=REJECTS

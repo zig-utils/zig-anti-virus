@@ -11,3 +11,38 @@ hex-bracket-before-far s5 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.F
 # ~aa and ~a? are documented for functionality level 240; libclamav 1.5 does not parse them yet.
 hex-negated-nibble sig1 zav=LOADS
 hex-negated-nibble sig2 zav=LOADS
+# PCRE through zig-regex byte mode (E13, #36). zig-regex reports leftmost-longest match ends where
+# PCRE is leftmost-first, which changes /g counts for patterns like a|aba.
+pcre-global s7 zav=OK
+pcre-global s8 zav=OK
+pcre-global s9 zav=Diff.Pcre.GlobalAlt
+# zig-regex's $ matches only at the end; PCRE's default (no E flag) also matches before a final LF.
+pcre-basic s8 zav=OK
+# Backreferences and lookaround need a backtracker; zav compiles only allocation-free byte-mode
+# programs and refuses them (regex_unsupported), so these signatures never load.
+pcre-syntax sig5 zav=REJECTS
+pcre-syntax sig6 zav=REJECTS
+# A leading inline flag group ((?i)) is a scoped modifier to zig-regex 0.3.1 (regex_unsupported).
+pcre-syntax sig7 zav=REJECTS
+# YARA: zav follows yara (tools/diff/yara_check.py checks zav against it), and libclamav's YARA
+# support differs from yara here:
+# - it refuses a hex string without two literal bytes in a row, which yara accepts;
+yara-hex sig7 zav=LOADS
+# - it ignores the regex modifiers i and s;
+yara-regex s2 zav=YARA.RegexNocase
+yara-regex s3 zav=YARA.RegexDotall
+# - it misreads hex literals of 2^31 and up and has no uint16be;
+yara-reads s1 zav=YARA.ReadUint16Be YARA.ReadUint32 YARA.ReadUint8
+# - it loads xor strings and never matches them; zav refuses xor over all 256 keys and expands
+#   a range, as yara does;
+yara-xor sig1 zav=REJECTS
+yara-xor s2 zav=YARA.XorRange
+yara-xor s3 zav=YARA.XorRange
+# - it loads rules without strings and never fires them (yara fires them); zav refuses them.
+yara-no-strings sig1 zav=REJECTS
+# Outside zav's YARA subset (modules, for loops, entrypoint, one-byte strings): refused with a
+# reason. pe.* is refused by yara too unless the module is imported.
+yara-unsupported sig1 zav=REJECTS
+yara-unsupported sig2 zav=REJECTS
+yara-unsupported sig3 zav=REJECTS
+yara-unsupported sig4 zav=REJECTS

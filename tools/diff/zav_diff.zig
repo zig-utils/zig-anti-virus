@@ -648,6 +648,9 @@ fn findKnown(known: []Known, case: []const u8, idx: usize) ?*Known {
 
 fn check(app: App, args: []const []const u8) !u8 {
     var tmp_path: []const u8 = ".zav-diff-tmp";
+    // --print: also write zav's own verdicts (`LOAD case sigN LOADS|REJECTS`, `RESULT case sN
+    // names`) for every signature zav loads, for comparisons with other engines (yara).
+    var print = false;
     var known_path: ?[]const u8 = null;
     var paths: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
@@ -658,6 +661,8 @@ fn check(app: App, args: []const []const u8) !u8 {
         } else if (std.mem.eql(u8, args[i], "--known") and i + 1 < args.len) {
             i += 1;
             known_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--print")) {
+            print = true;
         } else try paths.append(app.arena, args[i]);
     }
     const cases = try loadCases(app, paths.items);
@@ -678,6 +683,11 @@ fn check(app: App, args: []const []const u8) !u8 {
         // results[sample] = names zav found.
         const results = try app.arena.alloc(std.ArrayList([]const u8), case.samples.items.len);
         for (results) |*r| r.* = .empty;
+        const own = try app.arena.alloc(std.ArrayList([]const u8), case.samples.items.len);
+        for (own) |*r| r.* = .empty;
+        // Signatures zav refuses as a listed known difference: their matches are left out of
+        // the expectations, since the refusal is the difference.
+        var excused: std.ArrayList([]const u8) = .empty;
         for (case.sigs.items, 0..) |sig, si| {
             if (sig.isContext() and !sig.rejected) continue;
             const compiled = try compileSig(app, tmp, "sig.zavdb", case, sig);
@@ -691,6 +701,7 @@ fn check(app: App, args: []const []const u8) !u8 {
                     k.used = true;
                     if (std.mem.eql(u8, k.zav, got)) {
                         known_hits += 1;
+                        if (compiled.rejected) try excused.append(app.arena, try app.arena.dupe(u8, sig_name));
                     } else {
                         failures += 1;
                         try app.out.print("FAIL {s} sig{d} ({s}:{d}): known says zav={s}, zav {s}\n", .{ case.name, si + 1, case.file, sig.line, k.zav, got });
@@ -708,22 +719,36 @@ fn check(app: App, args: []const []const u8) !u8 {
                     try app.out.print("FAIL {s} sig{d}: listed as a known difference, but zav now agrees\n", .{ case.name, si + 1 });
                 }
             }
-            if (compiled.rejected or sig.rejected) continue;
+            if (print) try app.out.print("LOAD {s} sig{d} {s}\n", .{ case.name, si + 1, if (compiled.rejected) "REJECTS" else "LOADS" });
+            if (compiled.rejected or (sig.rejected and !print)) continue;
             var engine = try Engine.open(app.gpa, app.io, tmp, compiled.path);
             defer engine.close(app.gpa);
-            for (case.samples.items, results) |sample, *r| {
-                switch (try scanner.scan(&engine, sample.bytes)) {
-                    .clean => {},
-                    .found => try r.append(app.arena, try app.arena.dupe(u8, sig_name)),
-                    .limited => |ev| try r.append(app.arena, try std.fmt.allocPrint(app.arena, "LIMITED({t})", .{ev})),
-                }
+            for (case.samples.items, results, own) |sample, *r, *o| {
+                const name: ?[]const u8 = switch (try scanner.scan(&engine, sample.bytes)) {
+                    .clean => null,
+                    .found => try app.arena.dupe(u8, sig_name),
+                    .limited => |ev| try std.fmt.allocPrint(app.arena, "LIMITED({t})", .{ev}),
+                };
+                const n = name orelse continue;
+                try o.append(app.arena, n);
+                if (!sig.rejected) try r.append(app.arena, n);
             }
         }
+        if (print) for (own, 0..) |*o, n| {
+            std.mem.sort([]const u8, o.items, {}, lessString);
+            try app.out.print("RESULT {s} s{d} {s}\n", .{ case.name, n + 1, try joinResult(app.arena, o.items) });
+        };
         for (case.samples.items, results, 0..) |sample, *r, n| {
             total += 1;
             std.mem.sort([]const u8, r.items, {}, lessString);
             const got = try joinResult(app.arena, r.items);
-            const want = try joinResult(app.arena, sample.expect);
+            var expect: std.ArrayList([]const u8) = .empty;
+            for (sample.expect) |name| {
+                for (excused.items) |e| {
+                    if (std.mem.eql(u8, e, name)) break;
+                } else try expect.append(app.arena, name);
+            }
+            const want = try joinResult(app.arena, expect.items);
             const same = std.mem.eql(u8, got, want);
             const k = findKnown(known.items, case.name, n + 1);
             if (k) |kk| kk.used = true;

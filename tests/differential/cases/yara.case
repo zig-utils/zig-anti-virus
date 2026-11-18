@@ -1,0 +1,93 @@
+# YARA rules as libclamav runs them: text, hex and regex strings with their modifiers, and the
+# condition forms zav supports. clamscan names a rule YARA.<rule>.
+
+case yara-text
+yara rule Text { strings: $a = "evilcode" condition: $a }
+yara rule TextNocase { strings: $a = "evilcode" nocase condition: $a }
+yara rule TextWide { strings: $a = "evilcode" wide condition: $a }
+yara rule TextWideAscii { strings: $a = "evilcode" wide ascii condition: $a }
+yara rule TextFullword { strings: $a = "evilcode" fullword condition: $a }
+yara rule TextEscape { strings: $a = "evil\x00code" condition: $a }
+sample bin "evilcode" bin => YARA.Text YARA.TextFullword YARA.TextNocase YARA.TextWideAscii
+sample bin "EVILCODE" bin => YARA.TextNocase
+sample bin "e\0v\0i\0l\0c\0o\0d\0e\0" bin => YARA.TextWide YARA.TextWideAscii
+sample bin "xevilcodex" bin => YARA.Text YARA.TextNocase YARA.TextWideAscii
+sample bin " evilcode " bin => YARA.Text YARA.TextFullword YARA.TextNocase YARA.TextWideAscii
+sample bin "evil\0code" bin => YARA.TextEscape
+
+case yara-hex
+yara rule Hex { strings: $a = { 45 56 49 4C 43 4F 44 45 } condition: $a }
+yara rule HexWild { strings: $a = { 45 56 ?? 4C 43 4F 44 45 } condition: $a }
+yara rule HexNibble { strings: $a = { 45 56 4? 4C 43 4F 44 45 } condition: $a }
+yara rule HexJump { strings: $a = { 45 56 49 4C [2-4] 43 4F 44 45 } condition: $a }
+yara rule HexJumpOpen { strings: $a = { 45 56 49 4C [2-] 43 4F 44 45 } condition: $a }
+yara rule HexAlt { strings: $a = { 45 56 ( 49 | 58 ) 4C 43 4F 44 45 } condition: $a }
+yara! rule HexShort { strings: $a = { 45 ?? 56 } condition: $a }
+sample bin "EVILCODE" bin => YARA.Hex YARA.HexAlt YARA.HexNibble YARA.HexWild
+sample bin "EVXLCODE" bin => YARA.HexAlt YARA.HexWild
+sample bin "EVAL CODE" bin => OK
+sample bin "EVILxxCODE" bin => YARA.HexJump YARA.HexJumpOpen
+sample bin "EVILxxxxxCODE" bin => YARA.HexJumpOpen
+sample bin "E.V" bin => OK
+
+case yara-regex
+yara rule Regex { strings: $a = /ev[a-z]lcode/ condition: $a }
+yara rule RegexNocase { strings: $a = /ev[a-z]lcode/i condition: $a }
+yara rule RegexDotall { strings: $a = /evil.code/s condition: $a }
+yara rule RegexAlt { strings: $a = /(evil|good)code/ condition: $a }
+yara rule RegexRepeat { strings: $a = /e(v|w){1,3}ilcode/ condition: $a }
+sample bin "evilcode" bin => YARA.Regex YARA.RegexAlt YARA.RegexNocase YARA.RegexRepeat
+sample bin "EviLCODE" bin => OK
+sample bin "evil\ncode" bin => OK
+sample bin "goodcode" bin => YARA.RegexAlt
+sample bin "evvvilcode" bin => YARA.RegexRepeat
+
+case yara-conditions
+yara rule CondAnd { strings: $a = "evilcode" $b = "goodcode" condition: $a and $b }
+yara rule CondOr { strings: $a = "evilcode" $b = "goodcode" condition: $a or $b }
+yara rule CondNot { strings: $a = "evilcode" $b = "goodcode" condition: $a and not $b }
+yara rule CondCount { strings: $a = "evilcode" condition: #a >= 2 }
+yara rule CondCountEq { strings: $a = "evilcode" condition: #a == 1 }
+yara rule CondAt { strings: $a = "evilcode" condition: $a at 8 }
+yara rule CondIn { strings: $a = "evilcode" condition: $a in (0..10) }
+yara rule CondOffset { strings: $a = "evilcode" condition: @a[1] == 8 }
+yara rule CondAnyOf { strings: $a = "evilcode" $b = "goodcode" $c = "badcode!" condition: any of them }
+yara rule CondTwoOf { strings: $a = "evilcode" $b = "goodcode" $c = "badcode!" condition: 2 of them }
+yara rule CondAllOf { strings: $a = "evilcode" $b = "goodcode" condition: all of them }
+yara rule CondFilesize { strings: $a = "evilcode" condition: $a and filesize < 30 }
+yara rule CondArith { strings: $a = "evilcode" condition: $a and (@a[1] + 8) == 16 }
+sample bin "evilcode" bin => YARA.CondAnyOf YARA.CondArith YARA.CondAt YARA.CondCountEq YARA.CondFilesize YARA.CondIn YARA.CondNot YARA.CondOffset YARA.CondOr
+sample bin "goodcode" bin => YARA.CondAnyOf YARA.CondOr
+sample bin "evilcode goodcode" bin => YARA.CondAllOf YARA.CondAnd YARA.CondAnyOf YARA.CondArith YARA.CondAt YARA.CondCountEq YARA.CondIn YARA.CondOffset YARA.CondOr YARA.CondTwoOf
+sample bin "evilcode evilcode" bin => YARA.CondAnyOf YARA.CondArith YARA.CondAt YARA.CondCount YARA.CondIn YARA.CondNot YARA.CondOffset YARA.CondOr
+sample bin "xxevilcode" bin => YARA.CondAnyOf YARA.CondCountEq YARA.CondFilesize YARA.CondIn YARA.CondNot YARA.CondOr
+sample bin "evilcode badcode!" bin => YARA.CondAnyOf YARA.CondArith YARA.CondAt YARA.CondCountEq YARA.CondIn YARA.CondNot YARA.CondOffset YARA.CondOr YARA.CondTwoOf
+sample bin "evilcode" 20*"x" bin => YARA.CondAnyOf YARA.CondArith YARA.CondAt YARA.CondCountEq YARA.CondIn YARA.CondNot YARA.CondOffset YARA.CondOr
+
+case yara-unsupported
+yara rule UsesPe { strings: $a = "evilcode" condition: $a and pe.number_of_sections > 0 }
+yara rule UsesFor { strings: $a = "evilcode" condition: for any i in (1..#a): (@a[i] > 0) }
+yara rule UsesEntrypoint { strings: $a = "evilcode" condition: $a and entrypoint > 0 }
+yara rule ShortString { strings: $a = "e" condition: $a }
+sample bin "evilcode" bin => YARA.UsesFor
+
+case yara-reads
+# yara reads integers from the file; libclamav's YARA does not implement uintN.
+yara rule ReadUint32 { strings: $a = "evilcode" condition: $a and uint32(0) == 0xefbeadde }
+yara rule ReadUint16Be { strings: $a = "evilcode" condition: $a and uint16be(0) == 0xdead }
+yara rule ReadUint8 { strings: $a = "evilcode" condition: $a and uint8(8) == 0x65 }
+yara rule ReadMismatch { strings: $a = "evilcode" condition: $a and uint8(0) == 0x00 }
+sample bin "evilcode" bin => YARA.ReadUint8
+
+case yara-xor
+# libclamav loads xor strings and never matches them.
+yara rule Xor { strings: $a = "evilcode" xor condition: $a }
+yara rule XorRange { strings: $a = "evilcode" xor(1-3) condition: $a }
+sample bin "evilcode" bin => OK
+sample bin "\x64\x77\x68\x6d\x62\x6e\x65\x64" bin => OK
+sample bin "\x66\x75\x6a\x6f\x60\x6c\x67\x66" bin => OK
+sample bin "\x28\x3b\x24\x21\x2e\x22\x29\x28" bin => OK
+
+case yara-no-strings
+yara rule NoStrings { condition: filesize > 0 }
+sample bin "evilcode" bin => OK
