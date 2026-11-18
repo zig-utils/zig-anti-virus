@@ -85,11 +85,12 @@ pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source_name: []co
         p.skip();
         if (p.pos >= p.src.len) break;
         const start = p.pos;
+        p.why = .yara_unsupported;
         if (parseTop(&p)) |maybe| {
             if (maybe) |rule| try out.rules.append(gpa, rule);
         } else |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            try out.rejected.append(gpa, .{ .source_name = source_name, .line_number = lineOf(text, start), .reason = reasonOf(err), .column = @intCast(p.err_pos -| lineStart(text, p.err_pos)) });
+            try out.rejected.append(gpa, .{ .source_name = source_name, .line_number = lineOf(text, start), .reason = if (err == error.YaraUnsupported) p.why else reasonOf(err), .column = @intCast(p.err_pos -| lineStart(text, p.err_pos)) });
             p.recover(start);
         }
     }
@@ -119,6 +120,7 @@ fn parseTop(p: *Parser) ParseError!?Rule {
         p.pos += word.len;
         p.skip();
         _ = p.quoted() catch {};
+        p.why = .yara_include;
         return error.YaraUnsupported;
     }
     return try parseRule(p);
@@ -129,10 +131,18 @@ const Parser = struct {
     pos: usize = 0,
     arena: std.mem.Allocator,
     err_pos: usize = 0,
+    /// Which construct a YaraUnsupported refusal is about.
+    why: ir.Reason = .yara_unsupported,
 
     fn fail(p: *Parser, err: ParseError) ParseError {
         p.err_pos = p.pos;
         return err;
+    }
+
+    /// Refuse a construct outside the subset, naming it.
+    fn unsupported(p: *Parser, why: ir.Reason) ParseError {
+        p.why = why;
+        return p.fail(error.YaraUnsupported);
     }
 
     /// Skip whitespace and comments.
@@ -289,7 +299,7 @@ fn parseRule(p: *Parser) ParseError!Rule {
             private = true;
             p.skip();
         } else if (std.mem.eql(u8, w, "global")) {
-            return p.fail(error.YaraUnsupported);
+            return p.unsupported(.yara_global);
         } else break;
     }
     if (!p.keyword("rule")) return p.fail(error.YaraSyntax);
@@ -330,7 +340,8 @@ fn parseRule(p: *Parser) ParseError!Rule {
             p.pos += 1;
             const id = p.peekWord();
             p.pos += id.len;
-            if (id.len == 0) return p.failAt(id_start, error.YaraUnsupported);
+            // An anonymous string (`$ = ...`) keeps the empty name: `them` and `($*)` reach it,
+            // and naming it in a condition needs `for`, which is refused there.
             if (defs.items.len == max_strings) return p.failAt(id_start, error.YaraTooManyStrings);
             try p.expect("=");
             const def = try parseString(p);
@@ -415,13 +426,16 @@ fn parseText(p: *Parser) ParseError!StringDef {
             xor = range;
             continue;
         } else if (std.mem.eql(u8, w, "base64") or std.mem.eql(u8, w, "base64wide")) {
-            return p.fail(error.YaraUnsupported);
+            return p.unsupported(.yara_base64);
         } else break;
         p.pos += w.len;
     }
     // A string with wide and without ascii is wide only; ascii is the default otherwise.
     if (xor) |range| {
-        if (mods.nocase) return p.failAt(at, error.YaraUnsupported); // YARA forbids xor with nocase
+        if (mods.nocase) { // YARA forbids xor with nocase
+            p.why = .yara_xor_nocase;
+            return p.failAt(at, error.YaraUnsupported);
+        }
         if (@as(usize, range[1]) - range[0] + 1 > max_xor_keys) return p.failAt(at, error.YaraXorRange);
         var variants: std.ArrayList(hexsig.Variant) = .empty;
         const encodings: []const bool = if (mods.wide and mods.ascii) &.{ false, true } else if (mods.wide) &.{true} else &.{false};
@@ -521,7 +535,7 @@ fn parseRegex(p: *Parser) ParseError!StringDef {
         if (std.mem.eql(u8, w, "nocase")) {
             flags.case_insensitive = true;
         } else if (std.mem.eql(u8, w, "ascii") or std.mem.eql(u8, w, "private")) {} else if (std.mem.eql(u8, w, "wide") or std.mem.eql(u8, w, "fullword")) {
-            return p.fail(error.YaraUnsupported);
+            return p.unsupported(.yara_regex_modifier);
         } else break;
         p.pos += w.len;
     }
@@ -547,13 +561,13 @@ const Cond = struct {
     depth: usize = 0,
 
     fn emit(c: *Cond, code: yc.CondCode, str: u8, k: i64) ParseError!void {
-        if (c.ops.items.len >= yc.max_ops) return c.p.fail(error.YaraUnsupported);
+        if (c.ops.items.len >= yc.max_ops) return c.p.unsupported(.yara_condition_size);
         try c.ops.append(c.p.arena, .{ .code = code, .str = str, .k = k });
     }
 
     fn nest(c: *Cond) ParseError!void {
         c.depth += 1;
-        if (c.depth > yc.max_depth) return c.p.fail(error.YaraUnsupported);
+        if (c.depth > yc.max_depth) return c.p.unsupported(.yara_condition_size);
     }
 
     fn orExpr(c: *Cond) ParseError!void {
@@ -597,7 +611,7 @@ const Cond = struct {
             }
         }
         for ([_][]const u8{ "contains", "icontains", "matches", "startswith", "endswith", "iequals" }) |k| {
-            if (c.p.keyword(k)) return c.p.fail(error.YaraUnsupported);
+            if (c.p.keyword(k)) return c.p.unsupported(.yara_string_operator);
         }
     }
 
@@ -662,7 +676,7 @@ const Cond = struct {
     fn sigil(c: *Cond, s: u8) ParseError![]const u8 {
         c.p.pos += 1; // the sigil
         const name = c.p.peekWord();
-        if (name.len == 0) return c.p.fail(error.YaraUnsupported); // anonymous strings need `for`
+        if (name.len == 0) return c.p.unsupported(.yara_anonymous_string); // they need `for`
         c.p.pos += name.len;
         _ = s;
         return name;
@@ -697,7 +711,7 @@ const Cond = struct {
             },
             '#' => {
                 const idx = try c.stringIndex(try c.sigil('#'));
-                if (p.keyword("in")) return p.fail(error.YaraUnsupported);
+                if (p.keyword("in")) return p.unsupported(.yara_count_in);
                 return c.emit(.count, idx, 0);
             },
             '@' => {
@@ -708,7 +722,7 @@ const Cond = struct {
                 } else try c.emit(.push, 0, 1);
                 return c.emit(.offset, idx, 0);
             },
-            '!' => return p.fail(error.YaraUnsupported),
+            '!' => return p.unsupported(.yara_string_length),
             '0'...'9' => {
                 const n = try p.integer();
                 if (p.keyword("of")) return c.quantifier(.{ .at_least = n });
@@ -752,6 +766,10 @@ const Cond = struct {
             });
         }
         // `for` loops, `entrypoint`, module identifiers and references to other rules.
+        if (std.mem.eql(u8, w, "for")) return p.unsupported(.yara_for);
+        if (std.mem.eql(u8, w, "entrypoint")) return p.unsupported(.yara_entrypoint);
+        if (w.len > 0 and p.pos + w.len < p.src.len and p.src[p.pos + w.len] == '.') return p.unsupported(.yara_module);
+        if (w.len > 0) return p.unsupported(.yara_rule_reference);
         return p.fail(error.YaraUnsupported);
     }
 
@@ -771,7 +789,7 @@ const Cond = struct {
             try p.expect("(");
             while (true) {
                 p.skip();
-                if (p.pos >= p.src.len or p.src[p.pos] != '$') return p.fail(error.YaraUnsupported); // rule sets
+                if (p.pos >= p.src.len or p.src[p.pos] != '$') return p.unsupported(.yara_rule_set);
                 p.pos += 1;
                 const name = p.peekWord();
                 p.pos += name.len;
@@ -791,7 +809,7 @@ const Cond = struct {
             }
             try p.expect(")");
         }
-        if (p.keyword("at") or p.keyword("in")) return p.fail(error.YaraUnsupported);
+        if (p.keyword("at") or p.keyword("in")) return p.unsupported(.yara_of_at);
         for (set[0..n], 0..) |s, i| {
             try c.emit(.found, s, 0);
             if (i > 0) try c.emit(.add, 0, 0);
@@ -905,9 +923,9 @@ test "rejections carry reasons and parsing resumes at the next rule" {
     try testing.expectEqual(@as(usize, 1), rules.items.len);
     try testing.expectEqualStrings("Good", rules.items[0].name);
     const want = [_]ir.Reason{
-        .yara_unsupported, .yara_unsupported, .yara_unsupported,    .yara_unsupported, .yara_short_string,
-        .yara_no_strings,  .yara_xor_range,   .yara_unsupported,    .yara_unsupported, .regex_syntax,
-        .regex_lookaround, .yara_unsupported, .hex_bad_alternation, .yara_syntax,      .yara_unsupported,
+        .yara_module,      .yara_global,          .yara_for,            .yara_rule_reference, .yara_short_string,
+        .yara_no_strings,  .yara_xor_range,       .yara_base64,         .yara_regex_modifier, .regex_syntax,
+        .regex_lookaround, .yara_string_operator, .hex_bad_alternation, .yara_syntax,         .yara_include,
     };
     try testing.expectEqual(want.len, rejected.items.len);
     for (want, rejected.items, 1..) |w, r, line| {

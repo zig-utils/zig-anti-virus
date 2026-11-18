@@ -282,6 +282,15 @@ miss -> read first 4 KiB -> file-type trie
 - zstd and xz/LZMA are capped at 8 MiB by default.
 - Any window over 1 MiB takes a token from a global 64 MiB big-window budget.
 
+**Normalisers** (measured against libclamav 1.5.4 with `tools/diff/norm.py`, throughput from
+`zig build bench`, arm64 macOS):
+- HTML (target 3): nocomment.html and notags.html byte-identical on 702 of 702 local HTML files
+  and 1,800 generated stress documents; 156 MB/s producing both from 1 MiB of markup [M]. The
+  JavaScript form follows the JS normaliser (P5.13).
+- Text (target 7): byte-identical including libclamav's buffer seams; 1,569 MB/s [M].
+- File typing: 11,999 of 11,999 local system files and the realdb job's 10,000 Linux files get
+  the root type `clamscan --gen-json --debug` reports (`tools/diff/ftm_check.py`) [M].
+
 **Order of formats:**
 1. gzip, zip, tar, bzip2, xz, zstd, OOXML, MIME, PE, ELF, Mach-O, HTML and ASCII normalisers.
 2. OLE2/VBA, PDF, JS, RTF, CPIO, 7z.

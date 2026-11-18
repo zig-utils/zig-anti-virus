@@ -91,3 +91,13 @@ sample bin "\x28\x3b\x24\x21\x2e\x22\x29\x28" bin => OK
 case yara-no-strings
 yara rule NoStrings { condition: filesize > 0 }
 sample bin "evilcode" bin => OK
+
+case yara-anonymous
+yara rule AnonAny { strings: $ = "alphastr" $ = "bravostr" condition: any of them }
+yara rule AnonAll { strings: $ = "alphastr" $ = "bravostr" condition: all of them }
+yara rule AnonMixed { strings: $a = "charlie1" $ = "alphastr" condition: $a and any of ($*) }
+yara rule AnonCount { strings: $ = "alphastr" $ = "bravostr" $ = "charlie1" condition: 2 of them }
+sample bin "xx alphastr xx" bin => YARA.AnonAny
+sample bin "alphastr bravostr" bin => YARA.AnonAll YARA.AnonAny YARA.AnonCount
+sample bin "charlie1 alphastr" bin => YARA.AnonAny YARA.AnonCount YARA.AnonMixed
+sample bin "nothing here at all" bin => OK

@@ -141,7 +141,34 @@ pub const Reason = enum(u8) {
     regex_too_large,
     // YARA rules.
     yara_syntax,
+    /// A YARA construct outside the subset that none of the named reasons below covers.
     yara_unsupported,
+    yara_include,
+    yara_global,
+    /// Module identifiers (`pe.number_of_sections`, `math.entropy(...)`).
+    yara_module,
+    /// A condition naming another rule.
+    yara_rule_reference,
+    yara_for,
+    yara_entrypoint,
+    /// Anonymous strings (`$`) or the anonymous `$` in a condition.
+    yara_anonymous_string,
+    yara_base64,
+    yara_xor_nocase,
+    /// `contains`, `matches`, `startswith` and the other string operators.
+    yara_string_operator,
+    /// `#a in (lo..hi)`.
+    yara_count_in,
+    /// `!a`, a match length.
+    yara_string_length,
+    /// `of (rule, ...)`: rule sets.
+    yara_rule_set,
+    /// `N of (...) at` / `in`.
+    yara_of_at,
+    /// A condition over YARA_COND's operation or depth limits.
+    yara_condition_size,
+    /// `wide` or `fullword` on a regex string.
+    yara_regex_modifier,
     yara_short_string,
     yara_no_strings,
     yara_xor_range,
