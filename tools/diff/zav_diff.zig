@@ -394,6 +394,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "info")) return infoCmd(app, rest);
     if (std.mem.eql(u8, cmd, "normalize")) return normalizeCmd(app, rest);
     if (std.mem.eql(u8, cmd, "types")) return typesCmd(app, rest);
+    if (std.mem.eql(u8, cmd, "vba")) return vbaCmd(app, rest);
     if (std.mem.eql(u8, cmd, "roundtrip")) return roundtripCmd(app, rest);
     return usage(app);
 }
@@ -905,6 +906,76 @@ fn typesCmd(app: App, args: []const []const u8) !u8 {
         defer app.gpa.free(data);
         const t = engine.fileType(data) orelse .binary_data;
         try app.out.print("{s}\t{s}\n", .{ std.fs.path.basename(path), t.name(&name_buf) catch "?" });
+    }
+    return 0;
+}
+
+/// `vba FILE...`: the VBA module sources zav's OLE2 parser extracts (the walker's `macro/<name>`
+/// children), one `FILE<TAB>STREAM<TAB>HEX` line per module, STREAM as olevba names it
+/// (`Macros/VBA/Module1`). For tools/diff/vba_check.py.
+fn vbaCmd(app: App, args: []const []const u8) !u8 {
+    const engine = zav.engine;
+    const Collect = struct {
+        gpa: std.mem.Allocator,
+        current: ?std.ArrayList(u8) = null,
+        path: []const u8 = "",
+        out: *Io.Writer,
+        file: []const u8,
+
+        fn visitor(c: *@This()) engine.container.Visitor {
+            return .{ .ptr = c, .vtable = &.{ .enter = enter, .data = data, .leave = leave, .notice = notice } };
+        }
+        fn isMacro(obj: *const engine.container.Object) bool {
+            return obj.kind == .script and std.mem.startsWith(u8, obj.name, "macro/");
+        }
+        fn enter(ptr: *anyopaque, obj: *const engine.container.Object) error{Stop}!void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            if (!isMacro(obj)) return;
+            c.current = .empty;
+            c.path = c.gpa.dupe(u8, obj.path) catch return error.Stop;
+        }
+        fn data(ptr: *anyopaque, obj: *const engine.container.Object, bytes: []const u8) error{Stop}!void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            if (!isMacro(obj)) return;
+            if (c.current) |*l| l.appendSlice(c.gpa, bytes) catch return error.Stop;
+        }
+        fn leave(ptr: *anyopaque, obj: *const engine.container.Object) void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            if (!isMacro(obj)) return;
+            var l = c.current orelse return;
+            defer l.deinit(c.gpa);
+            defer c.gpa.free(c.path);
+            c.current = null;
+            // "<file>/Macros/VBA/macro/Module1" is olevba's "Macros/VBA/Module1".
+            var rel = c.path;
+            if (std.mem.indexOfScalar(u8, rel, '/')) |i| rel = rel[i + 1 ..];
+            const cut = std.mem.lastIndexOf(u8, rel, "macro/") orelse return;
+            c.out.print("{s}\t{s}{s}\t", .{ c.file, rel[0..cut], rel[cut + "macro/".len ..] }) catch return;
+            for (l.items) |b| c.out.print("{x:0>2}", .{b}) catch return;
+            c.out.writeAll("\n") catch return;
+        }
+        fn notice(_: *anyopaque, _: engine.container.Notice) void {}
+    };
+    var scratch = try engine.scratch.Scratch.init(256 * 1024 * 1024);
+    defer scratch.deinit();
+    var budget = engine.budget.Budget.init(64 * 1024 * 1024);
+    const cwd = Io.Dir.cwd();
+    for (args) |path| {
+        const bytes = cwd.readFileAlloc(app.io, path, app.gpa, .limited(1 << 30)) catch continue;
+        defer app.gpa.free(bytes);
+        var tracker = engine.limits.Tracker.init(.{});
+        var c: Collect = .{ .gpa = app.gpa, .out = app.out, .file = path };
+        var w: engine.container.Walker = .{
+            .io = app.io,
+            .scratch = &scratch,
+            .tracker = &tracker,
+            .budget = &budget,
+            .spill_dir = cwd,
+            .visitor = c.visitor(),
+            .parse = zav.fmt.scan.parse,
+        };
+        w.scan(.{ .memory = bytes }, std.fs.path.basename(path)) catch {};
+        scratch.reset();
     }
     return 0;
 }
