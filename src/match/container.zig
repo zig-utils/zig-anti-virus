@@ -127,7 +127,7 @@ pub const CdbTable = struct {
     /// be decided is reported, never taken as no match: `error.RegexBudget` when a regex search
     /// ran out of steps (or there is no scratch), `error.UnknownContainerSize` when a record
     /// constrains the container size and the container is a stream of unknown length.
-    pub fn check(t: CdbTable, m: Member, scratch: ?*regex.Scratch) error{ RegexBudget, UnknownContainerSize }!?u32 {
+    pub fn check(t: CdbTable, m: Member, scratch: ?*regex_pool.Scratch) error{ RegexBudget, UnknownContainerSize }!?u32 {
         var limited = false;
         var unknown_size = false;
         for (t.records) |rec| {
@@ -221,10 +221,9 @@ test "member checks: every field, wildcards, the ZIP/RAR CRC rule and filename r
     defer gpa.free(image);
     @memcpy(image, bytes);
     const t = try CdbTable.init(image, pool);
-    const capacity = pool.capacity(64);
-    const mem = try gpa.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
+    const mem = try gpa.alignedAlloc(u8, .@"8", pool.scratchBytes(64));
     defer gpa.free(mem);
-    var scratch = try regex.Scratch.initBuffer(mem, capacity);
+    var scratch = try regex_pool.Scratch.initBuffer(mem, pool, 64);
 
     const zip: Member = .{ .container_type = .zip, .container_size = 150, .name = "a.exe", .size_in_container = 50, .size_real = 70, .encrypted = true, .position = 3, .crc = 0x8a4f1c2e };
     try std.testing.expectEqual(@as(?u32, 10), try t.check(zip, &scratch));
@@ -256,9 +255,9 @@ test "member checks: every field, wildcards, the ZIP/RAR CRC rule and filename r
     m.name = "x.pif";
     try std.testing.expectError(error.RegexBudget, t.check(m, null));
     // A regex search that runs out of steps is a limit too.
-    scratch.step_budget = 1;
+    scratch.linear.step_budget = 1;
     try std.testing.expectError(error.RegexBudget, t.check(m, &scratch));
-    scratch.step_budget = null;
+    scratch.linear.step_budget = null;
 
     // A container size the record needs but a stream does not tell: undecided, reported.
     m = zip;

@@ -1,0 +1,13 @@
+# Known differences on the cases tools/diff/realdb.py generates from the real databases (case
+# names follow the signature, so entries stay valid while other signatures change).
+#
+# libclamav stops a PCRE search at PCRE2's match and depth limits (MaxPCREMatchLimit 100,000,
+# MaxPCRERecMatchLimit 2,000 by default) and treats that as no match. These two repeat a group
+# with a backreference 1,000 and 750 times; on the samples with longer whitespace runs the search
+# needs more than the limits allow. With --pcre-match-limit and --pcre-recmatch-limit raised to
+# 100,000,000 clamscan matches them too, as zav's bounded-backtracking program does (its step
+# budget, 4M steps, is reported as a limit when it runs out, never as clean).
+realpcre-Doc.Dropper.Agent-6336106-0.4 s3 zav=Diff.RealPcre.Doc.Dropper.Agent-6336106-0.4
+realpcre-Doc.Dropper.Agent-6336106-0.4 s4 zav=Diff.RealPcre.Doc.Dropper.Agent-6336106-0.4
+realpcre-Doc.Macro.Obfuscation-6663668-0.4 s3 zav=Diff.RealPcre.Doc.Macro.Obfuscation-6663668-0.4
+realpcre-Doc.Macro.Obfuscation-6663668-0.4 s4 zav=Diff.RealPcre.Doc.Macro.Obfuscation-6663668-0.4

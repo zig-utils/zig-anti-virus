@@ -112,7 +112,7 @@ jobs:
           python3 tools/diff/realdb.py pcre --db $db/main --db $db/daily --out "$RUNNER_TEMP/pcre.case"
           python3 tools/diff/realdb.py bytecompare --db $db/main --db $db/daily --out "$RUNNER_TEMP/bc.case"
           python3 tools/diff/clamav.py --raw --record --work "$RUNNER_TEMP/rwork" "$RUNNER_TEMP/pcre.case" "$RUNNER_TEMP/bc.case" | tail -1
-          ./zig-out/bin/zav-diff check --refusals-known --tmp "$RUNNER_TEMP/zd" "$RUNNER_TEMP/pcre.case" "$RUNNER_TEMP/bc.case"
+          ./zig-out/bin/zav-diff check --refusals-known --known tests/differential/known-realdb.txt --tmp "$RUNNER_TEMP/zd" "$RUNNER_TEMP/pcre.case" "$RUNNER_TEMP/bc.case"
       - name: P4.21 gate, zav and clamscan --bytecode=no over samples built from the signatures
         run: |
           db="$RUNNER_TEMP/db"

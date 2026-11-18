@@ -88,9 +88,10 @@ pub fn main(init: std.process.Init) !u8 {
     var shown: usize = 0;
     var by_source: std.StringArrayHashMapUnmanaged(Counts) = .empty;
 
-    var program: ?regex.Program = null;
+    // A linear program, or the bounded-backtracking one zav falls back to (as REGEX_POOL holds).
+    var program: ?zav.match.regex_pool.Prog = null;
     var scratch_mem: []align(8) u8 = &.{};
-    var scratch: ?regex.Scratch = null;
+    var scratch: ?zav.match.regex_pool.Scratch = null;
     var code: ?*pcre2.Code = null;
     var md: ?*pcre2.MatchData = null;
     var pattern_text: []const u8 = "";
@@ -150,17 +151,27 @@ pub fn main(init: std.process.Init) !u8 {
             };
             const zpattern = if (std.mem.indexOfScalar(u8, flags_text, 'U') != null) try std.mem.concat(pat_arena.allocator(), u8, &.{ "(?U)", pattern_text }) else pattern_text;
             const zav_ok = if (zav.compile.cdb.compileRegexKind(pat_arena.allocator(), zpattern, zf, .leftmost_first)) |blob| blk: {
-                program = regex.Program.load(blob) catch null;
+                if (std.mem.startsWith(u8, blob, regex.bt.magic)) {
+                    program = if (regex.bt.Program.load(blob)) |b| .{ .bt = b } else |_| null;
+                } else {
+                    program = if (regex.Program.load(blob)) |l| .{ .linear = l } else |_| null;
+                }
                 break :blk program != null;
             } else |_| false;
-            if (program) |*p| {
-                const cap = p.capacity();
-                var c2 = cap;
-                c2.dfa_states = 256;
-                scratch_mem = try gpa.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(c2));
-                scratch = try regex.Scratch.initBuffer(scratch_mem, c2);
-                scratch.?.step_budget = 1 << 24;
-            }
+            if (program) |*p| switch (p.*) {
+                .linear => |*l| {
+                    var c2 = l.capacity();
+                    c2.dfa_states = 256;
+                    scratch_mem = try gpa.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(c2));
+                    scratch = .{ .linear = try regex.Scratch.initBuffer(scratch_mem, c2) };
+                    scratch.?.linear.step_budget = 1 << 24;
+                },
+                .bt => |*b| {
+                    scratch_mem = try gpa.alignedAlloc(u8, .@"8", regex.bt.Scratch.bytesNeeded(b.capacity()));
+                    scratch = .{ .linear = undefined, .bt = try regex.bt.Scratch.initBuffer(scratch_mem, b.capacity()) };
+                    scratch.?.bt.?.step_budget = 1 << 24;
+                },
+            };
             var err: c_int = 0;
             var erroff: usize = 0;
             code = pcre2.pcre2_compile_8(pattern_text.ptr, pattern_text.len, pf, &err, &erroff, null);

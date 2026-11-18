@@ -678,11 +678,10 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
     var scratch: [2 * 1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
     var state = try logical.State.init(fba.allocator());
-    const regex = @import("regex");
-    const capacity = index.regexes.?.capacity(256);
-    const regex_mem = try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
-    var regex_scratch = try regex.Scratch.initBuffer(regex_mem, capacity);
-    regex_scratch.step_budget = 1 << 20;
+    const pool = index.regexes.?;
+    const regex_mem = try fba.allocator().alignedAlloc(u8, .@"8", pool.scratchBytes(256));
+    var regex_scratch = try regex_pool.Scratch.initBuffer(regex_mem, pool, 256);
+    regex_scratch.setStepBudget(1 << 20);
     state.regex_scratch = &regex_scratch;
     const reserved = fba.end_index;
     var tracker = limits_mod.Tracker.init(.{});
@@ -770,9 +769,8 @@ test "YARA rules end to end: text, hex and regex strings, offsets, reads, always
     var scratch: [2 * 1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
     var state = try logical.State.init(fba.allocator());
-    const regex = @import("regex");
-    const capacity = index.regexes.?.capacity(256);
-    var regex_scratch = try regex.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity)), capacity);
+    const pool = index.regexes.?;
+    var regex_scratch = try regex_pool.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", pool.scratchBytes(256)), pool, 256);
     state.regex_scratch = &regex_scratch;
     var tracker = limits_mod.Tracker.init(.{});
     var name_buf: [64]u8 = undefined;

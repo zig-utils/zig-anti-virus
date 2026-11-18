@@ -894,7 +894,7 @@ test "rejections carry reasons and parsing resumes at the next rule" {
         \\rule Base64 { strings: $a = "MZMZ" base64 condition: $a }
         \\rule WideRegex { strings: $a = /abc/ wide condition: $a }
         \\rule BadRegex { strings: $a = /(ab/ condition: $a }
-        \\rule Backref { strings: $a = /(a)\1/ condition: $a }
+        \\rule Behind { strings: $a = /(?<=a+)b/ condition: $a }
         \\rule Contains { strings: $a = "MZ" condition: $a contains "x" }
         \\rule BadHex { strings: $a = { 4D ( 5A } condition: $a }
         \\rule Syntax { strings: $a = "MZ" condition: $a and and }
@@ -905,9 +905,9 @@ test "rejections carry reasons and parsing resumes at the next rule" {
     try testing.expectEqual(@as(usize, 1), rules.items.len);
     try testing.expectEqualStrings("Good", rules.items[0].name);
     const want = [_]ir.Reason{
-        .yara_unsupported,    .yara_unsupported, .yara_unsupported,    .yara_unsupported, .yara_short_string,
-        .yara_no_strings,     .yara_xor_range,   .yara_unsupported,    .yara_unsupported, .regex_syntax,
-        .regex_backreference, .yara_unsupported, .hex_bad_alternation, .yara_syntax,      .yara_unsupported,
+        .yara_unsupported, .yara_unsupported, .yara_unsupported,    .yara_unsupported, .yara_short_string,
+        .yara_no_strings,  .yara_xor_range,   .yara_unsupported,    .yara_unsupported, .regex_syntax,
+        .regex_lookaround, .yara_unsupported, .hex_bad_alternation, .yara_syntax,      .yara_unsupported,
     };
     try testing.expectEqual(want.len, rejected.items.len);
     for (want, rejected.items, 1..) |w, r, line| {

@@ -642,7 +642,8 @@ test "pcre subsignatures: offsets, triggers, flags, compile failures" {
         .{ "0=0/abc/", 1, error.ExprTrueWithoutHits },
         .{ "EP+0:0/abc/", 1, error.OffsetNeedsExecutable },
         .{ "0/(ab/", 1, error.RegexSyntax },
-        .{ "0/(a)\\1/", 1, error.RegexBackreference },
+        // Unbounded lookbehind: neither zig-regex form runs it.
+        .{ "0/(?<=a+)b/", 1, error.RegexLookaround },
     }) |c| try testing.expectError(c[2], parsePcre(a, c[0], std.mem.indexOfScalar(u8, c[0], '/').?, c[1], 0));
 }
 

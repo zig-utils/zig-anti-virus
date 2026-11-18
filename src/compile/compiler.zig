@@ -652,7 +652,7 @@ test "compile files and a container, filter, and write a database" {
     try c.addFile("main.ndb", "Eicar:0:*:58354f\nBroken:0:*:58(35\n");
     try c.addFile("main.pdb", "R:example.com\n");
     try c.addFile("daily.ftm", "0:0:4d5a:DOS executable:CL_TYPE_ANY:CL_TYPE_MSEXE\n1:*:504b0304:ZIP-SFX:CL_TYPE_MSEXE:CL_TYPE_ZIPSFX\n7:0:00:Bad:CL_TYPE_ANY:CL_TYPE_ZIP\n");
-    try c.addFile("daily.cdb", "Zip.Meta-1-0:CL_TYPE_ZIP:*:*:*:1000:*:1:*:*\nZip.Regex-2-0:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:*:*\nZip.Backref-3-0:*:*:(a)\\1:*:*:*:*:*:*\n");
+    try c.addFile("daily.cdb", "Zip.Meta-1-0:CL_TYPE_ZIP:*:*:*:1000:*:1:*:*\nZip.Regex-2-0:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:*:*\nZip.Behind-3-0:*:*:(?<=a+)b:*:*:*:*:*:*\n");
     try c.addFile("main.ldb", "Logical.Test-1-0;Target:0;0&1;4142;4344::i\nLogical.Bad-2-0;Target:0;0&2;4142;4344\n");
     // An ignore list after signatures could not apply to them: refused, not half applied.
     try std.testing.expectError(error.LateIgnoreList, c.addFile("late.ign2", "Eicar\n"));
@@ -675,7 +675,7 @@ test "compile files and a container, filter, and write a database" {
     try std.testing.expect(std.mem.indexOf(u8, report, "main.pdb: 1 skipped (unsupported_database)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.ldb: 1 skipped (bad_expression)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "daily.ftm: 1 skipped (bad_magic_type)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (regex_backreference)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (regex_lookaround)") != null);
     const pool = try regex_pool.RegexPool.init(opened.section(.regex_pool, 0).?);
     const cdbt = try container.CdbTable.init(opened.section(.cdb_table, 0).?, pool);
     try std.testing.expectEqual(@as(usize, 2), cdbt.records.len);

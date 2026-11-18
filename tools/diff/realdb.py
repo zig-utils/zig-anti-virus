@@ -216,17 +216,20 @@ def hexstr(s):
 
 
 def gen_pcre(args):
-    rng = random.Random(1)
     cases, skipped = [], {}
     n = 0
     for name, line_no, line in db_lines(args.db, ("ldb", "ldu")):
         fields = ldb_fields(line)
         if len(fields) < 4:
             continue
-        for sub in fields[3:]:
+        for k, sub in enumerate(fields[3:]):
             if not is_pcre(sub):
                 continue
             n += 1
+            # Named after the signature and seeded by it, so a case keeps its name and samples
+            # when other signatures come and go (known-realdb.txt names cases).
+            key = "%s.%d" % (fields[0], k)
+            rng = random.Random(key)
             if args.limit and len(cases) >= args.limit:
                 break
             try:
@@ -239,9 +242,9 @@ def gen_pcre(args):
             except Exception:
                 skipped["generate"] = skipped.get("generate", 0) + 1
                 samples = []
-            case = ["case realpcre-%d" % n,
+            case = ["case realpcre-%s" % key,
                     "# %s:%d %s" % (name, line_no, fields[0]),
-                    "ldb Diff.RealPcre.%d;Engine:81-255,Target:0;0&1;54524947;0/%s/%s" % (n, pattern, flags)]
+                    "ldb Diff.RealPcre.%s;Engine:81-255,Target:0;0&1;54524947;0/%s/%s" % (key, pattern, flags)]
             for s in samples:
                 if len(s) > 60000:
                     continue

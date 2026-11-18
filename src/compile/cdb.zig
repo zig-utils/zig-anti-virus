@@ -93,8 +93,19 @@ pub fn compileRegexKind(arena: std.mem.Allocator, pattern_in: []const u8, flags:
     // Inline option settings (`(?i)`, `(?s:...)`, mid-pattern too) are zig-regex's own since
     // 0.4.1, with PCRE2's scoping: a standalone one lasts to the end of its group.
     const pattern = pattern_in;
-    const program = regex.Program.compileWithOptions(arena, pattern, f, .{ .match_kind = kind }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
+    const program = regex.Program.compileWithOptions(arena, pattern, f, .{ .match_kind = kind }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        // What the linear form refuses runs as a bounded-backtracking program (zig-regex 0.5:
+        // backreferences, lookaround, atomic groups, counted repeats kept as counters), with
+        // PCRE's leftmost-first semantics; a filename regex only asks whether it matches.
+        if (regex.bt.Program.compile(arena, pattern, f)) |bt| return bt.bytes() else |bt_err| if (bt_err == error.OutOfMemory) return error.OutOfMemory;
+        return refusal(err, pattern);
+    };
+    return program.bytes();
+}
+
+fn refusal(err: anyerror, pattern: []const u8) RegexError {
+    return switch (err) {
         error.ProgramTooLarge => error.RegexTooLarge,
         // Name the construct that needs the backtracker, whichever way zig-regex refused it
         // (an atomic group is still a syntax error to its parser).
@@ -106,7 +117,6 @@ pub fn compileRegexKind(arena: std.mem.Allocator, pattern_in: []const u8, flags:
             .none => if (e == error.UnsupportedByProgram) error.RegexUnsupported else error.RegexSyntax,
         },
     };
-    return program.bytes();
 }
 
 /// The first construct in `pattern` that only a backtracker runs: a backreference (`\1`,
@@ -260,14 +270,14 @@ test "cdb lines: wildcards, exact values, ranges, and rejections" {
         .{ "X:*:*:*:*:*:*:*:*:7", error.BadCdbField, 18 },
         .{ "X:*:*:*:*:*:*:*:*:*:x", error.BadFlevel, 20 },
         .{ "X:*:*:(a:*:*:*:*:*:*", error.RegexSyntax, 6 },
-        .{ "X:*:*:(a)\\1:*:*:*:*:*:*", error.RegexBackreference, 6 },
+        .{ "X:*:*:(?<=a+)b:*:*:*:*:*:*", error.RegexLookaround, 6 },
     }) |c| {
         try testing.expectError(c[1], parseLine(arena, c[0], &column));
         try testing.expectEqual(c[2], column);
     }
 }
 
-test "a regex without a program is named by the construct that needs a backtracker" {
+test "a regex with no program of either kind is named by its construct" {
     const T = struct { []const u8, @TypeOf(construct("")) };
     for ([_]T{
         .{ "(?P<n>\\w+)x(?P=n)", .backreference },
@@ -284,7 +294,9 @@ test "a regex without a program is named by the construct that needs a backtrack
     }) |t| try std.testing.expectEqual(t[1], construct(t[0]));
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(error.RegexAtomicGroup, compileRegex(arena.allocator(), "a(?>bc)d", .{}));
-    try std.testing.expectError(error.RegexLookaround, compileRegex(arena.allocator(), "a(?!b)", .{}));
+    // Backreferences, lookaround, atomic groups and huge repeats compile, as backtracking
+    // programs where the linear form refuses them; only unbounded lookbehind is left.
+    for ([_][]const u8{ "a(?>bc)d", "a(?!b)", "(?P<n>x+)y(?P=n)", "[a-z]{50000,}", "(?<!\\w)inject" }) |ok| _ = try compileRegex(arena.allocator(), ok, .{});
+    try std.testing.expectError(error.RegexLookaround, compileRegex(arena.allocator(), "(?<=a+)b", .{}));
     try std.testing.expectError(error.RegexSyntax, compileRegex(arena.allocator(), "(ab", .{}));
 }

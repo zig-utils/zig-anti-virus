@@ -27,7 +27,7 @@ const regex = @import("regex");
 /// sized for its filename regexes (`RegexPool.capacity`), owned by the worker.
 pub const CdbHook = struct {
     table: cdb_match.CdbTable,
-    scratch: ?*regex.Scratch = null,
+    scratch: ?*@import("../match/regex_pool.zig").Scratch = null,
 
     /// Check one member and report a match (or an undecidable regex) as a notice at the
     /// member's path. Callers push the member name first.

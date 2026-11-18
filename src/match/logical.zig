@@ -14,6 +14,7 @@ const ir = @import("../compile/ir.zig");
 const lt = @import("ldb_table.zig");
 const vm = @import("verify_vm.zig");
 const regex = @import("regex");
+const regex_pool_mod = @import("regex_pool.zig");
 const yc = @import("yara_cond.zig");
 
 pub const slot_count: usize = 8192;
@@ -78,7 +79,7 @@ pub const State = struct {
     bc_out_of_bounds: bool = false,
     /// zig-regex matching state for PCRE subsigs, sized for the database's REGEX_POOL
     /// (`RegexPool.capacity`) and owned by the worker. Without it PCRE subsigs cannot run.
-    regex_scratch: ?*regex.Scratch = null,
+    regex_scratch: ?*regex_pool_mod.Scratch = null,
     /// A PCRE subsig could not be decided (step budget, or no scratch) during the last finalize.
     regex_limited: bool = false,
     /// A YARA condition needed match offsets beyond the ones kept.
@@ -589,8 +590,7 @@ test "pcre subsigs: triggers, offsets, rolling, encompass, anchored and global c
     var mem: [1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&mem);
     var s = try State.init(fba.allocator());
-    const capacity = pool.capacity(64);
-    var scratch = try regex.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity)), capacity);
+    var scratch = try regex_pool.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", pool.scratchBytes(64)), pool, 64);
     s.regex_scratch = &scratch;
     s.all_match = true;
 
@@ -647,13 +647,12 @@ test "a worst-case PCRE input stops at the step budget and is reported" {
     var mem: [1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&mem);
     var s = try State.init(fba.allocator());
-    const capacity = pool.capacity(16);
-    var scratch = try regex.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity)), capacity);
-    scratch.step_budget = 10_000;
+    var scratch = try regex_pool.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", pool.scratchBytes(16)), pool, 16);
+    scratch.setStepBudget(10_000);
     s.regex_scratch = &scratch;
     try s.touch(table, .{}, 0, 0, 0);
     var out: [1]u32 = undefined;
     try testing.expectEqual(@as(usize, 0), s.finalize(table, data, &out));
     try testing.expect(s.regex_limited);
-    try testing.expect(scratch.steps <= 10_000);
+    try testing.expect(scratch.linear.steps <= 10_000);
 }

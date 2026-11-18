@@ -191,7 +191,7 @@ const Worker = struct {
     scratch: []u8,
     fba: std.heap.FixedBufferAllocator,
     state: zav.match.logical.State,
-    regex_scratch: zav.regex.Scratch,
+    regex_scratch: zav.match.regex_pool.Scratch,
     scan: *bodyscan.Scratch,
 
     fn init(gpa: std.mem.Allocator, index: *const bodyscan.BodyIndex) !*Worker {
@@ -201,10 +201,9 @@ const Worker = struct {
         w.state = try .init(w.fba.allocator());
         w.scan = try w.fba.allocator().create(bodyscan.Scratch);
         if (index.regexes) |pool| {
-            const capacity = pool.capacity(256);
-            const mem = try w.fba.allocator().alignedAlloc(u8, .@"8", zav.regex.Scratch.bytesNeeded(capacity));
-            w.regex_scratch = try .initBuffer(mem, capacity);
-            w.regex_scratch.step_budget = 1 << 20;
+            const mem = try w.fba.allocator().alignedAlloc(u8, .@"8", pool.scratchBytes(256));
+            w.regex_scratch = try .initBuffer(mem, pool, 256);
+            w.regex_scratch.setStepBudget(1 << 20);
             w.state.regex_scratch = &w.regex_scratch;
         }
         return w;

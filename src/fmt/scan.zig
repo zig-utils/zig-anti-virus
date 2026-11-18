@@ -877,7 +877,6 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
     const cdb = @import("../compile/cdb.zig");
     const cdb_match = @import("../match/container.zig");
     const regex_pool = @import("../match/regex_pool.zig");
-    const regex = @import("regex");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -899,9 +898,8 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
     const table_bytes = try cdb_match.build(arena, &rules, &.{ 1, 2, 3, 4, 5 }, &.{ 0, 1, 2, 3, null });
     const table_image = try arena.alignedAlloc(u8, .@"8", table_bytes.len);
     @memcpy(table_image, table_bytes);
-    const capacity = pool.capacity(64);
-    const mem = try arena.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
-    var scratch = try regex.Scratch.initBuffer(mem, capacity);
+    const mem = try arena.alignedAlloc(u8, .@"8", pool.scratchBytes(64));
+    var scratch = try regex_pool.Scratch.initBuffer(mem, pool, 64);
     const hook: container.CdbHook = .{ .table = try cdb_match.CdbTable.init(table_image, pool), .scratch = &scratch };
 
     const Case = struct { []const u8, ?u32, []const u8 };

@@ -20,7 +20,7 @@
 const std = @import("std");
 const Io = std.Io;
 const db = @import("../db/root.zig");
-const regex = @import("regex");
+const regex_pool = @import("../match/regex_pool.zig");
 const bodyscan = @import("bodyscan.zig");
 const hashscan = @import("hashscan.zig");
 const limits = @import("limits.zig");
@@ -47,7 +47,7 @@ pub const Engine = struct {
     /// The type magics, when the database has any.
     types: ?ftm.Ftm = null,
     regex_mem: []align(8) u8 = &.{},
-    regex_scratch: ?regex.Scratch = null,
+    regex_scratch: ?regex_pool.Scratch = null,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, options: db.reader.OpenOptions) !Engine {
         const database = try db.reader.open(io, dir, path, options);
@@ -58,10 +58,10 @@ pub const Engine = struct {
             e.types = try .init(section, magic_progs);
         }
         if (e.body.regexes) |pool| {
-            const capacity = pool.capacity(256);
-            e.regex_mem = try gpa.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
-            e.regex_scratch = try regex.Scratch.initBuffer(e.regex_mem, capacity);
-            e.regex_scratch.?.step_budget = 1 << 22;
+            // Sized for the database's largest linear and backtracking programs.
+            e.regex_mem = try gpa.alignedAlloc(u8, .@"8", pool.scratchBytes(256));
+            e.regex_scratch = try regex_pool.Scratch.initBuffer(e.regex_mem, pool, 256);
+            e.regex_scratch.?.setStepBudget(1 << 22);
         }
         return e;
     }
