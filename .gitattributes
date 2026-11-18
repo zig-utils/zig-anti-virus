@@ -1,0 +1,2 @@
+src/compile/fixtures/*.sign -text
+src/compile/fixtures/*.pin -text

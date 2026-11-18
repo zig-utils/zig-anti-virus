@@ -488,7 +488,7 @@ fn pinned(cert: *const Cert, pin: *const Pin) bool {
 // ---------------------------------------------------------------------------------------------
 
 pub const fixture_sign = @embedFile("fixtures/test.cvd.sign");
-pub const fixture_pin: Pin = hexPin(std.mem.trimEnd(u8, @embedFile("fixtures/test-root.pin"), "\n"));
+pub const fixture_pin: Pin = hexPin(std.mem.trim(u8, @embedFile("fixtures/test-root.pin"), " \r\n"));
 
 fn fixtureDigest() [32]u8 {
     var d: [32]u8 = undefined;
@@ -511,7 +511,7 @@ test "a different file, root or a flipped byte is refused" {
 
     // Flip bits in the DER: whatever it hits, the result is an error, never a pass or a crash.
     const line_start = std.mem.indexOf(u8, fixture_sign, "pkcs7-pem:").? + "pkcs7-pem:".len;
-    const line_end = std.mem.indexOfScalarPos(u8, fixture_sign, line_start, '\n').?;
+    const line_end = std.mem.indexOfAnyPos(u8, fixture_sign, line_start, "\r\n").?;
     const decoder = std.base64.standard.Decoder;
     const der = try gpa.alloc(u8, try decoder.calcSizeForSlice(fixture_sign[line_start..line_end]));
     defer gpa.free(der);
@@ -537,7 +537,7 @@ test "truncated DER never reads past the buffer" {
     const gpa = std.testing.allocator;
     const digest = fixtureDigest();
     const line_start = std.mem.indexOf(u8, fixture_sign, "pkcs7-pem:").? + "pkcs7-pem:".len;
-    const line_end = std.mem.indexOfScalarPos(u8, fixture_sign, line_start, '\n').?;
+    const line_end = std.mem.indexOfAnyPos(u8, fixture_sign, line_start, "\r\n").?;
     const decoder = std.base64.standard.Decoder;
     const der = try gpa.alloc(u8, try decoder.calcSizeForSlice(fixture_sign[line_start..line_end]));
     defer gpa.free(der);

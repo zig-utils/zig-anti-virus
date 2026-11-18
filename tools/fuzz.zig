@@ -862,7 +862,7 @@ fn cvdSign(random: std.Random) void {
     if (S.der_len == 0) {
         const text = sign.fixture_sign;
         const start = std.mem.indexOf(u8, text, "pkcs7-pem:").? + "pkcs7-pem:".len;
-        const end = std.mem.indexOfScalarPos(u8, text, start, '\n').?;
+        const end = std.mem.indexOfAnyPos(u8, text, start, "\r\n").?;
         const d = std.base64.standard.Decoder;
         S.der_len = d.calcSizeForSlice(text[start..end]) catch unreachable;
         d.decode(S.der_buf[0..S.der_len], text[start..end]) catch unreachable;
