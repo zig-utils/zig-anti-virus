@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zig-utils/zig-anti-virus/src/host/report.schema.json",
+  "title": "zav host report",
+  "description": "Output of `zav host --json` (schema id zav.host.report/1). `zav audit --json` reports vulnerability findings with the same finding shape.",
+  "type": "object",
+  "required": ["schema", "host", "tier", "score", "label", "highest", "exit_code", "findings", "suppressed", "disabled", "coverage", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "zav.host.report/1" },
+    "host": {
+      "type": "object",
+      "required": ["os", "role", "virtualized", "desktop", "services", "privileged"],
+      "additionalProperties": false,
+      "properties": {
+        "os": { "enum": ["linux", "macos"] },
+        "role": { "enum": ["workstation", "server", "container"] },
+        "virtualized": { "type": "boolean" },
+        "desktop": { "type": "boolean" },
+        "services": { "type": "array", "items": { "type": "string" } },
+        "privileged": { "type": "boolean" }
+      }
+    },
+    "tier": { "$ref": "#/$defs/tier" },
+    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "label": { "enum": ["excellent", "good", "fair", "poor", "critical"] },
+    "highest": { "anyOf": [{ "$ref": "#/$defs/severity" }, { "type": "null" }] },
+    "exit_code": { "enum": [0, 11, 12, 13, 14] },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "suppressed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check", "severity", "title", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "check": { "$ref": "#/$defs/check" },
+          "severity": { "$ref": "#/$defs/severity" },
+          "title": { "type": "string" },
+          "subject": { "type": "string" },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "disabled": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "check": { "$ref": "#/$defs/check" },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "check": { "type": "string" },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "checks": { "type": "array", "items": { "$ref": "#/$defs/check" } }
+  },
+  "$defs": {
+    "severity": { "enum": ["info", "low", "medium", "high", "critical"] },
+    "category": { "enum": ["malware", "process", "network", "kernel", "boot", "persistence", "access", "credential", "privilege", "hardening", "container", "integrity", "vulnerability"] },
+    "tier": { "enum": ["fast", "deep"] },
+    "check": { "type": "string", "minLength": 1 },
+    "finding": {
+      "type": "object",
+      "required": ["check", "severity", "category", "title", "description", "remediation", "cve", "details"],
+      "additionalProperties": false,
+      "properties": {
+        "check": { "$ref": "#/$defs/check" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "category": { "$ref": "#/$defs/category" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "remediation": { "type": "string", "minLength": 1 },
+        "cve": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "subject": { "type": "string" },
+        "pid": { "type": "integer", "minimum": 0 },
+        "details": { "type": "object", "additionalProperties": { "type": "string" } },
+        "downgraded": {
+          "type": "object",
+          "required": ["from", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "from": { "$ref": "#/$defs/severity" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}
