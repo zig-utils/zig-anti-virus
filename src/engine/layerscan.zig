@@ -38,6 +38,9 @@ const macho = @import("../fmt/macho.zig");
 const html_norm = @import("../fmt/html_norm.zig");
 const js_norm = @import("../fmt/js_norm.zig");
 const text_norm = @import("../fmt/text_norm.zig");
+const fmt_scan = @import("../fmt/scan.zig");
+const container = @import("container.zig");
+const budget_mod = @import("budget.zig");
 
 /// One compiled database, ready to scan with.
 pub const Engine = struct {
@@ -147,6 +150,8 @@ pub const Scanner = struct {
     norm: std.ArrayList(u8) = .empty,
     html: *html_norm.Normalizer,
     forms: [3]std.ArrayList(u8) = @splat(.empty),
+    /// Scratch for walking containers (VBA modules in OLE2), made on first use.
+    walk_scratch: ?scratch_mod.Scratch = null,
 
     pub fn init(gpa: std.mem.Allocator, io: Io) !*Scanner {
         const s = try gpa.create(Scanner);
@@ -171,6 +176,7 @@ pub const Scanner = struct {
 
     pub fn deinit(s: *Scanner) void {
         for (&s.forms) |*f| f.deinit(s.gpa);
+        if (s.walk_scratch) |*w| w.deinit();
         s.gpa.destroy(s.html);
         s.norm.deinit(s.gpa);
         s.gpa.free(s.vm_sections);
@@ -281,6 +287,11 @@ pub const Scanner = struct {
             .limited => |ev| limited = ev,
             .clean => {},
         }
+        if (c.format == .ole2) switch (try s.scanMacros(e, data, tracker)) {
+            .found => |sig| return .{ .found = sig },
+            .limited => |ev| limited = limited orelse ev,
+            .clean => {},
+        };
         if (c.kind == .text) {
             // scanraw: ASCII text whose type magics settle on HTML is scanned as HTML too (and
             // not as text); on mail, its raw bytes are matched with the mail target as well.
@@ -315,6 +326,80 @@ pub const Scanner = struct {
         if (limited) |ev| return .{ .limited = ev };
         return .clean;
     }
+
+    /// cli_vba_scandir: each VBA module's decompressed source in an OLE2 compound file, matched
+    /// with target type 2. The walker's OLE2 parser finds them (its `macro/<module>` children).
+    fn scanMacros(s: *Scanner, e: *Engine, data: []const u8, tracker: *limits.Tracker) !Result {
+        if (s.walk_scratch == null) s.walk_scratch = try .init(scratch_mod.default_reservation);
+        const ws = &s.walk_scratch.?;
+        ws.reset();
+        var budget = budget_mod.Budget.init(64 * 1024 * 1024);
+        var walk_tracker = limits.Tracker.init(s.limits);
+        var mc: MacroCollect = .{ .s = s, .e = e, .tracker = tracker };
+        defer mc.source.deinit(s.gpa);
+        var w: container.Walker = .{
+            .io = s.io,
+            .scratch = ws,
+            .tracker = &walk_tracker,
+            .budget = &budget,
+            .spill_dir = Io.Dir.cwd(),
+            .visitor = mc.visitor(),
+            .parse = fmt_scan.parse,
+        };
+        w.scan(.{ .memory = data }, "object") catch {};
+        if (mc.err) |err| return err;
+        if (mc.found) |sig| return .{ .found = sig };
+        if (mc.limited) |ev| return .{ .limited = ev };
+        return .clean;
+    }
+
+    const MacroCollect = struct {
+        s: *Scanner,
+        e: *Engine,
+        tracker: *limits.Tracker,
+        source: std.ArrayList(u8) = .empty,
+        in_macro: bool = false,
+        found: ?u32 = null,
+        limited: ?limits.Event = null,
+        err: ?anyerror = null,
+
+        fn visitor(m: *MacroCollect) container.Visitor {
+            return .{ .ptr = m, .vtable = &.{ .enter = enter, .data = dataFn, .leave = leave, .notice = notice } };
+        }
+        fn isMacro(obj: *const container.Object) bool {
+            return obj.kind == .script and std.mem.startsWith(u8, obj.name, "macro/");
+        }
+        fn enter(ptr: *anyopaque, obj: *const container.Object) error{Stop}!void {
+            const m: *MacroCollect = @ptrCast(@alignCast(ptr));
+            if (!isMacro(obj)) return;
+            m.in_macro = true;
+            m.source.clearRetainingCapacity();
+        }
+        fn dataFn(ptr: *anyopaque, obj: *const container.Object, bytes: []const u8) error{Stop}!void {
+            const m: *MacroCollect = @ptrCast(@alignCast(ptr));
+            if (!isMacro(obj) or !m.in_macro) return;
+            m.source.appendSlice(m.s.gpa, bytes) catch |err| {
+                m.err = err;
+                return error.Stop;
+            };
+        }
+        fn leave(ptr: *anyopaque, obj: *const container.Object) void {
+            const m: *MacroCollect = @ptrCast(@alignCast(ptr));
+            if (!isMacro(obj) or !m.in_macro or m.found != null) return;
+            m.in_macro = false;
+            const src = m.source.items;
+            const v = m.s.body(m.e, src, .{ .info = .{ .size = src.len }, .target = 2 }, m.tracker) catch |err| {
+                m.err = err;
+                return;
+            };
+            switch (v) {
+                .infected => |d| m.found = d.sig,
+                .limited => |ev| m.limited = m.limited orelse ev,
+                .clean => {},
+            }
+        }
+        fn notice(_: *anyopaque, _: container.Notice) void {}
+    };
 
     /// cli_scanhtml: nocomment.html and notags.html with target type 3, then the normalised
     /// JavaScript with target types 3 and 7. No raw scan.
