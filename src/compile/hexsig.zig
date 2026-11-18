@@ -239,7 +239,7 @@ const Parser = struct {
 
     fn breakPart(p: *Parser, at: usize, min: u32, max: u32, syntax: ir.GapSyntax) Error!void {
         try p.endPart(at);
-        if (syntax == .bracket and p.strict_brackets) {
+        if ((syntax == .bracket or syntax == .bracket_one) and p.strict_brackets) {
             // `BYTE[x-y]HEXSIG` or `HEXSIG[x-y]BYTE`: one side is a single literal byte.
             if (p.singleByte()) {
                 p.bracket_next = .static;
@@ -343,13 +343,15 @@ const Parser = struct {
                     p.pos += 1;
                     const n = try p.number();
                     var m = n;
+                    var syntax: ir.GapSyntax = .bracket_one;
                     if (p.peek(0) == '-') {
                         p.pos += 1;
                         m = try p.number();
+                        syntax = .bracket;
                     }
                     try p.expect(']', error.BadRange);
                     if (m < n or (p.strict_brackets and m > ir.bracket_limit)) return p.fail(start, error.BadRange);
-                    try p.breakPart(start, n, m, .bracket);
+                    try p.breakPart(start, n, m, syntax);
                 },
                 '(' => {
                     if (p.peek(2) == ')' and p.peek(1) != null) {
@@ -514,6 +516,7 @@ fn formatOps(p: ir.Pattern, ops: []const ir.Op, w: *std.Io.Writer) std.Io.Writer
             .from => try w.print("{{{d}-}}", .{o.a}),
             .exact => try w.print("{{{d}}}", .{o.a}),
             .bracket => try w.print("[{d}-{d}]", .{ o.a, o.b }),
+            .bracket_one => try w.print("[{d}]", .{o.a}),
         },
         .alt, .nalt => {
             if (o.code == .nalt) try w.writeByte('!');

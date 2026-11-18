@@ -188,6 +188,11 @@ fn parseSample(arena: std.mem.Allocator, text: []const u8, file: []const u8, lin
             if (to < bytes.items.len or to > 64 * 1024 * 1024) return diag.fail(file, line, "pad offset behind the sample or too large");
             try term.appendNTimes(arena, 0, to - bytes.items.len);
             p = p[close + 1 ..];
+        } else if (std.mem.startsWith(u8, p, "elf")) {
+            // An ELF64 x86_64 executable header block (0x140 bytes): .text at file 0x140 and
+            // .data at 0x240, 0x100 bytes each, one PT_LOAD over the file, entry at 0x140.
+            try term.appendSlice(arena, &elfHeader());
+            p = p[3..];
         } else if (std.mem.startsWith(u8, p, "pe")) {
             // A PE32 header block (0x200 bytes), optionally with the entry point RVA: pe(0x1010).
             var ep: u32 = 0x1000;
@@ -257,6 +262,43 @@ fn parseSample(arena: std.mem.Allocator, text: []const u8, file: []const u8, lin
     }
     std.mem.sort([]const u8, names.items, {}, lessString);
     return .{ .bytes = bytes.items, .expect = names.items, .line = line };
+}
+
+pub fn elfHeader() [0x140]u8 {
+    var h: [0x140]u8 = @splat(0);
+    @memcpy(h[0..4], "\x7fELF");
+    h[4] = 2; // 64-bit
+    h[5] = 1; // little-endian
+    h[6] = 1;
+    std.mem.writeInt(u16, h[16..18], 2, .little); // ET_EXEC
+    std.mem.writeInt(u16, h[18..20], 62, .little); // x86_64
+    std.mem.writeInt(u32, h[20..24], 1, .little);
+    std.mem.writeInt(u64, h[24..32], 0x400140, .little); // entry
+    std.mem.writeInt(u64, h[32..40], 0x40, .little); // phoff
+    std.mem.writeInt(u64, h[40..48], 0x78, .little); // shoff
+    std.mem.writeInt(u16, h[52..54], 64, .little);
+    std.mem.writeInt(u16, h[54..56], 56, .little);
+    std.mem.writeInt(u16, h[56..58], 1, .little);
+    std.mem.writeInt(u16, h[58..60], 64, .little);
+    std.mem.writeInt(u16, h[60..62], 3, .little);
+    const ph = h[0x40..0x78];
+    std.mem.writeInt(u32, ph[0..4], 1, .little); // PT_LOAD
+    std.mem.writeInt(u32, ph[4..8], 5, .little); // R+X
+    std.mem.writeInt(u64, ph[16..24], 0x400000, .little);
+    std.mem.writeInt(u64, ph[24..32], 0x400000, .little);
+    std.mem.writeInt(u64, ph[32..40], 0x340, .little);
+    std.mem.writeInt(u64, ph[40..48], 0x340, .little);
+    std.mem.writeInt(u64, ph[48..56], 0x1000, .little);
+    for ([_][2]u64{ .{ 0x140, 6 }, .{ 0x240, 3 } }, 1..) |sec, i| {
+        const sh = h[0x78 + 64 * i ..][0..64];
+        std.mem.writeInt(u32, sh[4..8], 1, .little); // PROGBITS
+        std.mem.writeInt(u64, sh[8..16], sec[1], .little); // flags
+        std.mem.writeInt(u64, sh[16..24], 0x400000 + sec[0], .little);
+        std.mem.writeInt(u64, sh[24..32], sec[0], .little);
+        std.mem.writeInt(u64, sh[32..40], 0x100, .little);
+        std.mem.writeInt(u64, sh[48..56], 16, .little);
+    }
+    return h;
 }
 
 /// A minimal, valid PE32 header: two sections, .text at file 0x200 (RVA 0x1000) and .data at
@@ -512,6 +554,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "rejects")) return rejects(app, rest);
     if (std.mem.eql(u8, cmd, "info")) return infoCmd(app, rest);
     if (std.mem.eql(u8, cmd, "normalize")) return normalizeCmd(app, rest);
+    if (std.mem.eql(u8, cmd, "roundtrip")) return roundtripCmd(app, rest);
     return usage(app);
 }
 
@@ -863,6 +906,78 @@ fn materialize(app: App, args: []const []const u8) !u8 {
     try root.writeFile(app.io, .{ .sub_path = "cases", .data = index.items });
     try app.out.print("zav-diff: wrote {d} cases to {s}\n", .{ cases.items.len, root_path });
     return 0;
+}
+
+/// `roundtrip FILE...`: parse every hex body of the .ndb/.ndu and .ldb/.ldu files (logical
+/// subsigs without their offset and modifiers) and print it back; the text must come back as
+/// written, modulo letter case and whitespace (P4.01). Prints each difference, then the counts.
+fn roundtripCmd(app: App, args: []const []const u8) !u8 {
+    var bodies: usize = 0;
+    var same: usize = 0;
+    var refused: usize = 0;
+    var differ: usize = 0;
+    for (args) |path| {
+        const text = try Io.Dir.cwd().readFileAlloc(app.io, path, app.arena, .limited(1 << 30));
+        const ext = std.fs.path.extension(path);
+        const is_ldb = std.mem.eql(u8, ext, ".ldb") or std.mem.eql(u8, ext, ".ldu");
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var line_no: usize = 0;
+        while (lines.next()) |raw| {
+            line_no += 1;
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            var arena_state = std.heap.ArenaAllocator.init(app.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var fields = std.mem.splitScalar(u8, line, if (is_ldb) ';' else ':');
+            var i: usize = 0;
+            while (fields.next()) |f| : (i += 1) {
+                var body = f;
+                var options: zav.compile.hexsig.Options = .{ .literal_pairs = true };
+                if (is_ldb) {
+                    // (A ';' inside a PCRE subsig splits it here; its pieces are skipped.)
+                    if (i < 3 or f.len == 0 or std.mem.indexOfScalar(u8, f, '/') != null or std.mem.indexOfScalar(u8, f, '#') != null or std.mem.startsWith(u8, f, "${")) continue;
+                    if (std.mem.lastIndexOf(u8, body, "::")) |m| {
+                        const mods = zav.compile.hexsig.parseModifiers(body[m + 2 ..]) catch zav.compile.ir.Modifiers{};
+                        options = zav.compile.hexsig.clamavOptions(mods);
+                        body = body[0..m];
+                    }
+                    if (std.mem.lastIndexOfScalar(u8, body, ':')) |c| body = body[c + 1 ..];
+                } else if (i != 3) continue;
+                bodies += 1;
+                var diag: zav.compile.hexsig.Diag = .{};
+                const pattern = zav.compile.hexsig.parseWith(a, body, &diag, options) catch |e| {
+                    refused += 1;
+                    try app.out.print("{s}:{d}: refused ({t} at {d}): {s}\n", .{ path, line_no, e, diag.pos, body[0..@min(body.len, 200)] });
+                    continue;
+                };
+                var buf: std.Io.Writer.Allocating = .init(a);
+                try zav.compile.hexsig.format(pattern, &buf.writer);
+                const printed = buf.written();
+                if (equalLoose(printed, body)) {
+                    same += 1;
+                } else {
+                    differ += 1;
+                    try app.out.print("{s}:{d}: {s}\n    printed {s}\n", .{ path, line_no, body, printed });
+                }
+            }
+        }
+    }
+    try app.out.print("zav-diff roundtrip: {d} bodies, {d} print back as written, {d} differ, {d} refused\n", .{ bodies, same, differ, refused });
+    return if (differ == 0) 0 else 1;
+}
+
+fn equalLoose(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.len and (a[i] == ' ' or a[i] == '\t')) i += 1;
+        while (j < b.len and (b[j] == ' ' or b[j] == '\t')) j += 1;
+        if (i == a.len or j == b.len) return i == a.len and j == b.len;
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
 }
 
 /// `normalize text|html FILE`: zav's target-7 or target-3 normalised form of FILE on stdout,

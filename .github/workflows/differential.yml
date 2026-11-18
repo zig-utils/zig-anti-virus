@@ -102,6 +102,10 @@ jobs:
           # Unsupported features and regexes zig-regex refuses are expected; anything else is a
           # line libclamav loads and zav misreads.
           if cut -d: -f4 "$RUNNER_TEMP/rejects.txt" | grep -v -E '^ (fuzzy_image|icon|handler_type|version_info)_unsupported$|^ regex_(syntax|unsupported)$'; then exit 1; fi
+      - name: Every hex body prints back as written (P4.01 round trip)
+        run: |
+          db="$RUNNER_TEMP/db"
+          ./zig-out/bin/zav-diff roundtrip $db/main/*.ndb $db/main/*.ldb $db/daily/*.ndb $db/daily/*.ndu $db/daily/*.ldb $db/daily/*.ldu
       - name: PCRE and byte-compare subsignatures, isolated
         run: |
           db="$RUNNER_TEMP/db"

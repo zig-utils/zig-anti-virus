@@ -152,3 +152,18 @@ case ldb-negation-many
 ldb Diff.Neg.Many;Engine:51-255,Target:0;0;41424344!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)4546
 sample bin "ABCD" 70*"x" "EF" bin => Diff.Neg.Many
 sample bin "ABCD" 69*"x" "\0EF" bin => OK
+
+case offsets-elf
+# Entry point and section offsets on an ELF (target 6): .text at 0x140 (the entry point), .data
+# at 0x240.
+ndb Diff.Elf.Ep:6:EP+0:41414141
+ndb Diff.Elf.EpPlus:6:EP+4:42424242
+ndb Diff.Elf.Section1:6:S1+0:41414141
+ndb Diff.Elf.Section2:6:S2+0:43434343
+ndb Diff.Elf.SectionEntire:6:SE2:43434343
+ndb Diff.Elf.LastSection:6:SL+0:43434343
+ndb Diff.Elf.Any:6:*:41414141
+ldb Diff.Elf.Logical;Engine:51-255,Target:6,EntryPoint:320-320;0&1;EP+0:41414141;S2+0:43434343
+sample elf "AAAABBBB" pad(0x240) "CCCC" pad(0x340) => Diff.Elf.Any Diff.Elf.Ep Diff.Elf.EpPlus Diff.Elf.LastSection Diff.Elf.Logical Diff.Elf.Section1 Diff.Elf.Section2 Diff.Elf.SectionEntire
+sample elf "xxAAAA" pad(0x240) "xCCCC" pad(0x340) => Diff.Elf.Any Diff.Elf.SectionEntire
+sample elf pad(0x240) "AAAA" pad(0x340) => Diff.Elf.Any

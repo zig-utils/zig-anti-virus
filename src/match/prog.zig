@@ -254,7 +254,7 @@ fn validateOps(p: ir.Pattern, ops: []const ir.Op, inside_alt: bool) Programs.Err
         .gapf => if (o.a == 0 or o.a >= ir.inline_gap_limit or o.flags != 0) return error.BadProgram,
         .bound => if (inside_alt or o.flags > @backingInt(ir.Bound.nonalnum)) return error.BadProgram,
         // A minimum above the maximum is a gap that never matches (libclamav loads `{3-1}`).
-        .part_end => if (inside_alt or o.flags > @backingInt(ir.GapSyntax.bracket)) return error.BadProgram,
+        .part_end => if (inside_alt or o.flags > @backingInt(ir.GapSyntax.bracket_one)) return error.BadProgram,
         .alt, .nalt => {
             if (inside_alt or o.len == 0 or o.flags & ~ir.op_nocase != 0) return error.BadProgram;
             if (o.a % 4 != 0 or @as(usize, o.a) + @as(usize, o.len) * @sizeOf(ir.AltEntry) > data_len) return error.BadProgram;

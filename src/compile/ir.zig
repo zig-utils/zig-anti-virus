@@ -302,6 +302,8 @@ pub const GapSyntax = enum(u8) {
     exact = 4,
     /// `[n-m]`
     bracket = 5,
+    /// `[n]` (libclamav reads it as `[n-n]`)
+    bracket_one = 6,
 };
 
 pub const unbounded: u32 = std.math.maxInt(u32);
