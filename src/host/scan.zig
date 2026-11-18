@@ -11,6 +11,7 @@ const suppress = @import("suppress.zig");
 const host_mod = @import("host.zig");
 const pkgs = @import("linux/packages.zig");
 const cache_mod = @import("cache.zig");
+const procfs = @import("linux/procfs.zig");
 
 const Host = host_mod.Host;
 const Finding = finding.Finding;
@@ -100,6 +101,7 @@ pub const Scan = struct {
     pkgdb_tried: bool = false,
     /// Digests of files already hashed, by inode, ctime, mtime and size.
     file_cache: cache_mod.Cache,
+    procs: ?std.ArrayList(procfs.Process) = null,
 
     pub const cache_file = "file-cache.zavc";
 
@@ -118,6 +120,7 @@ pub const Scan = struct {
 
     pub fn deinit(s: *Scan) void {
         if (s.pkgdb) |*db| db.deinit();
+        if (s.procs) |*p| p.deinit(s.gpa);
         s.file_cache.deinit();
         s.findings.deinit(s.gpa);
         s.suppressed.deinit(s.gpa);
@@ -160,6 +163,16 @@ pub const Scan = struct {
         const db = s.packages() orelse return null;
         const p = db.ownerResolved(path) orelse return null;
         return p.name;
+    }
+
+    /// Every process, read once per scan (Linux).
+    pub fn processes(s: *Scan) ![]const procfs.Process {
+        if (s.procs) |p| return p.items;
+        var list: std.ArrayList(procfs.Process) = .empty;
+        errdefer list.deinit(s.gpa);
+        try procfs.snapshot(s.gpa, s.arena(), s.host, &list);
+        s.procs = list;
+        return list.items;
     }
 
     /// The package databases under the host root, loaded on first use. Null when there are none

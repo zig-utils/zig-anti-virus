@@ -21,6 +21,8 @@ pub const linux = struct {
     pub const sqlite = @import("linux/sqlite.zig");
     pub const rpm = @import("linux/rpm.zig");
     pub const integrity = @import("linux/integrity.zig");
+    pub const procfs = @import("linux/procfs.zig");
+    pub const process = @import("linux/process.zig");
 };
 
 pub const Host = host.Host;
@@ -31,7 +33,7 @@ pub const Severity = finding.Severity;
 pub const Category = finding.Category;
 
 /// Every check this build knows, in run order.
-pub const registry = linux.integrity.checks;
+pub const registry = linux.process.checks ++ linux.integrity.checks;
 
 test {
     _ = finding;
@@ -47,4 +49,6 @@ test {
     _ = linux.sqlite;
     _ = linux.rpm;
     _ = linux.integrity;
+    _ = linux.procfs;
+    _ = linux.process;
 }
