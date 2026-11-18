@@ -12,6 +12,7 @@ const host_mod = @import("host.zig");
 const pkgs = @import("linux/packages.zig");
 const cache_mod = @import("cache.zig");
 const procfs = @import("linux/procfs.zig");
+const baseline_mod = @import("baseline.zig");
 
 const Host = host_mod.Host;
 const Finding = finding.Finding;
@@ -102,6 +103,8 @@ pub const Scan = struct {
     /// Digests of files already hashed, by inode, ctime, mtime and size.
     file_cache: cache_mod.Cache,
     procs: ?std.ArrayList(procfs.Process) = null,
+    /// Drift state from the last accepted scan (empty and disabled without a state directory).
+    baseline: baseline_mod.Baseline,
 
     pub const cache_file = "file-cache.zavc";
 
@@ -113,8 +116,12 @@ pub const Scan = struct {
             .context = options.context orelse detect(h),
             .options = options,
             .file_cache = .init(gpa),
+            .baseline = .init(gpa),
         };
-        if (options.state_dir) |d| s.file_cache.load(h.io, d, cache_file) catch {};
+        if (options.state_dir) |d| {
+            s.file_cache.load(h.io, d, cache_file) catch {};
+            s.baseline.load(h.io, d) catch {};
+        }
         return s;
     }
 
@@ -122,6 +129,7 @@ pub const Scan = struct {
         if (s.pkgdb) |*db| db.deinit();
         if (s.procs) |*p| p.deinit(s.gpa);
         s.file_cache.deinit();
+        s.baseline.deinit();
         s.findings.deinit(s.gpa);
         s.suppressed.deinit(s.gpa);
         s.disabled.deinit(s.gpa);
@@ -163,6 +171,17 @@ pub const Scan = struct {
         const db = s.packages() orelse return null;
         const p = db.ownerResolved(path) orelse return null;
         return p.name;
+    }
+
+    /// Record an observation for drift tracking. Returns true when it differs from a stored
+    /// baseline that tracks `kind`; notes reduced coverage once when there is no state directory.
+    pub fn drift(s: *Scan, kind: []const u8, subject: []const u8, value: []const u8) !bool {
+        if (!s.baseline.enabled) {
+            for (s.coverage.items) |c| if (std.mem.eql(u8, c.check, s.current) and std.mem.startsWith(u8, c.reason, "no state directory")) return false;
+            try s.reduced("no state directory: changes since the last baseline are not tracked", .{});
+            return false;
+        }
+        return s.baseline.observe(kind, subject, value);
     }
 
     /// Every process, read once per scan (Linux).
@@ -234,9 +253,11 @@ pub const Scan = struct {
             };
         }
         s.current = "";
-        if (s.options.state_dir) |d| if (s.file_cache.dirty) {
-            s.file_cache.save(s.host.io, d, cache_file) catch |e| try s.reduced("file cache not saved: {t}", .{e});
-        };
+        if (s.options.state_dir) |d| {
+            if (s.file_cache.dirty) s.file_cache.save(s.host.io, d, cache_file) catch |e| try s.reduced("file cache not saved: {t}", .{e});
+            if (s.options.update_baseline or s.baseline.hasNewKinds())
+                s.baseline.save(s.host.io, d, s.options.update_baseline) catch |e| try s.reduced("baseline not saved: {t}", .{e});
+        }
         try s.finalize();
     }
 

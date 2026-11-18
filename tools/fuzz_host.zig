@@ -9,6 +9,7 @@ const targets = [_]Target{
     .{ .name = "hostPackages", .run = hostPackages },
     .{ .name = "hostProcfs", .run = hostProcfs },
     .{ .name = "hostNetwork", .run = hostNetwork },
+    .{ .name = "hostKernel", .run = hostKernel },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -133,4 +134,33 @@ pub fn hostNetwork(gpa: std.mem.Allocator, random: std.Random) !void {
     defer out.deinit(gpa);
     var done = false;
     network.parseDiag(gpa, msg[0..random.uintLessThan(usize, msg.len + 1)], &out, &done) catch |e| if (e == error.OutOfMemory) return e;
+}
+
+/// /proc/modules lines, modules.dep, fdinfo, the kernel command line and baseline files.
+pub fn hostKernel(gpa: std.mem.Allocator, random: std.Random) !void {
+    const kernel = zav.host.linux.kernel;
+    var buf: [512]u8 = undefined;
+    const seeds = [_][]const u8{
+        "nvidia 56823808 1 nvidia_modeset, Live 0x0000000000000000 (POE)",
+        "kernel/drivers/net/wireguard/wireguard.ko.zst: kernel/lib/crypto/libchacha.ko.zst\nx.ko:\n",
+        "pos:\t0\nflags:\t02000002\nprog_id:\t42\n",
+        "BOOT_IMAGE=/vmlinuz root=/dev/sda1 ro mitigations=off init=/bin/sh",
+        "zav-host-baseline 1\nssh.key\t/root/.ssh/authorized_keys\tSHA256:x\nsuid\t/usr/bin/sudo\t1\n",
+    };
+    const input = mutateCopy(random, &buf, seeds[random.uintLessThan(usize, seeds.len)]);
+    _ = kernel.parseModulesLine(input);
+    _ = kernel.fdinfoProgId(input);
+    var risks: [16]kernel.CmdlineRisk = undefined;
+    _ = kernel.cmdlineRisks(input, &risks);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var dep: kernel.DepIndex = .{};
+    defer dep.deinit(gpa);
+    try dep.parse(gpa, arena.allocator(), input);
+    var b = zav.host.baseline.Baseline.init(gpa);
+    defer b.deinit();
+    try b.loadText(input);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try b.serialize(&out, random.boolean());
 }

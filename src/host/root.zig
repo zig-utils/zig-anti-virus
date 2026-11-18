@@ -16,6 +16,7 @@ pub const scan = @import("scan.zig");
 pub const schema = @import("schema.zig");
 pub const tokens = @import("tokens.zig");
 pub const cache = @import("cache.zig");
+pub const baseline = @import("baseline.zig");
 pub const linux = struct {
     pub const packages = @import("linux/packages.zig");
     pub const sqlite = @import("linux/sqlite.zig");
@@ -24,6 +25,7 @@ pub const linux = struct {
     pub const procfs = @import("linux/procfs.zig");
     pub const process = @import("linux/process.zig");
     pub const network = @import("linux/network.zig");
+    pub const kernel = @import("linux/kernel.zig");
 };
 
 pub const Host = host.Host;
@@ -34,7 +36,7 @@ pub const Severity = finding.Severity;
 pub const Category = finding.Category;
 
 /// Every check this build knows, in run order.
-pub const registry = linux.process.checks ++ linux.network.checks ++ linux.integrity.checks;
+pub const registry = linux.process.checks ++ linux.network.checks ++ linux.kernel.checks ++ linux.integrity.checks;
 
 test {
     _ = finding;
@@ -53,4 +55,6 @@ test {
     _ = linux.procfs;
     _ = linux.process;
     _ = linux.network;
+    _ = linux.kernel;
+    _ = baseline;
 }
