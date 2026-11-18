@@ -409,12 +409,14 @@ src/compile/   cvd, per-extension parsers, yara/, guardian/, mbazaar, ir, atoms,
                sbbf_build, hash_build (external sort), layout, delta, coverage
 src/match/     hashidx, need_map, sbbf (probe kernels per arch), atom_table, verify_vm,
                anchored, logical, teddy (small partitions), regex_bridge
-src/hash/      multihash, md5, sha1_hw, sha256 (per-variant builds)
+src/hash/      variants, kernel, sha1_hw, variant_object (one per CPU variant), dispatch,
+               hasher, multihash
 src/simd/      arch dispatch, byte shuffles
 src/fmt/       ftm, pe, elf, macho, ole2, vba, ooxml, pdf, html_norm, text_norm, js_norm,
                mime, zip, gzip, bzip2, xz, zstd, tar
 src/engine/    source, scan pipeline, limits, scratch, budget, result, cache
-src/rt/        deque, pool, epoch, ioloop, walk, io_small
+src/rt/        vm (file mappings and reserved regions, POSIX and Windows), deque, pool,
+               epoch, ioloop, walk, io_small
 src/daemon/    clamd_proto, native_proto, conn, server, clamd_conf
 src/watch/     fanotify, endpoint_security, fsevents
 src/host/      host checks
@@ -497,7 +499,7 @@ bench/         corpus manifests, runner, memory sampler, clamd driver, gates
 | E5 | Memory: idle, nominal, peak; reload under load | 24 / 64 MB; reload ≤ 2 MB |
 | E6 | pread vs mmap vs io_uring; munmap shootdowns; cache hygiene | pick defaults; io_uring ≥ 2x fewer µs per small file |
 | E7 | std flate, zstd, xz vs zlib-ng, libdeflate, libzstd | std flate ≥ 60% of zlib-ng, otherwise optimise |
-| E8 | Hardware hashers, baseline vs native builds | SHA-256 ≥ 1.5 GB/s, SHA-1 ≥ 2 GB/s with hardware |
+| E8 | Hardware hashers, baseline vs native builds ([results](experiments/E8-hashers.md)) | SHA-256 ≥ 1.5 GB/s, SHA-1 ≥ 2 GB/s with hardware |
 | E9 | Parity against clamd (bytecode on and off); false positives on B1 | ≥ 99.5% parity; 0 new false positives |
 | E10 | Scan cache fault injection; warm-rescan speedup; delta rescan | 0 stale CLEAN results; ≥ 20x faster warm rescan |
 | E11 | fanotify permission latency | cached ≤ 20 µs |
