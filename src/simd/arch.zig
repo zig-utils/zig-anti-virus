@@ -142,7 +142,13 @@ fn detectAarch64() Features {
             .aarch64_sha2 = sysctlFlag("hw.optional.arm.FEAT_SHA256"),
         },
         .linux => {
-            const hwcap = std.os.linux.getauxval(std.elf.AT_HWCAP);
+            // With libc linked, glibc's startup runs instead of Zig's, which never records the
+            // auxiliary vector, so `std.os.linux.getauxval` answers 0 for everything and every
+            // CPU looked like it had no crypto extensions. Ask libc in that case.
+            const hwcap: usize = if (builtin.link_libc)
+                @intCast(std.c.getauxval(std.elf.AT_HWCAP))
+            else
+                std.os.linux.getauxval(std.elf.AT_HWCAP);
             return .{
                 .aarch64_aes = hwcap & (1 << 3) != 0, // HWCAP_AES
                 .aarch64_sha1 = hwcap & (1 << 5) != 0, // HWCAP_SHA1
