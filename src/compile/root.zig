@@ -8,6 +8,7 @@ pub const hash_build = @import("hash_build.zig");
 pub const filters = @import("filters.zig");
 pub const coverage = @import("coverage.zig");
 pub const compiler = @import("compiler.zig");
+pub const mbazaar = @import("mbazaar.zig");
 
 test {
     _ = cvd;
@@ -17,5 +18,6 @@ test {
     _ = filters;
     _ = coverage;
     _ = compiler;
+    _ = mbazaar;
     _ = @This();
 }

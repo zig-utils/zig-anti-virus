@@ -12,6 +12,7 @@ const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
 const hash_build = @import("hash_build.zig");
 const cvd = @import("cvd.zig");
+const mbazaar = @import("mbazaar.zig");
 const hashidx = @import("../match/hashidx.zig");
 const writer = @import("../db/writer.zig");
 const format = @import("../db/format.zig");
@@ -74,6 +75,13 @@ pub const Compiler = struct {
                 try c.coverage.skip(c.gpa, owned_name, reason);
             }
         }
+    }
+
+    /// Add a MalwareBazaar CSV export (opt-in feed).
+    pub fn addMalwareBazaar(c: *Compiler, name: []const u8, text: []const u8, export_time: u64) !void {
+        const arena = c.arena.allocator();
+        try mbazaar.parse(c.gpa, arena, try arena.dupe(u8, name), try arena.dupe(u8, text), &c.rules, &c.rejected);
+        c.sources.malwarebazaar = export_time;
     }
 
     /// Verify a CVD (or, with `allow_unverified`, a CLD) and add its members.
