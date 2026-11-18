@@ -855,10 +855,12 @@ test "rules with every supported string and condition form compile" {
         \\    2 of ($s*) and all of them or none of ($x) and (uint32be(4) & 0xff) == 7 and ~0 == -1
         \\}
         \\rule Always { strings: $a = "zz" condition: $a or not $a }
+        \\rule Shapes { strings: $a = /(?:ab|cd)+x/ $b = /<script.+?>/i $c = /(\x90|\xcc){4,}/ condition: any of them }
         \\
     , &rules, &rejected);
     try testing.expectEqual(@as(usize, 0), rejected.items.len);
-    try testing.expectEqual(@as(usize, 4), rules.items.len);
+    try testing.expectEqual(@as(usize, 5), rules.items.len);
+    for (rules.items[4].strings) |str| try testing.expect(str.regex != null);
     const t = rules.items[0];
     try testing.expectEqualStrings("Text", t.name);
     try testing.expectEqual(@as(usize, 3), t.strings.len);

@@ -128,8 +128,9 @@ pub const Reason = enum(u8) {
     bad_cdb_field,
     /// A regex zig-regex cannot parse.
     regex_syntax,
-    /// A regex that needs the backtracking engine (backreferences, lookaround, lazy repeats,
-    /// a repeated group holding an alternation, ...), so no allocation-free program exists.
+    /// A regex that needs the backtracking engine (backreferences, general lookaround, scoped
+    /// inline modifiers), so no allocation-free program exists. Repeated alternations and lazy
+    /// repeats compile (zig-regex 0.3.1).
     regex_unsupported,
     // YARA rules.
     yara_syntax,

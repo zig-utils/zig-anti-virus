@@ -287,6 +287,7 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         \\Test.Logical.Bc-5-0;Target:0;0&1;4c454e3d;0(>>4#de3#>100)
         \\Test.Logical.Pcre-6-0;Target:0;0&1;3c736372697074;0/eval\s*\(\s*unescape/i
         \\Test.Logical.PcreCount-7-0;Target:0;1>1;46524147;0/frag[0-9]+/g
+        \\Test.Logical.PcreSled-8-0;Target:0;0&1;534c4544;0/(?:\x90|\xcc){4,}/
         \\
     );
     _ = try c.write(io, tmp.dir, "ldb.zavdb", .{ .db_version = 1 });
@@ -329,6 +330,8 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         .{ "<script>evaluate(unescape)", .{ .info = .{ .size = 1 } }, null },
         .{ "FRAG frag1 frag22", .{ .info = .{ .size = 1 } }, "Test.Logical.PcreCount-7-0" },
         .{ "FRAG frag1", .{ .info = .{ .size = 1 } }, null },
+        .{ "SLED \x90\xcc\x90\x90!", .{ .info = .{ .size = 1 } }, "Test.Logical.PcreSled-8-0" },
+        .{ "SLED \x90\xcc\x90!", .{ .info = .{ .size = 1 } }, null },
     }) |case| {
         state.reset();
         var budget: vm.Budget = .{};

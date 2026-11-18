@@ -540,6 +540,14 @@ test "pcre subsignatures: offsets, triggers, flags, compile failures" {
     try testing.expectEqual(@as(usize, 3), p.trigger.len);
     const q = try parsePcre(a, "0/\\x4d\\x5a.{2}\\x50\\x45/sA", 1, 1, 0);
     try testing.expect(q.flags.anchored);
+    // ClamAV's commonest PCRE shapes: repeated alternations and lazy repeats compile.
+    for ([_][]const u8{
+        "0/(?:\\x90|\\xcc){4,}/",
+        "0/(?:%[0-9a-f]{2}|\\\\x[0-9a-f]{2}){8,}/i",
+        "0/eval\\((?:unescape|atob|String\\.fromCharCode)\\(/",
+        "0/<script.+?>/is",
+        "0/a(?:b|c)+?d/",
+    }) |pcre| _ = try parsePcre(a, pcre, 1, 1, 0);
     const Bad = struct { []const u8, usize, LineError };
     for ([_]Bad{
         .{ "0//", 1, error.BadPcre },
