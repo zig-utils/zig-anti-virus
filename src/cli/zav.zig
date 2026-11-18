@@ -149,13 +149,46 @@ fn openDb(ctx: *Command.ParseContext, path: []const u8) !zav.db.reader.Database 
 
 fn compileAction(ctx: *Command.ParseContext) !u8 {
     const out_path = ctx.getOption("out") orelse "zav.zavdb";
-    var compiler = zav.compile.compiler.Compiler.init(app.gpa);
-    defer compiler.deinit();
-    if (!flag(ctx, "no-builtin")) try compiler.addBuiltin();
-
     const cwd = std.Io.Dir.cwd();
+
+    // Large sections and sort runs go to a temporary directory next to the output (the same
+    // filesystem, and never a RAM-backed /tmp), removed when the compile ends.
+    var nonce: [8]u8 = undefined;
+    app.io.random(&nonce);
+    var spill_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const spill_path = try std.fmt.bufPrint(&spill_buf, "{s}.spill-{x}", .{ out_path, std.mem.readInt(u64, &nonce, .little) });
+    try cwd.createDirPath(app.io, spill_path);
+    defer cwd.deleteTree(app.io, spill_path) catch {};
+    var spill_dir = try cwd.openDir(app.io, spill_path, .{});
+    defer spill_dir.close(app.io);
+    var spill = zav.compile.spill.Spill.init(app.io, spill_dir);
+
+    var compiler = zav.compile.compiler.Compiler.initOptions(app.gpa, .{ .spill = &spill });
+    defer compiler.deinit();
+
+    // Ignore lists first, wherever they are, so they apply to every signature.
     for (ctx.arguments.items) |path| {
         const ext = std.fs.path.extension(path);
+        if (std.mem.eql(u8, ext, ".cvd") or std.mem.eql(u8, ext, ".cld")) {
+            const kind: zav.compile.cvd.Kind = if (std.mem.eql(u8, ext, ".cld")) .cld else .cvd;
+            compiler.preloadIgnores(app.io, cwd, path, .{ .kind = kind, .allow_unverified = flag(ctx, "allow-unverified") }) catch |e| {
+                try app.err.print("zav: {s}: {t}\n", .{ path, e });
+                return 2;
+            };
+        } else if (std.mem.eql(u8, ext, ".ign2")) {
+            const text = cwd.readFileAlloc(app.io, path, app.gpa, .limited(64 * 1024 * 1024)) catch |e| {
+                try app.err.print("zav: {s}: {t}\n", .{ path, e });
+                return 2;
+            };
+            defer app.gpa.free(text);
+            try compiler.addFile(std.fs.path.basename(path), text);
+        }
+    }
+    if (!flag(ctx, "no-builtin")) try compiler.addBuiltin();
+
+    for (ctx.arguments.items) |path| {
+        const ext = std.fs.path.extension(path);
+        if (std.mem.eql(u8, ext, ".ign2")) continue;
         if (std.mem.eql(u8, ext, ".cvd") or std.mem.eql(u8, ext, ".cld")) {
             const kind: zav.compile.cvd.Kind = if (std.mem.eql(u8, ext, ".cld")) .cld else .cvd;
             _ = compiler.addContainer(app.io, cwd, path, .{ .kind = kind, .allow_unverified = flag(ctx, "allow-unverified") }) catch |e| {
@@ -163,12 +196,17 @@ fn compileAction(ctx: *Command.ParseContext) !u8 {
                 return 2;
             };
         } else {
-            const text = cwd.readFileAlloc(app.io, path, app.gpa, .limited(512 * 1024 * 1024)) catch |e| {
+            const file = cwd.openFile(app.io, path, .{}) catch |e| {
                 try app.err.print("zav: {s}: {t}\n", .{ path, e });
                 return 2;
             };
-            defer app.gpa.free(text);
-            try compiler.addFile(std.fs.path.basename(path), text);
+            defer file.close(app.io);
+            var buf: [64 * 1024]u8 = undefined;
+            var r = file.reader(app.io, &buf);
+            compiler.addStream(std.fs.path.basename(path), &r.interface) catch |e| {
+                try app.err.print("zav: {s}: {t}\n", .{ path, e });
+                return 2;
+            };
         }
     }
     for (ctx.getOptionValues("malwarebazaar")) |path| {
@@ -177,7 +215,6 @@ fn compileAction(ctx: *Command.ParseContext) !u8 {
         try compiler.addMalwareBazaar(std.fs.path.basename(path), text, 0);
     }
 
-    var nonce: [8]u8 = undefined;
     app.io.random(&nonce);
     const summary = try compiler.write(app.io, cwd, out_path, .{ .db_version = std.mem.readInt(u64, &nonce, .little) >> 1 });
     if (ctx.wantsJson()) {

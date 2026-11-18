@@ -168,6 +168,21 @@ pub fn build(b: *std.Build) void {
     run_census.addPassthruArgs();
     b.step("census", "Count signatures in ClamAV databases (pass the .cvd files after --)").dependOn(&run_census.step);
 
+    // E1: hash index lookup cost and hashing skipped (P3.09), on a compiled database.
+    const e1_exe = b.addExecutable(.{
+        .name = "e1",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/e1.zig"),
+            .target = target,
+            .optimize = .fast,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    const run_e1 = b.addRunArtifact(e1_exe);
+    run_e1.addPassthruArgs();
+    b.step("e1", "Hash index lookup cost and skipped hashing (pass db, CVD dir and corpus roots after --)").dependOn(&run_e1.step);
+
     // Kernel benchmarks (zig-bench is a lazy dependency, fetched only by this step).
     const bench_step = b.step("bench", "Run kernel benchmarks and write a JSON result file");
     if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {

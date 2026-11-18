@@ -117,33 +117,34 @@ The hot region comes first, starting on a 2 MiB boundary. Everything else follow
 
 A table t is one combination of algorithm (MD5, SHA1, SHA256) and kind (whole file, PE section, import hash). MalwareBazaar goes into the SHA256 whole-file table, tagged with its own source.
 
-**`HASH_NEED_MAP`** is the per-file gate, consulted before any hashing:
-- Sizes below 2^24 use a dense map, 4 bits per size: {md5, sha1, sha256, reserved}.
-- Larger sizes go into a sorted `{size u64, mask u8}` array.
+**`HASH_NEED_MAP`** is the per-file gate, consulted before any hashing. One map per scope, and inside it one structure per algorithm, sized by how many distinct sizes that algorithm has (version 2, after E0):
+- More than 4,096 distinct sizes (in practice only MD5): a bitmap, one bit per size below 2^24, as a top table of 2,048 block numbers and 1 KiB blocks for the 8,192-size ranges that have any size; larger sizes in a sorted u64 list.
+- Up to 4,096 (SHA-1 and SHA-256 today): a sorted u64 list, at most 12 probes.
 - A global `sizeless_mask` covers entries with `*` as the size. Any algorithm in it must be computed for every file.
 - E0 found 13 such entries (11 MD5, 2 SHA-256, all whole-file, in main.hsb) [M]. So MD5 and SHA-256 run on every scanned file, as they do in ClamAV; the map still gates SHA-1, PE section hashing and which tables are probed.
 - Sizes below 2^24 cover 98.7% of whole-file MD5 entries (174,283 distinct sizes) and 99.99% of PE section entries (69,636 distinct sizes) [M].
 
 **`HASH_HOT[t]`** holds the keys:
 ```
-sizes:   [D]u32 sorted distinct sizes (plus a u64 overflow list)
+sizes:   [D]u64 sorted distinct sizes
 starts:  [D+1]u32 entry index per size
-radix:   [65536]u32 index into sizes by (size >> shift)
-keys:    [N]u64 first 8 digest bytes, big-endian, sorted within each size bucket
+radix:   [65537]u32 first size index per 256-size range below 2^24 (tables with over 4,096 sizes)
+keys:    [N]u32 first 4 digest bytes, big-endian, sorted within each size bucket
 ```
-- Up to 8 entries in a bucket are scanned branch-free; larger buckets are binary-searched.
-- 4M entries take 32 MB of mapped, clean memory [E].
+- The radix narrows the size search to at most 256 sizes; buckets are binary-searched. The largest real bucket holds 38,871 entries (E0), so a 32-bit prefix collision inside a bucket happens on about 1 lookup in 100,000 and costs one extra cold read; it can never become a detection.
+- Measured on main 63 + daily 28187 [M]: 3.21 million entries, need maps 3.2 MB plus hot tables 16.3 MB, so 19.5 MB of hot region for hashes (version 1, with 4-bit need maps and 8-byte keys: 41 MB).
 
-**`HASH_COLD[t]`** holds full digest rows in the same order. They are read only on a prefix hit, and the full digest is always compared.
+**`HASH_COLD[t]`** holds the rest of each digest (after its first 4 bytes) and the u32 signature id, in the same order: 16 bytes per MD5 row, 51 MB for the real databases. Rows are read only on a prefix hit, and the full digest is always compared.
 
 **Other tables:**
 - Size-less tables use interpolation search over uniformly distributed prefixes, about 2-3 probes [K].
 - FP tables always store full digests.
 - An optional `HASH_FILTER[t]` binary fuse filter (about 9 bits per key) is kept only if E1 shows it helps when keys have been evicted.
 
-**`SIGMETA`** tokenises signature names into 16-byte records:
-- Fields: `{family_str u32, number u32, rev u8, source u8, flevel_min u8, flevel_max u8, flags u16, category u16}`.
-- A name is rebuilt only when a result is reported. Names that don't tokenise are stored verbatim.
+**`SIGMETA`** tokenises signature names into 8-byte records:
+- Fields: `{family u24, source u4, pua u1, shape u2, number u24, revision u8}`, then a table of family offsets into `NAME_POOL`.
+- E0: every current name is `Family-N` (79%) or `Family-N-R` (21%) with canonical decimals, numbers below 2^24 [M]. 3.64 million names share 308,730 families: SIGMETA is 30 MB and NAME_POOL 5.8 MB (version 1: 58 MB and 65 MB).
+- A name is rebuilt only when a result is reported. Names that don't tokenise, or whose number does not fit, are stored verbatim.
 
 ### 3.4 Pattern sections
 
@@ -168,15 +169,15 @@ keys:    [N]u64 first 8 digest bytes, big-endian, sorted within each size bucket
 
 ## 4. Compiler pipeline
 
-1. **Read the CVD.** It is a 512-byte header followed by tar.gz [K]; a CLD may be plain tar, detected by magic. Verify the MD5 and the digital signature.
-2. **Parse into the rule IR.** Apply `.ign2` and functionality-level filtering, and record every dropped signature with its reason.
-3. **Build hash tables** with an external merge sort.
+1. **Read the CVD.** It is a 512-byte header followed by tar.gz [K]; a CLD may be plain tar, detected by magic. Verify the MD5, the legacy digital signature and, when the mirror publishes one, the detached `.sign` PKCS#7 signature chained to Cisco's pinned root.
+2. **Stream members into records.** `.ign2` lists are read from every container first. Each line of a hash, `.ndb` or `.ldb` member is parsed, filtered (ignore lists, functionality level) and turned straight into its database record: a fixed-size hash record, verify programs, an LDB_TABLE record, a SIGMETA entry. No source text and no per-signature IR is kept, and every dropped signature is recorded with its reason.
+3. **Build hash tables** with an external merge sort: bounded sort buffers, runs spilled to a temporary directory next to the output, merged straight into the hot and cold sections.
 4. **Select atoms** (4.2).
 5. **Build the filters.** Partition, and size them for about 16 bits per key (roughly 0.1-0.3% false positives).
 6. **Lay out sections.** Order signatures by benign-corpus hit frequency, hot ones first.
 7. **Finish.** Write the BLAKE3 root and signature, then write to a temp file, fsync and rename. Optionally emit a delta blob.
 
-Estimated cost: 10-30 s and about 1 GB peak [E], always out of process, at low priority.
+Large sections (programs, cold rows, sort runs) live in spill files and are mapped read-only for the final write, so they are clean, reclaimable pages rather than heap. Measured on main 63 + daily 28187 + bytecode 339 on an Apple M3 Pro [M]: 5.8 s, 393 MB peak memory footprint, 600 MB maximum RSS (the first, all-in-memory compiler: 7.7-9.0 s, 4.38 GB footprint, 2.8-3.5 GB RSS). Always out of process, at low priority.
 
 ### 4.1 Hex-signature IR
 

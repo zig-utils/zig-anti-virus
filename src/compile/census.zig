@@ -67,35 +67,6 @@ pub fn subsigRun(arena: std.mem.Allocator, sub: ir.Subsig) struct { run: usize, 
     return .{ .run = run, .variants = variants.len, .expanded = true };
 }
 
-/// Names in the shape `Family-N` or `Family-N-R` with canonical decimal fields (no sign, no
-/// leading zero), N below 2^32 and R below 256: these round-trip through (family, number,
-/// revision) exactly.
-pub const SchemeTokens = struct {
-    family: []const u8,
-    number: ?u32 = null,
-    revision: ?u8 = null,
-
-    pub fn parse(name: []const u8) SchemeTokens {
-        const last = std.mem.lastIndexOfScalar(u8, name, '-') orelse return .{ .family = name };
-        if (last == 0) return .{ .family = name };
-        const tail = canonical(u32, name[last + 1 ..]) orelse return .{ .family = name };
-        const head = name[0..last];
-        if (std.mem.lastIndexOfScalar(u8, head, '-')) |second| {
-            if (second > 0 and tail <= 255) {
-                if (canonical(u32, head[second + 1 ..])) |n| return .{ .family = head[0..second], .number = n, .revision = @intCast(tail) };
-            }
-        }
-        return .{ .family = head, .number = tail };
-    }
-
-    fn canonical(comptime T: type, text: []const u8) ?T {
-        if (text.len == 0 or text.len > 10) return null;
-        if (text.len > 1 and text[0] == '0') return null;
-        for (text) |c| if (c < '0' or c > '9') return null;
-        return std.fmt.parseInt(T, text, 10) catch null;
-    }
-};
-
 const TableStats = struct {
     entries: u64 = 0,
     sizeless: u64 = 0,
@@ -176,15 +147,12 @@ pub const Census = struct {
     names_total: u64 = 0,
     name_set: std.AutoHashMapUnmanaged(u64, void) = .empty,
     name_bytes: u64 = 0,
-    /// Names the engine's NameTokens splits into family, number and revision.
-    current_tokenised: u64 = 0,
-    current_roundtrip_failures: u64 = 0,
-    current_families: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    current_family_bytes: u64 = 0,
-    scheme_n: u64 = 0,
-    scheme_nr: u64 = 0,
-    scheme_families: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    scheme_family_bytes: u64 = 0,
+    /// Names `ir.NameTokens` splits: `Family-N` and `Family-N-R`.
+    tokens_n: u64 = 0,
+    tokens_nr: u64 = 0,
+    roundtrip_failures: u64 = 0,
+    families: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    family_bytes: u64 = 0,
     max_number: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Census {
@@ -201,8 +169,7 @@ pub const Census = struct {
         }
         for (&c.levels) |*l| l.min.deinit(c.gpa);
         c.name_set.deinit(c.gpa);
-        c.current_families.deinit(c.gpa);
-        c.scheme_families.deinit(c.gpa);
+        c.families.deinit(c.gpa);
         c.scratch.deinit();
         c.keep.deinit();
     }
@@ -409,21 +376,16 @@ pub const Census = struct {
         const h = std.hash.Wyhash.hash(0, name);
         if (!(try c.name_set.getOrPut(c.gpa, h)).found_existing) c.name_bytes += name.len;
 
-        const cur = ir.NameTokens.parse(name);
-        if (cur.number != null) c.current_tokenised += 1;
-        var buf: [1024]u8 = undefined;
-        const back = cur.format(&buf) catch name;
-        if (!std.mem.eql(u8, back, name)) c.current_roundtrip_failures += 1;
-        const fh = std.hash.Wyhash.hash(1, cur.family);
-        if (!(try c.current_families.getOrPut(c.gpa, fh)).found_existing) c.current_family_bytes += cur.family.len;
-
-        const s = SchemeTokens.parse(name);
-        if (s.number) |n| {
+        const tokens = ir.NameTokens.parse(name);
+        if (tokens.number) |n| {
             c.max_number = @max(c.max_number, n);
-            if (s.revision != null) c.scheme_nr += 1 else c.scheme_n += 1;
+            if (tokens.revision != null) c.tokens_nr += 1 else c.tokens_n += 1;
         }
-        const sh = std.hash.Wyhash.hash(2, s.family);
-        if (!(try c.scheme_families.getOrPut(c.gpa, sh)).found_existing) c.scheme_family_bytes += s.family.len;
+        var buf: [1024]u8 = undefined;
+        const back = tokens.format(&buf) catch name;
+        if (!std.mem.eql(u8, back, name)) c.roundtrip_failures += 1;
+        const fh = std.hash.Wyhash.hash(1, tokens.family);
+        if (!(try c.families.getOrPut(c.gpa, fh)).found_existing) c.family_bytes += tokens.family.len;
     }
 
     /// The census as Markdown.
@@ -520,11 +482,8 @@ pub const Census = struct {
     fn renderNames(c: *Census, w: *Io.Writer) !void {
         try w.writeAll("\n## Signature names\n\n");
         try w.print("- names: {d}, distinct: {d}, distinct name bytes: {d}\n", .{ c.names_total, c.name_set.count(), c.name_bytes });
-        try w.print("- current tokeniser (`Family-N-R` only): {d} tokenised ({d:.2}%), {d} distinct families, {d} family bytes, {d} round-trip failures\n", .{
-            c.current_tokenised, pct(c.current_tokenised, c.names_total), c.current_families.count(), c.current_family_bytes, c.current_roundtrip_failures,
-        });
-        try w.print("- `Family-N` or `Family-N-R`, canonical decimals: {d} `Family-N` and {d} `Family-N-R` ({d:.2}%), {d} distinct families, {d} family bytes, largest N {d}\n", .{
-            c.scheme_n, c.scheme_nr, pct(c.scheme_n + c.scheme_nr, c.names_total), c.scheme_families.count(), c.scheme_family_bytes, c.max_number,
+        try w.print("- `ir.NameTokens` (`Family-N` or `Family-N-R`, canonical decimals): {d} `Family-N` and {d} `Family-N-R` ({d:.2}%), {d} distinct families, {d} family bytes, largest N {d}, {d} round-trip failures\n", .{
+            c.tokens_n, c.tokens_nr, pct(c.tokens_n + c.tokens_nr, c.names_total), c.families.count(), c.family_bytes, c.max_number, c.roundtrip_failures,
         });
     }
 
@@ -636,19 +595,6 @@ test "tiers come from the longest fixed run of the weakest variant" {
     try std.testing.expectEqual(Tier.d, Tier.of(3));
     try std.testing.expectEqual(Tier.c, Tier.of(4));
     try std.testing.expectEqual(Tier.a, Tier.of(11));
-}
-
-test "scheme tokens round-trip only canonical names" {
-    const t = SchemeTokens.parse("Win.Trojan.VB-1770");
-    try std.testing.expectEqualStrings("Win.Trojan.VB", t.family);
-    try std.testing.expectEqual(@as(?u32, 1770), t.number);
-    try std.testing.expectEqual(@as(?u8, null), t.revision);
-    const r = SchemeTokens.parse("Win.Trojan.Agent-1234567-0");
-    try std.testing.expectEqualStrings("Win.Trojan.Agent", r.family);
-    try std.testing.expectEqual(@as(?u8, 0), r.revision);
-    try std.testing.expectEqual(@as(?u32, null), SchemeTokens.parse("Win.X-01").number);
-    try std.testing.expectEqual(@as(?u32, null), SchemeTokens.parse("-5").number);
-    try std.testing.expectEqualStrings("Win.X-007", SchemeTokens.parse("Win.X-007-1").family);
 }
 
 test "census of the fixture CVD is deterministic" {

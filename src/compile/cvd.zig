@@ -334,9 +334,10 @@ pub const WalkOptions = struct {
 };
 
 /// Walk the members of a verified container body, calling `visitor.member(name, size, reader)`
-/// for each database file. `name` is only valid during the call. The reader is limited to the
-/// member; whatever the visitor does not read is drained so its hash can be checked. `header`
-/// must be the container's header.
+/// for each database file, and `visitor.infoListed(info)` (when declared) once the `.info` member
+/// is read. A visitor error ends the walk and is returned. `name` is only valid during the call.
+/// The reader is limited to the member; whatever the visitor does not read is drained so its hash
+/// can be checked. `header` must be the container's header.
 pub fn walk(
     gpa: std.mem.Allocator,
     header: Header,
@@ -381,6 +382,8 @@ pub fn walk(
             if (ih.version != header.version or ih.signatures != header.signatures or
                 ih.functionality_level != header.functionality_level or ih.build_seconds != header.build_seconds)
                 return error.InfoMismatch;
+            // A visitor that only wants some members can stop once it knows which are listed.
+            if (@hasDecl(@typeInfo(@TypeOf(visitor)).pointer.child, "infoListed")) try visitor.infoListed(&info.?);
             continue;
         }
 

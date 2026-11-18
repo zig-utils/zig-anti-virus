@@ -65,9 +65,9 @@ pub fn parse(gpa: std.mem.Allocator, format: Format, source_name: []const u8, te
     }
 }
 
-const LineError = error{ FieldCount, BadHash, BadSize, WildcardNeedsFlevel73, BadFlevel, EmptyName };
+pub const LineError = error{ FieldCount, BadHash, BadSize, WildcardNeedsFlevel73, BadFlevel, EmptyName };
 
-fn reasonOf(err: LineError) ir.Reason {
+pub fn reasonOf(err: LineError) ir.Reason {
     return switch (err) {
         error.FieldCount => .field_count,
         error.BadHash => .bad_hash,

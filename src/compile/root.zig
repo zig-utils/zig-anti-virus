@@ -23,6 +23,8 @@ pub const mbazaar = @import("mbazaar.zig");
 pub const builtin = @import("builtin.zig");
 pub const lines = @import("lines.zig");
 pub const census = @import("census.zig");
+pub const spill = @import("spill.zig");
+pub const names = @import("names.zig");
 
 test {
     _ = cvd;
@@ -47,5 +49,7 @@ test {
     _ = builtin;
     _ = lines;
     _ = census;
+    _ = spill;
+    _ = names;
     _ = @This();
 }

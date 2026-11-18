@@ -27,106 +27,125 @@ pub fn pcrePrograms(rule: *const ir.LogicalRule, out: *std.ArrayList([]const u8)
 }
 
 pub fn build(gpa: std.mem.Allocator, entries: []const Entry) ![]u8 {
-    var rpn_count: usize = 0;
-    var bc_count: usize = 0;
-    var pcre_count: usize = 0;
-    for (entries) |e| {
-        rpn_count += e.rule.expr.len;
-        for (e.rule.subsigs) |sub| switch (sub) {
-            .byte_compare => bc_count += 1,
-            .pcre => |p| {
-                pcre_count += 1;
-                rpn_count += p.trigger.len;
-            },
-            .hex => {},
-        };
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    for (entries) |e| try b.add(e);
+    return b.finish(gpa);
+}
+
+/// LDB_TABLE built one rule at a time, so rules need not stay alive until the table is written.
+/// The layout is the one `build` always produced: records, main expressions, PCRE triggers,
+/// target descriptions, byte compares, PCRE records and the always-evaluated record list.
+pub const Builder = struct {
+    gpa: std.mem.Allocator,
+    records: std.ArrayList(ldb_table.LdbRecord) = .empty,
+    exprs: std.ArrayList(ir.RpnOp) = .empty,
+    triggers: std.ArrayList(ir.RpnOp) = .empty,
+    tdbs: std.ArrayList(ldb_table.TdbRecord) = .empty,
+    bcs: std.ArrayList(ldb_table.BcRecord) = .empty,
+    /// `trigger_off` relative to the trigger pool until `finish`.
+    pcres: std.ArrayList(ldb_table.PcreRecord) = .empty,
+    /// Records whose expression holds with no hits: evaluated for every file.
+    always: std.ArrayList(u32) = .empty,
+
+    pub fn init(gpa: std.mem.Allocator) Builder {
+        return .{ .gpa = gpa };
     }
-    // Records whose expression holds with no hits are evaluated for every file.
-    var always: std.ArrayList(u32) = .empty;
-    defer always.deinit(gpa);
-    for (entries, 0..) |e, i| {
-        if (e.yara) continue;
-        var zeros: [ir.max_subsigs]u32 = @splat(0);
-        if (ldb_table.evalRpn(e.rule.expr, zeros[0..e.rule.subsigs.len])) try always.append(gpa, @intCast(i));
+
+    pub fn deinit(b: *Builder) void {
+        b.records.deinit(b.gpa);
+        b.exprs.deinit(b.gpa);
+        b.triggers.deinit(b.gpa);
+        b.tdbs.deinit(b.gpa);
+        b.bcs.deinit(b.gpa);
+        b.pcres.deinit(b.gpa);
+        b.always.deinit(b.gpa);
+        b.* = undefined;
     }
-    const header: ldb_table.LdbHeader = .{ .count = @intCast(entries.len), .rpn_count = @intCast(rpn_count), .bc_count = @intCast(bc_count), .pcre_count = @intCast(pcre_count), .always_count = @intCast(always.items.len) };
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, std.mem.asBytes(&header));
-    var expr_off: u32 = 0;
-    var bc_first: u32 = 0;
-    var pcre_first: u32 = 0;
-    for (entries) |e| {
+
+    pub fn count(b: *const Builder) u32 {
+        return @intCast(b.records.items.len);
+    }
+
+    pub fn add(b: *Builder, e: Entry) !void {
+        const gpa = b.gpa;
         var bcs: u16 = 0;
         var pcres: u16 = 0;
         var counts = ldb_table.usesCounts(e.rule.expr);
-        for (e.rule.subsigs) |sub| switch (sub) {
-            .byte_compare => bcs += 1,
+        const bc_first: u32 = @intCast(b.bcs.items.len);
+        const pcre_first: u32 = @intCast(b.pcres.items.len);
+        var regex = e.regex_first;
+        for (e.rule.subsigs, 0..) |sub, i| switch (sub) {
+            .byte_compare => |bc| {
+                bcs += 1;
+                try b.bcs.append(gpa, ldb_table.BcRecord.from(@intCast(i), bc));
+            },
             .pcre => |p| {
                 pcres += 1;
                 counts = counts or ldb_table.usesCounts(p.trigger);
+                try b.pcres.append(gpa, .{
+                    .subsig = @intCast(i),
+                    .flags = p.flags,
+                    .trigger_len = @intCast(p.trigger.len),
+                    .trigger_off = @intCast(b.triggers.items.len),
+                    .regex = regex,
+                    .off_kind = p.offset.kind,
+                    .off_section = p.offset.section,
+                    .off_a = p.offset.a,
+                    .off_shift = p.offset.shift,
+                });
+                try b.triggers.appendSlice(gpa, p.trigger);
+                regex += 1;
             },
             .hex => {},
         };
-        const rec: ldb_table.LdbRecord = .{
+        try b.records.append(gpa, .{
             .sig = e.sig,
             .nsub = @intCast(e.rule.subsigs.len),
             .flags = if (e.yara) ldb_table.flag_counts | ldb_table.flag_yara else if (counts) ldb_table.flag_counts else 0,
             .expr_len = @intCast(e.rule.expr.len),
-            .expr_off = expr_off,
+            .expr_off = @intCast(b.exprs.items.len),
             .prog_first = e.prog_first,
             .prog_count = e.prog_count,
             .bc_first = bc_first,
             .bc_count = bcs,
             .pcre_first = pcre_first,
             .pcre_count = pcres,
+        });
+        if (!e.yara) {
+            var zeros: [ir.max_subsigs]u32 = @splat(0);
+            if (ldb_table.evalRpn(e.rule.expr, zeros[0..e.rule.subsigs.len])) try b.always.append(gpa, @intCast(b.records.items.len - 1));
+        }
+        try b.exprs.appendSlice(gpa, e.rule.expr);
+        try b.tdbs.append(gpa, ldb_table.TdbRecord.from(e.rule.tdb));
+    }
+
+    /// The section bytes, allocated with `gpa`.
+    pub fn finish(b: *Builder, gpa: std.mem.Allocator) ![]u8 {
+        const header: ldb_table.LdbHeader = .{
+            .count = @intCast(b.records.items.len),
+            .rpn_count = @intCast(b.exprs.items.len + b.triggers.items.len),
+            .bc_count = @intCast(b.bcs.items.len),
+            .pcre_count = @intCast(b.pcres.items.len),
+            .always_count = @intCast(b.always.items.len),
         };
-        try out.appendSlice(gpa, std.mem.asBytes(&rec));
-        expr_off += @intCast(e.rule.expr.len);
-        bc_first += bcs;
-        pcre_first += pcres;
-    }
-    for (entries) |e| try out.appendSlice(gpa, std.mem.sliceAsBytes(e.rule.expr));
-    // PCRE triggers follow the main expressions, in the same order as the PCRE records.
-    var trigger_off: u32 = expr_off;
-    for (entries) |e| for (e.rule.subsigs) |sub| switch (sub) {
-        .pcre => |p| try out.appendSlice(gpa, std.mem.sliceAsBytes(p.trigger)),
-        else => {},
-    };
-    while (out.items.len % 8 != 0) try out.append(gpa, 0);
-    for (entries) |e| {
-        const t = ldb_table.TdbRecord.from(e.rule.tdb);
-        try out.appendSlice(gpa, std.mem.asBytes(&t));
-    }
-    for (entries) |e| for (e.rule.subsigs, 0..) |sub, i| switch (sub) {
-        .byte_compare => |bc| {
-            const r = ldb_table.BcRecord.from(@intCast(i), bc);
-            try out.appendSlice(gpa, std.mem.asBytes(&r));
-        },
-        else => {},
-    };
-    for (entries) |e| {
-        var regex = e.regex_first;
-        for (e.rule.subsigs, 0..) |sub, i| switch (sub) {
-            .pcre => |p| {
-                const r: ldb_table.PcreRecord = .{
-                    .subsig = @intCast(i),
-                    .flags = p.flags,
-                    .trigger_len = @intCast(p.trigger.len),
-                    .trigger_off = trigger_off,
-                    .regex = regex,
-                    .off_kind = p.offset.kind,
-                    .off_section = p.offset.section,
-                    .off_a = p.offset.a,
-                    .off_shift = p.offset.shift,
-                };
-                try out.appendSlice(gpa, std.mem.asBytes(&r));
-                trigger_off += @intCast(p.trigger.len);
-                regex += 1;
-            },
-            else => {},
+        // PCRE triggers follow the main expressions in the RPN pool.
+        const base: u32 = @intCast(b.exprs.items.len);
+        for (b.pcres.items) |*r| r.trigger_off += base;
+        defer for (b.pcres.items) |*r| {
+            r.trigger_off -= base;
         };
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        try out.appendSlice(gpa, std.mem.asBytes(&header));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.records.items));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.exprs.items));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.triggers.items));
+        while (out.items.len % 8 != 0) try out.append(gpa, 0);
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.tdbs.items));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.bcs.items));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.pcres.items));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(b.always.items));
+        return out.toOwnedSlice(gpa);
     }
-    try out.appendSlice(gpa, std.mem.sliceAsBytes(always.items));
-    return out.toOwnedSlice(gpa);
-}
+};

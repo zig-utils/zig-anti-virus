@@ -582,9 +582,11 @@ pub const CdbRule = struct {
     line: []const u8 = "",
 };
 
-/// A ClamAV signature name split for compact storage: `Win.Trojan.Agent-1234567-0` becomes the
-/// family `Win.Trojan.Agent`, number 1234567 and revision 0. Names without that shape keep the
-/// whole name as the family.
+/// A ClamAV signature name split for compact storage. E0 found every current name in one of two
+/// shapes: `Win.Trojan.VB-1770` (family `Win.Trojan.VB`, number 1770) and
+/// `Win.Trojan.Agent-1234567-0` (family, number, revision 0). Fields must be canonical decimals
+/// (no sign, no leading zero) so the name rebuilds byte for byte; anything else keeps the whole
+/// name as the family.
 pub const NameTokens = struct {
     family: []const u8,
     number: ?u32 = null,
@@ -592,17 +594,29 @@ pub const NameTokens = struct {
 
     pub fn parse(name: []const u8) NameTokens {
         const last = std.mem.lastIndexOfScalar(u8, name, '-') orelse return .{ .family = name };
-        const revision = std.fmt.parseInt(u8, name[last + 1 ..], 10) catch return .{ .family = name };
+        if (last == 0) return .{ .family = name };
+        const tail = canonical(name[last + 1 ..]) orelse return .{ .family = name };
         const head = name[0..last];
-        const second = std.mem.lastIndexOfScalar(u8, head, '-') orelse return .{ .family = name };
-        const number = std.fmt.parseInt(u32, head[second + 1 ..], 10) catch return .{ .family = name };
-        if (second == 0) return .{ .family = name };
-        return .{ .family = head[0..second], .number = number, .revision = revision };
+        if (tail <= 255) if (std.mem.lastIndexOfScalar(u8, head, '-')) |second| {
+            if (second > 0) if (canonical(head[second + 1 ..])) |n|
+                return .{ .family = head[0..second], .number = n, .revision = @intCast(tail) };
+        };
+        return .{ .family = head, .number = tail };
+    }
+
+    fn canonical(text: []const u8) ?u32 {
+        if (text.len == 0 or text.len > 10) return null;
+        if (text.len > 1 and text[0] == '0') return null;
+        for (text) |c| if (c < '0' or c > '9') return null;
+        return std.fmt.parseInt(u32, text, 10) catch null;
     }
 
     /// Writes the original name back into `out`.
     pub fn format(tokens: NameTokens, out: []u8) ![]const u8 {
-        if (tokens.number) |n| return std.fmt.bufPrint(out, "{s}-{d}-{d}", .{ tokens.family, n, tokens.revision.? });
+        if (tokens.number) |n| {
+            if (tokens.revision) |r| return std.fmt.bufPrint(out, "{s}-{d}-{d}", .{ tokens.family, n, r });
+            return std.fmt.bufPrint(out, "{s}-{d}", .{ tokens.family, n });
+        }
         if (tokens.family.len > out.len) return error.NoSpaceLeft;
         @memcpy(out[0..tokens.family.len], tokens.family);
         return out[0..tokens.family.len];
@@ -611,7 +625,7 @@ pub const NameTokens = struct {
 
 test "name tokens round-trip" {
     var buf: [128]u8 = undefined;
-    for ([_][]const u8{ "Win.Trojan.Agent-1234567-0", "Eicar-Test-Signature", "Doc.Malware.X-1-12", "-1-2", "Plain" }) |name| {
+    for ([_][]const u8{ "Win.Trojan.Agent-1234567-0", "Win.Trojan.VB-1770", "Eicar-Test-Signature", "Doc.Malware.X-1-12", "-1-2", "Plain", "Win.X-01", "Win.X-007-1", "A-1-256", "A-+1", "Js.Trojan.Agent-1553495-4663817-1" }) |name| {
         const t = NameTokens.parse(name);
         try std.testing.expectEqualStrings(name, try t.format(&buf));
     }
@@ -619,5 +633,11 @@ test "name tokens round-trip" {
     try std.testing.expectEqualStrings("Win.Trojan.Agent", t.family);
     try std.testing.expectEqual(@as(?u32, 1234567), t.number);
     try std.testing.expectEqual(@as(?u8, 0), t.revision);
+    const one = NameTokens.parse("Win.Trojan.VB-1770");
+    try std.testing.expectEqualStrings("Win.Trojan.VB", one.family);
+    try std.testing.expectEqual(@as(?u8, null), one.revision);
     try std.testing.expectEqual(@as(?u32, null), NameTokens.parse("Eicar-Test-Signature").number);
+    try std.testing.expectEqual(@as(?u32, null), NameTokens.parse("Win.X-01").number);
+    // A revision above 255 is a number: the family keeps the earlier number.
+    try std.testing.expectEqualStrings("A-1", NameTokens.parse("A-1-256").family);
 }

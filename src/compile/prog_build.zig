@@ -3,6 +3,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const prog = @import("../match/prog.zig");
+const spill_mod = @import("spill.zig");
 
 pub const Input = struct {
     pattern: ir.Pattern,
@@ -65,38 +66,93 @@ pub fn minLen(p: ir.Pattern) u32 {
 
 /// The section bytes for `inputs`, in order: program i is input i.
 pub fn build(gpa: std.mem.Allocator, inputs: []const Input) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    const header: prog.SectionHeader = .{ .count = @intCast(inputs.len) };
-    try out.appendSlice(gpa, std.mem.asBytes(&header));
-    try out.appendNTimes(gpa, 0, inputs.len * 4);
-    for (inputs, 0..) |in, i| {
-        while (out.items.len % 4 != 0) try out.append(gpa, 0);
-        std.mem.writeInt(u32, out.items[@sizeOf(prog.SectionHeader) + i * 4 ..][0..4], @intCast(out.items.len), .little);
-        const anchor = chooseAnchor(in.pattern, in.offset.kind != .any);
-        const h: prog.ProgHeader = .{
-            .sig = in.sig,
-            .subsig = in.subsig,
-            .target = in.target,
-            .flags = in.flags,
-            .off_kind = in.offset.kind,
-            .anchor_part = anchor.part,
-            .off_section = in.offset.section,
-            .off_a = in.offset.a,
-            .off_shift = in.offset.shift,
-            .op_count = @intCast(in.pattern.ops.len),
-            .part_count = @intCast(in.pattern.partCount()),
-            .data_len = @intCast(in.pattern.data.len),
-            .min_len = minLen(in.pattern),
-            .anchor_op = anchor.op,
-            .anchor_delta = anchor.delta,
-        };
-        try out.appendSlice(gpa, std.mem.asBytes(&h));
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(in.pattern.ops));
-        try out.appendSlice(gpa, in.pattern.data);
-    }
-    return out.toOwnedSlice(gpa);
+    var w = Writer.init(gpa, null);
+    defer w.deinit();
+    for (inputs) |in| _ = try w.add(in);
+    const section = try w.finish();
+    return gpa.dupe(u8, section);
 }
+
+/// One program as it is laid out in the section (header, ops, data).
+fn header(in: Input) prog.ProgHeader {
+    const anchor = chooseAnchor(in.pattern, in.offset.kind != .any);
+    return .{
+        .sig = in.sig,
+        .subsig = in.subsig,
+        .target = in.target,
+        .flags = in.flags,
+        .off_kind = in.offset.kind,
+        .anchor_part = anchor.part,
+        .off_section = in.offset.section,
+        .off_a = in.offset.a,
+        .off_shift = in.offset.shift,
+        .op_count = @intCast(in.pattern.ops.len),
+        .part_count = @intCast(in.pattern.partCount()),
+        .data_len = @intCast(in.pattern.data.len),
+        .min_len = minLen(in.pattern),
+        .anchor_op = anchor.op,
+        .anchor_delta = anchor.delta,
+    };
+}
+
+/// SUBSIG_PROG built one program at a time: bodies go to a (spill-backed) sink as they come, the
+/// index stays on the heap, and `finish` puts header, index and bodies together.
+pub const Writer = struct {
+    gpa: std.mem.Allocator,
+    spill: ?*spill_mod.Spill,
+    /// Body offsets relative to the first body byte.
+    index: std.ArrayList(u32) = .empty,
+    bodies: spill_mod.Sink,
+    section: ?spill_mod.Sink = null,
+
+    pub fn init(gpa: std.mem.Allocator, spill: ?*spill_mod.Spill) Writer {
+        return .{ .gpa = gpa, .spill = spill, .bodies = .init(gpa, spill) };
+    }
+
+    pub fn deinit(w: *Writer) void {
+        w.index.deinit(w.gpa);
+        w.bodies.deinit();
+        if (w.section) |*s| s.deinit();
+        w.* = undefined;
+    }
+
+    pub fn count(w: *const Writer) u32 {
+        return @intCast(w.index.items.len);
+    }
+
+    /// Append a program; returns its number.
+    pub fn add(w: *Writer, in: Input) !u32 {
+        const n = w.count();
+        try w.bodies.alignTo(4);
+        try w.index.append(w.gpa, @intCast(w.bodies.len));
+        const h = header(in);
+        try w.bodies.append(std.mem.asBytes(&h));
+        try w.bodies.append(std.mem.sliceAsBytes(in.pattern.ops));
+        try w.bodies.append(in.pattern.data);
+        return n;
+    }
+
+    /// The finished section, 4-byte aligned, valid until `deinit`.
+    pub fn finish(w: *Writer) ![]align(4) const u8 {
+        const bodies = try w.bodies.finish();
+        const base = @sizeOf(prog.SectionHeader) + w.index.items.len * 4;
+        if (base + bodies.len > std.math.maxInt(u32)) return error.TooLarge;
+        for (w.index.items) |*off| off.* += @intCast(base);
+        var section = spill_mod.Sink.init(w.gpa, w.spill);
+        errdefer section.deinit();
+        const h: prog.SectionHeader = .{ .count = w.count() };
+        try section.append(std.mem.asBytes(&h));
+        try section.append(std.mem.sliceAsBytes(w.index.items));
+        try section.append(bodies);
+        w.section = section;
+        // The bodies are copied; their spill file can go.
+        w.bodies.deinit();
+        w.bodies = .init(w.gpa, null);
+        const bytes = try w.section.?.finish();
+        std.debug.assert(@intFromPtr(bytes.ptr) % 4 == 0);
+        return @alignCast(bytes);
+    }
+};
 
 const testing = std.testing;
 const hexsig = @import("hexsig.zig");

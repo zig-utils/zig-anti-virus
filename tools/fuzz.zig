@@ -899,28 +899,57 @@ fn hashLine(random: std.Random) void {
 }
 
 /// Hash-index section validation must reject corrupt sections instead of reading out of bounds.
+/// Starts from real sections (a bitmap and a list need map, a table, SIGMETA) and corrupts them.
 fn hashSections(random: std.Random) void {
     const hashidx = zav.match.hashidx;
-    var buf: [hashidx.top_entries * 4 + 64 + 4096 + 64]u8 align(8) = @splat(0);
-    random.bytes(buf[0..random.uintLessThan(usize, 256)]);
-    @memcpy(buf[0..4], "NEED");
-    buf[4] = 1;
-    for (0..random.uintLessThan(usize, 16)) |_| buf[random.uintLessThan(usize, buf.len)] = random.int(u8);
-    if (hashidx.NeedMap.init(buf[0..random.uintLessThan(usize, buf.len + 1)])) |map| {
-        _ = map.mask(random.int(u64) % (hashidx.dense_limit * 2));
+    const S = struct {
+        var built: ?zav.compile.hash_build.Built = null;
+    };
+    if (S.built == null) {
+        const gpa = std.heap.page_allocator;
+        var rules: [6000]zav.compile.ir.HashRule = undefined;
+        var prng = std.Random.DefaultPrng.init(1);
+        for (&rules, 0..) |*r, i| {
+            var digest: [32]u8 = undefined;
+            prng.random().bytes(&digest);
+            r.* = .{ .algo = if (i % 50 == 0) .sha256 else .md5, .scope = .file, .digest = digest, .size = prng.random().uintLessThan(u64, 1 << 25), .name = if (i % 2 == 0) "Win.Trojan.A-1-0" else "Win.Trojan.B-7", .source = .hdb };
+        }
+        S.built = zav.compile.hash_build.build(gpa, &rules) catch @panic("fuzz: build");
+    }
+    const b = &S.built.?;
+    var need_buf: [64 * 1024]u8 align(8) = undefined;
+    const need = b.need_maps[0].?;
+    const n = @min(need.len, need_buf.len);
+    @memcpy(need_buf[0..n], need[0..n]);
+    for (0..random.uintLessThan(usize, 8)) |_| need_buf[random.uintLessThan(usize, @min(n, 160))] = random.int(u8);
+    for (0..random.uintLessThan(usize, 8)) |_| need_buf[random.uintLessThan(usize, n)] = random.int(u8);
+    if (hashidx.NeedMap.init(need_buf[0..random.uintLessThan(usize, n + 1)])) |map| {
+        for (0..16) |_| _ = map.mask(random.int(u64) % (hashidx.dense_limit * 2));
     } else |_| {}
-    var hot: [512]u8 align(8) = @splat(0);
-    var cold: [512]u8 = @splat(0);
-    random.bytes(&hot);
-    random.bytes(&cold);
-    @memcpy(hot[0..4], "HASH");
-    hot[4] = 1;
-    hot[8] = random.uintLessThan(u8, 3);
-    hot[9] = random.uintLessThan(u8, 3);
-    if (hashidx.Table.init(&hot, &cold)) |t| {
+
+    var hot_buf: [32 * 1024]u8 align(8) = undefined;
+    var cold_buf: [128 * 1024]u8 = undefined;
+    const hot = b.hot[0].?;
+    const cold = b.cold[0].?;
+    const hn = @min(hot.len, hot_buf.len);
+    const cn = @min(cold.len, cold_buf.len);
+    @memcpy(hot_buf[0..hn], hot[0..hn]);
+    @memcpy(cold_buf[0..cn], cold[0..cn]);
+    for (0..random.uintLessThan(usize, 6)) |_| hot_buf[random.uintLessThan(usize, @min(hn, 96))] = random.int(u8);
+    for (0..random.uintLessThan(usize, 6)) |_| hot_buf[random.uintLessThan(usize, hn)] = random.int(u8);
+    if (hashidx.Table.init(hot_buf[0..random.uintLessThan(usize, hn + 1)], cold_buf[0..cn])) |t| {
         var d: [32]u8 = undefined;
         random.bytes(&d);
-        _ = t.lookup(random.int(u16), d[0..t.algo.digestLen()]);
+        _ = t.lookup(random.int(u64) % (1 << 25), d[0..t.algo.digestLen()]);
+    } else |_| {}
+
+    var meta_buf: [64 * 1024]u8 align(8) = undefined;
+    const mn = @min(b.sigmeta.len, meta_buf.len);
+    @memcpy(meta_buf[0..mn], b.sigmeta[0..mn]);
+    for (0..random.uintLessThan(usize, 6)) |_| meta_buf[random.uintLessThan(usize, mn)] = random.int(u8);
+    if (hashidx.SigMeta.init(meta_buf[0..random.uintLessThan(usize, mn + 1)], b.names.?.namePool())) |meta| {
+        var name: [256]u8 = undefined;
+        for (0..4) |_| _ = meta.name(random.uintLessThan(u32, @intCast(meta.count() + 2)), &name) catch {};
     } else |_| {}
 }
 
