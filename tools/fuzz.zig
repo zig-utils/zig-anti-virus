@@ -69,6 +69,10 @@ pub fn main(init: std.process.Init) !void {
             logicalDiff(random);
             cases += 1;
         }
+        if (selected(only, "byteCompare")) {
+            byteCompare(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
         // Format parsers and decoders (fmt/): one per iteration in rotation, or every target whose
@@ -592,7 +596,7 @@ fn logicalDiff(random: std.Random) void {
         const l = random.uintLessThan(u32, lines.len);
         const nsub = fx.table.records[l].nsub;
         const sub = random.uintLessThan(u16, nsub);
-        fx.state.touch(fx.table, ctx, l, sub) catch @panic("fuzz: logical touch failed");
+        fx.state.touch(fx.table, ctx, l, sub, 0) catch @panic("fuzz: logical touch failed");
         touched[l] = true;
         counts[l][sub] += 1;
     }
@@ -605,10 +609,51 @@ fn logicalDiff(random: std.Random) void {
         want[l] = lt.evalRpn(fx.table.expr(rec), c[0..rec.nsub]);
     }
     var out: [lines.len]u32 = undefined;
-    const n = fx.state.finalize(fx.table, &out);
+    const n = fx.state.finalize(fx.table, "", &out);
     var got: [lines.len]bool = @splat(false);
     for (out[0..n]) |l| got[l] = true;
     if (!std.mem.eql(bool, &want, &got)) @panic("fuzz: sparse logical state disagrees with the dense reference");
+}
+
+/// Byte-compare subsigs: mutated text through the parser, then evaluation at random trigger
+/// starts over random data; a binary compare is checked against a direct read.
+fn byteCompare(random: std.Random) void {
+    const lt = zav.match.ldb_table;
+    const seeds = [_][]const u8{
+        "0(>>4#hb2#=0x10)",
+        "0(<<0x10#hle8#>1,<0xffff)",
+        "0(>>2#de3#=123)",
+        "0(>>2#a6#<0x1f)",
+        "0(>>1#il4#=0x04030201)",
+        "0(>>0#ib8#>5)",
+    };
+    var buf: [64]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const text = mutate(random, &buf, seed.len, "0123456789abcdefx#<>=,hdailbe()");
+    const bc = zav.compile.ldb.parseByteCompare(text, 1) catch return;
+    const rec = lt.BcRecord.from(1, bc);
+    var data: [40]u8 = undefined;
+    const alphabet = "0123456789abcdefABCDEFx \x00\xff";
+    for (&data) |*b| b.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+    const len = random.uintAtMost(usize, data.len);
+    const start = random.uintAtMost(usize, len + 4);
+    const got = lt.evalByteCompare(rec, data[0..len], start);
+    if (bc.kind == .binary and !bc.backward) {
+        const pos = start +| bc.offset;
+        if (pos + bc.width > len) {
+            if (got != .out_of_bounds) @panic("fuzz: byte compare read past the data");
+            return;
+        }
+        const v = if (bc.big_endian) std.mem.readVarInt(u64, data[pos..][0..bc.width], .big) else std.mem.readVarInt(u64, data[pos..][0..bc.width], .little);
+        var want = true;
+        for (bc.comparisons[0..bc.comparison_count]) |c| want = want and switch (c.op) {
+            .lt => v < c.value,
+            .gt => v > c.value,
+            .eq => v == c.value,
+        };
+        if ((got == .yes) != want) @panic("fuzz: binary byte compare disagrees with a direct read");
+    }
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.

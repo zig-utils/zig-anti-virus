@@ -117,7 +117,7 @@ pub const Reason = enum(u8) {
     fuzzy_image_unsupported,
     icon_unsupported,
     handler_type_unsupported,
-    byte_compare_unsupported,
+    bad_byte_compare,
 };
 
 pub const Rejection = struct {
@@ -359,8 +359,44 @@ pub const max_subsigs = 64;
 /// Deepest evaluation stack an expression may need.
 pub const max_rpn_depth = 64;
 
+/// How a byte-compare subsig reads its number.
+pub const ByteKind = enum(u8) {
+    /// `h`: hexadecimal text
+    hex = 0,
+    /// `d`: decimal text
+    decimal = 1,
+    /// `a`: hexadecimal when the text starts with 0x, decimal otherwise
+    auto = 2,
+    /// `i`: raw binary of 1, 2, 4 or 8 bytes
+    binary = 3,
+};
+
+pub const CmpOp = enum(u8) { lt = 0, gt = 1, eq = 2 };
+
+pub const Comparison = struct { op: CmpOp, value: u64 };
+
+/// `trigger(>>offset#options#comparisons)`: read a number relative to each match of subsig
+/// `trigger` and compare it (docs: LogicalSignatures, Byte Compare Subsignatures).
+pub const ByteCompare = struct {
+    trigger: u8,
+    /// Distance from the start of the trigger match; `backward` for `<<`.
+    offset: u32,
+    backward: bool = false,
+    kind: ByteKind,
+    big_endian: bool,
+    /// Evaluate only if exactly `width` bytes (or digits) can be read.
+    exact: bool,
+    width: u8,
+    comparisons: [2]Comparison = undefined,
+    comparison_count: u8,
+};
+
+/// Text widths up to this many characters; binary widths are 1, 2, 4 or 8.
+pub const max_text_width: u8 = 20;
+
 pub const LogicalSubsig = union(enum) {
     hex: Subsig,
+    byte_compare: ByteCompare,
 };
 
 /// An `.ldb` logical signature.

@@ -216,6 +216,8 @@ pub const Compiler = struct {
                     try c.coverage.skip(c.gpa, @tagName(rule.source), hexsig.reasonOf(err));
                     continue :logical;
                 },
+                // Byte compares run at evaluation time and have no program.
+                .byte_compare => out.* = &.{},
             };
             try kept_logicals.append(c.gpa, rule);
             try logical_variants.append(c.gpa, per_subsig);
@@ -243,6 +245,7 @@ pub const Compiler = struct {
         for (kept_logicals.items, logical_variants.items, logical_sigs, 0..) |rule, per_subsig, sig, record| {
             const first: u32 = @intCast(inputs.items.len);
             for (rule.subsigs, per_subsig, 0..) |sub, variants, i| {
+                if (sub != .hex) continue;
                 const h = sub.hex;
                 for (variants) |v| {
                     var flags: u8 = prog.flag_ldb;

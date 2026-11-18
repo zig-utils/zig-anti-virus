@@ -6,6 +6,7 @@
 //!     records: [count]LdbRecord (32 bytes)   {sig, nsub, flags, expr_len, expr_off, prog range}
 //!     rpn:     [rpn_count]ir.RpnOp (8 bytes)
 //!     tdbs:    [count]TdbRecord (96 bytes)    record i's target description
+//!     bcs:     [bc_count]BcRecord (32 bytes)  byte-compare subsigs, by record
 //!
 //! A record's subsignature programs are a contiguous range of SUBSIG_PROG, each flagged as a
 //! logical subsig and pointing back at the record. `LdbTable.init` checks all of that, and that
@@ -88,7 +89,51 @@ pub const TdbRecord = extern struct {
     }
 };
 
+/// A byte-compare subsig (docs: LogicalSignatures, Byte Compare Subsignatures).
+pub const BcRecord = extern struct {
+    /// The subsig index this compare occupies in its signature.
+    subsig: u8,
+    /// The body subsig whose match starts are the reference points.
+    trigger: u8,
+    kind: ir.ByteKind,
+    /// bit 0 big-endian, bit 1 exact, bit 2 backward offset
+    flags: u8,
+    width: u8,
+    comparison_count: u8,
+    ops: [2]ir.CmpOp,
+    offset: u32,
+    _pad: u32 = 0,
+    values: [2]u64,
+
+    pub const big_endian: u8 = 1 << 0;
+    pub const exact: u8 = 1 << 1;
+    pub const backward: u8 = 1 << 2;
+
+    pub fn from(subsig: u8, bc: ir.ByteCompare) BcRecord {
+        var r: BcRecord = .{
+            .subsig = subsig,
+            .trigger = bc.trigger,
+            .kind = bc.kind,
+            .flags = 0,
+            .width = bc.width,
+            .comparison_count = bc.comparison_count,
+            .ops = .{ .eq, .eq },
+            .offset = bc.offset,
+            .values = .{ 0, 0 },
+        };
+        if (bc.big_endian) r.flags |= big_endian;
+        if (bc.exact) r.flags |= exact;
+        if (bc.backward) r.flags |= backward;
+        for (bc.comparisons[0..bc.comparison_count], 0..) |c, i| {
+            r.ops[i] = c.op;
+            r.values[i] = c.value;
+        }
+        return r;
+    }
+};
+
 comptime {
+    std.debug.assert(@sizeOf(BcRecord) == 32);
     std.debug.assert(@sizeOf(LdbHeader) == 32);
     std.debug.assert(@sizeOf(LdbRecord) == 32);
     std.debug.assert(@sizeOf(TdbRecord) == 96);
@@ -171,6 +216,7 @@ pub const LdbTable = struct {
     records: []const LdbRecord,
     rpn: []const ir.RpnOp,
     tdbs: []const TdbRecord,
+    bcs: []const BcRecord,
 
     pub const Error = error{BadLdbTable};
 
@@ -181,12 +227,14 @@ pub const LdbTable = struct {
         const records_at = @sizeOf(LdbHeader);
         const rpn_at = records_at + @as(usize, h.count) * @sizeOf(LdbRecord);
         const tdb_at = std.mem.alignForward(usize, rpn_at + @as(usize, h.rpn_count) * @sizeOf(ir.RpnOp), 8);
-        const end = tdb_at + @as(usize, h.count) * @sizeOf(TdbRecord);
+        const bc_at = tdb_at + @as(usize, h.count) * @sizeOf(TdbRecord);
+        const end = bc_at + @as(usize, h.bc_count) * @sizeOf(BcRecord);
         if (end > section.len) return error.BadLdbTable;
+        const b: [*]const BcRecord = @ptrCast(@alignCast(section.ptr + bc_at));
         const r: [*]const LdbRecord = @ptrCast(@alignCast(section.ptr + records_at));
         const o: [*]const ir.RpnOp = @ptrCast(@alignCast(section.ptr + rpn_at));
         const t: [*]const TdbRecord = @ptrCast(@alignCast(section.ptr + tdb_at));
-        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count] };
+        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count], .bcs = b[0..h.bc_count] };
         const nprog = if (programs) |ps| ps.count() else 0;
         for (table.records, table.tdbs, 0..) |rec, tdb, i| {
             if (rec.nsub == 0 or rec.nsub > ir.max_subsigs) return error.BadLdbTable;
@@ -195,11 +243,20 @@ pub const LdbTable = struct {
             if ((rec.flags & flag_counts != 0) != usesCounts(table.expr(rec))) return error.BadLdbTable;
             if (tdb.target > 14 or tdb.intermediate_count > ir.max_intermediates) return error.BadLdbTable;
             if (@as(u64, rec.prog_first) + rec.prog_count > nprog) return error.BadLdbTable;
-            if (rec.bc_count != 0) return error.BadLdbTable;
+            if (@as(u64, rec.bc_first) + rec.bc_count > h.bc_count) return error.BadLdbTable;
+            // Subsigs that have programs, and those that are byte compares, never overlap.
+            var with_programs: u64 = 0;
             if (programs) |ps| for (rec.prog_first..rec.prog_first + rec.prog_count) |j| {
                 const ph = ps.get(j).header;
                 if (ph.flags & prog.flag_ldb == 0 or ph.sig != i or ph.subsig >= rec.nsub) return error.BadLdbTable;
+                with_programs |= @as(u64, 1) << @intCast(ph.subsig);
             };
+            for (table.bcs[rec.bc_first..][0..rec.bc_count]) |bc| {
+                if (!validBc(bc, rec.nsub)) return error.BadLdbTable;
+                const own = @as(u64, 1) << @intCast(bc.subsig);
+                const trig = @as(u64, 1) << @intCast(bc.trigger);
+                if (programs != null and (with_programs & own != 0 or with_programs & trig == 0)) return error.BadLdbTable;
+            }
         }
         return table;
     }
@@ -207,7 +264,121 @@ pub const LdbTable = struct {
     pub fn expr(table: LdbTable, rec: LdbRecord) []const ir.RpnOp {
         return table.rpn[rec.expr_off..][0..rec.expr_len];
     }
+
+    pub fn byteCompares(table: LdbTable, rec: LdbRecord) []const BcRecord {
+        return table.bcs[rec.bc_first..][0..rec.bc_count];
+    }
 };
+
+fn validBc(bc: BcRecord, nsub: u8) bool {
+    if (bc.subsig >= nsub or bc.trigger >= nsub or bc.subsig == bc.trigger) return false;
+    if (@backingInt(bc.kind) > @backingInt(ir.ByteKind.binary) or bc.flags & ~@as(u8, 7) != 0) return false;
+    if (bc.width == 0 or bc.width > ir.max_text_width) return false;
+    if (bc.kind == .binary and (bc.flags & BcRecord.exact == 0 or !(bc.width == 1 or bc.width == 2 or bc.width == 4 or bc.width == 8))) return false;
+    if (bc.comparison_count == 0 or bc.comparison_count > 2) return false;
+    for (bc.ops[0..bc.comparison_count]) |op| if (@backingInt(op) > @backingInt(ir.CmpOp.eq)) return false;
+    return true;
+}
+
+pub const BcResult = enum { yes, no, out_of_bounds };
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Read the number a byte compare points at, relative to a trigger match starting at `start`,
+/// and compare it. A position outside the data is reported, not silently false.
+pub fn evalByteCompare(bc: BcRecord, data: []const u8, start: usize) BcResult {
+    const off: usize = bc.offset;
+    const pos = if (bc.flags & BcRecord.backward != 0) (if (off > start) return .out_of_bounds else start - off) else start +| off;
+    if (pos >= data.len) return .out_of_bounds;
+    const exact = bc.flags & BcRecord.exact != 0;
+    const big = bc.flags & BcRecord.big_endian != 0;
+    if (exact and data.len - pos < bc.width) return .out_of_bounds;
+    const field = data[pos..][0..@min(bc.width, data.len - pos)];
+    const value: u64 = switch (bc.kind) {
+        .binary => if (big) std.mem.readVarInt(u64, field, .big) else std.mem.readVarInt(u64, field, .little),
+        .decimal => decimal(field, exact) orelse return .no,
+        .hex => hexText(field, exact, big) orelse return .no,
+        .auto => if (field.len >= 2 and field[0] == '0' and (field[1] == 'x' or field[1] == 'X'))
+            hexText(field[2..], exact, big) orelse return .no
+        else
+            decimal(field, exact) orelse return .no,
+    };
+    for (bc.ops[0..bc.comparison_count], bc.values[0..bc.comparison_count]) |op, k| {
+        const ok = switch (op) {
+            .lt => value < k,
+            .gt => value > k,
+            .eq => value == k,
+        };
+        if (!ok) return .no;
+    }
+    return .yes;
+}
+
+fn decimal(field: []const u8, exact: bool) ?u64 {
+    var v: u64 = 0;
+    var n: usize = 0;
+    for (field) |c| {
+        if (c < '0' or c > '9') break;
+        v = std.math.mul(u64, v, 10) catch return null;
+        v = std.math.add(u64, v, c - '0') catch return null;
+        n += 1;
+    }
+    if (n == 0 or (exact and n != field.len)) return null;
+    return v;
+}
+
+/// Hex digits, most significant first; little-endian swaps the bytes they spell.
+fn hexText(field: []const u8, exact: bool, big: bool) ?u64 {
+    var v: u64 = 0;
+    var n: usize = 0;
+    for (field) |c| {
+        const d = hexDigit(c) orelse break;
+        if (n == 16) return null;
+        v = (v << 4) | d;
+        n += 1;
+    }
+    if (n == 0 or (exact and n != field.len)) return null;
+    if (big) return v;
+    if (n % 2 != 0) return null;
+    const bytes = n / 2;
+    return @byteSwap(v) >> @intCast(64 - bytes * 8);
+}
+
+test "byte compare evaluation: encodings, widths, endianness, bounds" {
+    const Case = struct { []const u8, []const u8, usize, BcResult };
+    const ldb = @import("../compile/ldb.zig");
+    for ([_]Case{
+        .{ "0(>>2#hb4#=0x1234)", "ab1234zz", 0, .yes },
+        .{ "0(>>2#hl4#=0x3412)", "ab1234zz", 0, .yes },
+        .{ "0(>>2#hb4#=0x12)", "ab12zzzz", 0, .yes }, // not exact: stops at the first non-digit
+        .{ "0(>>2#hbe4#=0x12)", "ab12zzzz", 0, .no }, // exact needs four digits
+        .{ "0(>>2#d3#=123)", "ab123", 0, .yes },
+        .{ "0(>>2#de3#=12)", "ab12", 0, .out_of_bounds },
+        .{ "0(>>2#d3#>100,<200)", "ab150", 0, .yes },
+        .{ "0(>>2#d3#>100,<200)", "ab250", 0, .no },
+        .{ "0(>>2#a6#=0x1f)", "ab0x1f;", 0, .yes },
+        .{ "0(>>2#a6#=31)", "ab31;", 0, .yes },
+        .{ "0(>>1#ib1#=0x7f)", "\x00\x7f", 0, .yes },
+        .{ "0(>>1#il2#=0x0201)", "\x00\x01\x02", 0, .yes },
+        .{ "0(>>1#ib2#=0x0102)", "\x00\x01\x02", 0, .yes },
+        .{ "0(>>0#il4#=0x04030201)", "\x01\x02\x03\x04", 0, .yes },
+        .{ "0(>>0#ib8#=0x0102030405060708)", "\x01\x02\x03\x04\x05\x06\x07\x08", 0, .yes },
+        .{ "0(>>0#il8#<1)", "\x01\x02\x03", 0, .out_of_bounds },
+        .{ "0(<<2#ib1#=0x41)", "xA..", 3, .yes },
+        .{ "0(<<9#ib1#=0x41)", "xA..", 3, .out_of_bounds },
+        .{ "0(>>9#d1#=1)", "1", 0, .out_of_bounds },
+    }) |c| {
+        const bc = try ldb.parseByteCompare(c[0], 1);
+        try testing.expectEqual(c[3], evalByteCompare(BcRecord.from(1, bc), c[1], c[2]));
+    }
+}
 
 /// What target description predicates are checked against.
 pub const FileContext = struct {

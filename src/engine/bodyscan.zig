@@ -75,7 +75,8 @@ const Collector = struct {
     ctx: lt.FileContext,
     hit: ?Detection = null,
     last: vm.Match = .{ .start = 0, .end = 0 },
-    err: ?anyerror = null,
+    /// The logical state's spill arena filled up: reported as a limit.
+    overflow: bool = false,
 
     fn take(c: *Collector, h: anchored.Hit) bool {
         const p = c.programs.get(h.prog);
@@ -83,8 +84,8 @@ const Collector = struct {
             c.hit = .{ .sig = p.header.sig, .start = h.match.start, .end = h.match.end };
             return false;
         }
-        c.touch(p, h.match) catch |err| {
-            c.err = err;
+        c.touch(p, h.match) catch {
+            c.overflow = true;
             return false;
         };
         return true;
@@ -95,7 +96,7 @@ const Collector = struct {
         const table = c.index.ldb orelse return;
         if (p.header.sig >= table.records.len) return;
         c.last = m;
-        try state.touch(table, c.ctx, p.header.sig, p.header.subsig);
+        try state.touch(table, c.ctx, p.header.sig, p.header.subsig, m.start);
     }
 
     /// The logical signature does not count matches and already has this subsig.
@@ -103,7 +104,9 @@ const Collector = struct {
         const state = c.state orelse return true;
         const table = c.index.ldb orelse return true;
         if (p.header.sig >= table.records.len) return true;
-        if (table.records[p.header.sig].flags & lt.flag_counts != 0) return false;
+        const rec = table.records[p.header.sig];
+        // Counting signatures need every match; byte compares need their triggers' starts.
+        if (rec.flags & lt.flag_counts != 0 or rec.bc_count > 0) return false;
         return state.settled(p.header.sig, p.header.subsig);
     }
 };
@@ -120,8 +123,8 @@ pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget:
         if (n == 1 and target == 0) break;
         const a = if (part < index.anchored.len) index.anchored[part] orelse continue else continue;
         anchored.scan(a, progs, data, info, budget, &c, Collector.take) catch break;
-        if (c.err) |err| return err;
         if (c.hit) |d| return .{ .infected = d };
+        if (c.overflow) break;
     }
     // Everything else is searched for.
     scan: for (0..progs.count()) |i| {
@@ -135,16 +138,23 @@ pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget:
             const m = scanner.next() catch break :scan;
             const hit = m orelse break;
             if (!is_ldb) return .{ .infected = .{ .sig = p.header.sig, .start = hit.start, .end = hit.end } };
-            try c.touch(p, hit);
+            c.touch(p, hit) catch {
+                c.overflow = true;
+                break :scan;
+            };
             if (c.settled(p)) break;
         }
     }
     if (state) |st| if (index.ldb) |table| {
         var out: [1]u32 = undefined;
-        if (st.finalize(table, &out) > 0) {
-            return .{ .infected = .{ .sig = table.records[out[0]].sig, .start = c.last.start, .end = c.last.end } };
-        }
+        const n = st.finalize(table, data, &out);
+        if (st.bc_out_of_bounds) tracker.note(.byte_compare_bounds);
+        if (n > 0) return .{ .infected = .{ .sig = table.records[out[0]].sig, .start = c.last.start, .end = c.last.end } };
     };
+    if (c.overflow) {
+        tracker.note(.logical_state);
+        return .{ .limited = .logical_state };
+    }
     if (budget.exhausted) {
         tracker.note(.verify_steps);
         return .{ .limited = .verify_steps };
@@ -216,6 +226,7 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         \\Test.Logical.Count-2-0;Target:0;0>2&1=0;414141;5a5a5a
         \\Test.Logical.Pe-3-0;Target:1,FileSize:10-64;0&1;EP+0:e8;4d5a
         \\Test.Logical.Distinct-4-0;Target:7;(0|1|2)>1,2;6f6e65;74776f;746872656565
+        \\Test.Logical.Bc-5-0;Target:0;0&1;4c454e3d;0(>>4#de3#>100)
         \\
     );
     _ = try c.write(io, tmp.dir, "ldb.zavdb", .{ .db_version = 1 });
@@ -225,7 +236,7 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
     const names = try hashscan.HashIndex.load(database);
 
     // Logical state comes from worker scratch; the heap is never used during scans.
-    var scratch: [512 * 1024]u8 = undefined;
+    var scratch: [1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
     var state = try logical.State.init(fba.allocator());
     const reserved = fba.end_index;
@@ -245,6 +256,9 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         .{ pe, .{ .info = .{ .size = pe.len, .entry_point = 8 }, .target = 6 }, null },
         .{ "one two", .{ .info = .{ .size = 7 }, .target = 7 }, "Test.Logical.Distinct-4-0" },
         .{ "one one", .{ .info = .{ .size = 7 }, .target = 7 }, null },
+        .{ "x LEN=512;", .{ .info = .{ .size = 10 } }, "Test.Logical.Bc-5-0" },
+        .{ "x LEN=099;", .{ .info = .{ .size = 10 } }, null },
+        .{ "x LEN=5", .{ .info = .{ .size = 7 } }, null },
     }) |case| {
         state.reset();
         var budget: vm.Budget = .{};
@@ -256,4 +270,6 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         } else try std.testing.expectEqual(Verdict.clean, verdict);
     }
     try std.testing.expectEqual(reserved, fba.end_index);
+    // The last case's compare pointed past the end of the data: a bounds event, still no match.
+    try std.testing.expect(tracker.raised.contains(.byte_compare_bounds));
 }

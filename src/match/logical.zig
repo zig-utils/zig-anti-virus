@@ -6,8 +6,9 @@
 //! signatures whose expression compares counts. The target description is checked once, on a
 //! signature's first touch; a signature that fails it is marked dead and ignores later hits.
 //! When the table passes its load limit or the counter pool runs dry, entries spill into a list
-//! allocated from the worker's scratch arena: slower, never a failure. Nothing here touches the
-//! heap; every byte comes from the scratch allocator handed to `init`.
+//! in the state's own spill arena, reclaimed by `reset`: slower, and only a limit event (never a
+//! silent miss) if even that fills. Nothing here touches the heap; every byte comes from the
+//! scratch allocator handed to `init`, once, for the worker's lifetime.
 const std = @import("std");
 const ir = @import("../compile/ir.zig");
 const lt = @import("ldb_table.zig");
@@ -16,6 +17,11 @@ pub const slot_count: usize = 8192;
 /// Entries the table takes before new signatures spill (75% load).
 pub const table_limit: usize = slot_count / 4 * 3;
 pub const counter_pool: usize = 32 * 1024;
+/// Trigger match starts kept per (signature, trigger) for byte compares.
+pub const bc_offsets_per_trigger: usize = 8;
+pub const bc_pool: usize = 256;
+/// Bytes for entries that spill past the table, the counter pool or the trigger pool.
+pub const spill_bytes: usize = 256 * 1024;
 
 pub const Slot = extern struct {
     mask: u64 = 0,
@@ -32,34 +38,52 @@ comptime {
 
 pub const no_counters: u16 = 0xffff;
 
+/// Match starts of one byte-compare trigger subsig.
+const TriggerOffsets = struct {
+    ldb: u32,
+    trigger: u8,
+    n: u8 = 0,
+    starts: [bc_offsets_per_trigger]u64 = undefined,
+};
+
 const Spilled = struct {
     ldb: u32,
     mask: u64 = 0,
     dead: bool,
-    /// Counters for this entry (scratch memory), empty when the expression has no counts.
+    /// Counters for this entry (spill arena), empty when the expression has no counts.
     counts: []u16 = &.{},
 };
 
 pub const State = struct {
-    scratch: std.mem.Allocator,
+    spill_arena: std.heap.FixedBufferAllocator,
     slots: []Slot,
     touched: []u16,
     touched_len: usize = 0,
     counts: []u16,
     counts_used: usize = 0,
     spill: std.ArrayList(Spilled) = .empty,
+    /// Byte-compare trigger offsets; rare, so a short list searched linearly, moving to the
+    /// spill arena past `bc_pool`.
+    triggers: std.ArrayList(TriggerOffsets),
+    trigger_pool: []TriggerOffsets,
     /// Every match, or only the first.
     all_match: bool = false,
+    /// A byte compare pointed outside the data during the last finalize.
+    bc_out_of_bounds: bool = false,
 
-    /// Reserve the table, touched list and counter pool (about 208 KiB) from `scratch`.
+    /// Reserve the table, touched list, counter and trigger pools and the spill arena (about
+    /// 500 KiB) from `scratch`. They live as long as the worker.
     pub fn init(scratch: std.mem.Allocator) !State {
         const slots = try scratch.alloc(Slot, slot_count);
         @memset(slots, .{});
+        const pool = try scratch.alloc(TriggerOffsets, bc_pool);
         return .{
-            .scratch = scratch,
+            .spill_arena = .init(try scratch.alloc(u8, spill_bytes)),
             .slots = slots,
             .touched = try scratch.alloc(u16, table_limit),
             .counts = try scratch.alloc(u16, counter_pool),
+            .triggers = .initBuffer(pool),
+            .trigger_pool = pool,
         };
     }
 
@@ -68,8 +92,39 @@ pub const State = struct {
         for (s.touched[0..s.touched_len]) |i| s.slots[i] = .{};
         s.touched_len = 0;
         s.counts_used = 0;
-        // Spilled entries live in scratch; the scratch reset frees them with everything else.
         s.spill = .empty;
+        s.triggers = .initBuffer(s.trigger_pool);
+        s.spill_arena.reset();
+        s.bc_out_of_bounds = false;
+    }
+
+    fn recordTrigger(s: *State, table: lt.LdbTable, rec: lt.LdbRecord, ldb: u32, subsig: u16, start: u64) !void {
+        for (table.byteCompares(rec)) |bc| {
+            if (bc.trigger != subsig) continue;
+            for (s.triggers.items) |*t| if (t.ldb == ldb and t.trigger == subsig) {
+                if (t.n < bc_offsets_per_trigger) {
+                    t.starts[t.n] = start;
+                    t.n += 1;
+                }
+                return;
+            };
+            var t: TriggerOffsets = .{ .ldb = ldb, .trigger = @intCast(subsig), .n = 1 };
+            t.starts[0] = start;
+            if (s.triggers.items.len == s.triggers.capacity) {
+                // The fixed pool is full: continue in a larger copy in the spill arena (the pool
+                // itself is not the arena's, so the list must not try to resize it in place).
+                const bigger = try s.spill_arena.allocator().alloc(TriggerOffsets, s.triggers.capacity * 2);
+                @memcpy(bigger[0..s.triggers.items.len], s.triggers.items);
+                s.triggers = .{ .items = bigger[0..s.triggers.items.len], .capacity = bigger.len };
+            }
+            s.triggers.appendAssumeCapacity(t);
+            return;
+        }
+    }
+
+    fn triggerStarts(s: *const State, ldb: u32, trigger: u8) []const u64 {
+        for (s.triggers.items) |*t| if (t.ldb == ldb and t.trigger == trigger) return t.starts[0..t.n];
+        return &.{};
     }
 
     fn hash(ldb: u32) usize {
@@ -90,8 +145,8 @@ pub const State = struct {
         return null;
     }
 
-    /// Record a match of subsig `subsig` of logical signature `ldb`.
-    pub fn touch(s: *State, table: lt.LdbTable, ctx: lt.FileContext, ldb: u32, subsig: u16) !void {
+    /// Record a match of subsig `subsig` of logical signature `ldb` starting at `start`.
+    pub fn touch(s: *State, table: lt.LdbTable, ctx: lt.FileContext, ldb: u32, subsig: u16, start: u64) !void {
         const rec = table.records[ldb];
         if (subsig >= rec.nsub) return;
         const bit = @as(u64, 1) << @intCast(subsig);
@@ -99,14 +154,17 @@ pub const State = struct {
             if (slot.dead != 0) return;
             slot.mask |= bit;
             if (slot.cnt_off != no_counters) s.counts[slot.cnt_off + subsig] +|= 1;
+            if (rec.bc_count > 0) try s.recordTrigger(table, rec, ldb, subsig, start);
             return;
         }
         if (s.findSpilled(ldb)) |e| {
             if (e.dead) return;
             e.mask |= bit;
             if (e.counts.len > 0) e.counts[subsig] +|= 1;
+            if (rec.bc_count > 0) try s.recordTrigger(table, rec, ldb, subsig, start);
             return;
         }
+        if (rec.bc_count > 0 and lt.tdbMatches(table.tdbs[ldb], ctx)) try s.recordTrigger(table, rec, ldb, subsig, start);
         // First touch: the target description decides whether the signature can match at all.
         const dead = !lt.tdbMatches(table.tdbs[ldb], ctx);
         const wants_counts = rec.flags & lt.flag_counts != 0 and !dead;
@@ -129,12 +187,12 @@ pub const State = struct {
         // Spill: scratch memory, linear lookups.
         var e: Spilled = .{ .ldb = ldb, .dead = dead };
         if (wants_counts) {
-            e.counts = try s.scratch.alloc(u16, rec.nsub);
+            e.counts = try s.spill_arena.allocator().alloc(u16, rec.nsub);
             @memset(e.counts, 0);
             e.counts[subsig] = 1;
         }
         if (!dead) e.mask = bit;
-        try s.spill.append(s.scratch, e);
+        try s.spill.append(s.spill_arena.allocator(), e);
     }
 
     /// Whether subsig `subsig` of `ldb` has matched (or the signature is dead): the scan can
@@ -146,16 +204,31 @@ pub const State = struct {
         return false;
     }
 
-    fn countsOf(nsub: usize, mask: u64, counters: ?[]const u16, out: *[ir.max_subsigs]u32) []const u32 {
+    fn countsOf(s: *State, table: lt.LdbTable, data: []const u8, ldb: u32, rec: lt.LdbRecord, mask: u64, counters: ?[]const u16, out: *[ir.max_subsigs]u32) []const u32 {
+        const nsub = rec.nsub;
         for (0..nsub) |i| {
             out[i] = if (counters) |c| c[i] else @intFromBool(mask & (@as(u64, 1) << @intCast(i)) != 0);
+        }
+        // Byte compares: how many trigger matches satisfy each one.
+        for (table.byteCompares(rec)) |bc| {
+            var hits: u32 = 0;
+            for (s.triggerStarts(ldb, bc.trigger)) |start| {
+                if (start > data.len) continue;
+                switch (lt.evalByteCompare(bc, data, @intCast(start))) {
+                    .yes => hits += 1,
+                    .no => {},
+                    .out_of_bounds => s.bc_out_of_bounds = true,
+                }
+            }
+            out[bc.subsig] = if (counters != null) hits else @intFromBool(hits > 0);
         }
         return out[0..nsub];
     }
 
-    /// Evaluate every touched, live signature. Matching record indices go into `out` (the
-    /// first only, unless `all_match`); returns how many.
-    pub fn finalize(s: *State, table: lt.LdbTable, out: []u32) usize {
+    /// Evaluate every touched, live signature over the file's `data` (byte compares read it).
+    /// Matching record indices go into `out` (the first only, unless `all_match`); returns how
+    /// many.
+    pub fn finalize(s: *State, table: lt.LdbTable, data: []const u8, out: []u32) usize {
         var n: usize = 0;
         var buf: [ir.max_subsigs]u32 = undefined;
         for (s.touched[0..s.touched_len]) |i| {
@@ -163,7 +236,7 @@ pub const State = struct {
             if (slot.dead != 0) continue;
             const rec = table.records[slot.ldb];
             const counters: ?[]const u16 = if (slot.cnt_off != no_counters) s.counts[slot.cnt_off..][0..rec.nsub] else null;
-            if (lt.evalRpn(table.expr(rec), countsOf(rec.nsub, slot.mask, counters, &buf))) {
+            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, slot.ldb, rec, slot.mask, counters, &buf))) {
                 if (n == out.len) return n;
                 out[n] = slot.ldb;
                 n += 1;
@@ -174,7 +247,7 @@ pub const State = struct {
             if (e.dead) continue;
             const rec = table.records[e.ldb];
             const counters: ?[]const u16 = if (e.counts.len > 0) e.counts else null;
-            if (lt.evalRpn(table.expr(rec), countsOf(rec.nsub, e.mask, counters, &buf))) {
+            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, e.ldb, rec, e.mask, counters, &buf))) {
                 if (n == out.len) return n;
                 out[n] = e.ldb;
                 n += 1;
@@ -225,33 +298,33 @@ test "touch, target descriptions, counts, finalize and an O(touched) reset" {
         "E-5-0;Target:0;(0|1)=2,2;aa;bb", // 4: counts and distinct
     });
     defer f.deinit();
-    var mem: [512 * 1024]u8 = undefined;
+    var mem: [1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&mem);
     var s = try State.init(fba.allocator());
     const after_init = fba.end_index;
     s.all_match = true;
 
     const ctx: lt.FileContext = .{ .target = 0, .size = 100 };
-    try s.touch(f.table, ctx, 0, 0);
-    try s.touch(f.table, ctx, 1, 0); // dead: wrong target
-    try s.touch(f.table, ctx, 3, 0); // dead: wrong size
-    for (0..3) |_| try s.touch(f.table, ctx, 2, 0);
-    try s.touch(f.table, ctx, 4, 0);
-    try s.touch(f.table, ctx, 4, 1);
+    try s.touch(f.table, ctx, 0, 0, 0);
+    try s.touch(f.table, ctx, 1, 0, 0); // dead: wrong target
+    try s.touch(f.table, ctx, 3, 0, 0); // dead: wrong size
+    for (0..3) |_| try s.touch(f.table, ctx, 2, 0, 0);
+    try s.touch(f.table, ctx, 4, 0, 0);
+    try s.touch(f.table, ctx, 4, 1, 0);
     var out: [8]u32 = undefined;
-    var n = s.finalize(f.table, &out);
+    var n = s.finalize(f.table, "", &out);
     std.mem.sortUnstable(u32, out[0..n], {}, std.sort.asc(u32));
     try testing.expectEqualSlices(u32, &.{ 2, 4 }, out[0..n]); // 0 lacks subsig 1
     try testing.expect(s.settled(1, 0)); // dead counts as settled
     try testing.expect(!s.settled(0, 1));
 
-    try s.touch(f.table, ctx, 0, 1);
-    try s.touch(f.table, ctx, 4, 0); // three matches now: =2 fails
-    n = s.finalize(f.table, &out);
+    try s.touch(f.table, ctx, 0, 1, 0);
+    try s.touch(f.table, ctx, 4, 0, 0); // three matches now: =2 fails
+    n = s.finalize(f.table, "", &out);
     std.mem.sortUnstable(u32, out[0..n], {}, std.sort.asc(u32));
     try testing.expectEqualSlices(u32, &.{ 0, 2 }, out[0..n]);
     s.all_match = false;
-    try testing.expectEqual(@as(usize, 1), s.finalize(f.table, &out));
+    try testing.expectEqual(@as(usize, 1), s.finalize(f.table, "", &out));
 
     // Reset clears exactly the touched slots; no allocation happened in any of this.
     try testing.expectEqual(@as(usize, 5), s.touched_len);
@@ -259,7 +332,7 @@ test "touch, target descriptions, counts, finalize and an O(touched) reset" {
     try testing.expectEqual(@as(usize, 0), s.touched_len);
     for (s.slots) |slot| try testing.expectEqual(@as(u8, 0), slot.used);
     try testing.expectEqual(after_init, fba.end_index);
-    try testing.expectEqual(@as(usize, 0), s.finalize(f.table, &out));
+    try testing.expectEqual(@as(usize, 0), s.finalize(f.table, "", &out));
 }
 
 test "past the table limit entries spill into scratch and still evaluate" {
@@ -276,15 +349,42 @@ test "past the table limit entries spill into scratch and still evaluate" {
     @memcpy(image, bytes);
     const table = try lt.LdbTable.init(image, null);
 
-    const mem = try testing.allocator.alloc(u8, 1024 * 1024);
+    const mem = try testing.allocator.alloc(u8, 2 * 1024 * 1024);
     defer testing.allocator.free(mem);
     var fba: std.heap.FixedBufferAllocator = .init(mem);
     var s = try State.init(fba.allocator());
     s.all_match = true;
-    for (0..n_sigs) |i| try s.touch(table, .{}, @intCast(i), 0);
+    for (0..n_sigs) |i| try s.touch(table, .{}, @intCast(i), 0, 0);
     try testing.expectEqual(@as(usize, 10), s.spill.items.len);
     const out = try a.allocator().alloc(u32, n_sigs);
-    try testing.expectEqual(n_sigs, s.finalize(table, out));
+    try testing.expectEqual(n_sigs, s.finalize(table, "", out));
     s.reset();
     fba.reset();
+}
+
+test "byte compares evaluate against recorded trigger starts" {
+    var f = try fixture(&.{
+        "BC-1-0;Target:0;0&1;aa;0(>>2#ib1#=0x7f)",
+        "BC-2-0;Target:0;0>1&1;aa;0(>>1#d2#>50)",
+    });
+    defer f.deinit();
+    var mem: [1024 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var s = try State.init(fba.allocator());
+    s.all_match = true;
+    const data = "aa\x7f.....a75";
+    try s.touch(f.table, .{}, 0, 0, 0); // byte at 2 is 0x7f
+    try s.touch(f.table, .{}, 1, 0, 8); // "75" at 9
+    try s.touch(f.table, .{}, 1, 0, 0); // "\x7f." is not decimal
+    var out: [4]u32 = undefined;
+    var n = s.finalize(f.table, data, &out);
+    std.mem.sortUnstable(u32, out[0..n], {}, std.sort.asc(u32));
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, out[0..n]);
+    try testing.expect(!s.bc_out_of_bounds);
+    // A trigger near the end points past the data: no match, and the bounds event is set.
+    s.reset();
+    try s.touch(f.table, .{}, 0, 0, data.len - 1);
+    n = s.finalize(f.table, data, &out);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(s.bc_out_of_bounds);
 }

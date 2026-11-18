@@ -8,8 +8,9 @@
 //! The expression compiles to RPN (`ir.RpnOp`); `&` binds tighter than `|`, parentheses group,
 //! and `=X`, `>X`, `<X` (each with an optional `,Y` distinct count) apply to the subsig or block
 //! before them. Subsignatures are hex bodies with an optional `Offset:` prefix and `::iwfa`
-//! modifiers; PCRE, macro, byte-compare and fuzzy-image subsigs are recognised and rejected with
-//! a reason until their matchers land. At most 64 subsigs. `.ldu` holds PUA signatures.
+//! modifiers, or byte compares (`trigger(>>offset#options#comparisons)`); PCRE, macro and
+//! fuzzy-image subsigs are recognised and rejected with a reason until their matchers land. At
+//! most 64 subsigs. `.ldu` holds PUA signatures.
 const std = @import("std");
 const ir = @import("ir.zig");
 const hexsig = @import("hexsig.zig");
@@ -35,7 +36,7 @@ pub const LineError = error{
     PcreNeedsByteMode,
     MacroUnsupported,
     FuzzyImageUnsupported,
-    ByteCompareUnsupported,
+    BadByteCompare,
 } || hexsig.Error;
 
 pub fn reasonOf(err: LineError) ir.Reason {
@@ -57,7 +58,7 @@ pub fn reasonOf(err: LineError) ir.Reason {
         error.PcreNeedsByteMode => .pcre_needs_byte_mode,
         error.MacroUnsupported => .macro_unsupported,
         error.FuzzyImageUnsupported => .fuzzy_image_unsupported,
-        error.ByteCompareUnsupported => .byte_compare_unsupported,
+        error.BadByteCompare => .bad_byte_compare,
         else => |e| hexsig.reasonOf(@errorCast(e)),
     };
 }
@@ -124,6 +125,14 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
         column.* = colOf(line, text);
         sub.* = try parseSubsig(arena, text, i, tdb.target, column);
     }
+    // A byte compare's trigger must be a body subsig of this signature.
+    for (fields[3..count], subsigs) |text, sub| switch (sub) {
+        .byte_compare => |bc| if (bc.trigger >= nsub or subsigs[bc.trigger] != .hex) {
+            column.* = colOf(line, text);
+            return error.BadByteCompare;
+        },
+        .hex => {},
+    };
     column.* = 0;
     return .{
         .name = fields[0],
@@ -310,7 +319,7 @@ fn parseSubsig(arena: std.mem.Allocator, text: []const u8, index: usize, target:
     if (text.len == 0) return error.FieldCount;
     if (std.mem.startsWith(u8, text, "${")) return error.MacroUnsupported;
     if (std.mem.startsWith(u8, text, "fuzzy_img#")) return error.FuzzyImageUnsupported;
-    if (isByteCompare(text)) return error.ByteCompareUnsupported;
+    if (isByteCompare(text)) return .{ .byte_compare = try parseByteCompare(text, index) };
     if (std.mem.indexOfScalar(u8, text, '/')) |slash| {
         try checkPcre(arena, text, slash, index);
         return error.PcreNeedsByteMode;
@@ -335,6 +344,132 @@ fn parseSubsig(arena: std.mem.Allocator, text: []const u8, index: usize, target:
         return err;
     };
     return .{ .hex = .{ .pattern = pattern, .mods = mods, .offset = offset } };
+}
+
+fn numberValue(comptime T: type, text: []const u8) error{BadByteCompare}!T {
+    if (text.len == 0) return error.BadByteCompare;
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
+        if (text.len == 2) return error.BadByteCompare;
+        return std.fmt.parseInt(T, text[2..], 16) catch error.BadByteCompare;
+    }
+    for (text) |c| if (c < '0' or c > '9') return error.BadByteCompare;
+    return std.fmt.parseInt(T, text, 10) catch error.BadByteCompare;
+}
+
+/// `trigger(>>offset#[h|d|a|i][l|b][e]width#op value[,op value])`.
+pub fn parseByteCompare(text: []const u8, self_index: usize) error{BadByteCompare}!ir.ByteCompare {
+    const open = std.mem.indexOfScalar(u8, text, '(') orelse return error.BadByteCompare;
+    if (text[text.len - 1] != ')') return error.BadByteCompare;
+    const trigger = std.fmt.parseInt(u8, text[0..open], 10) catch return error.BadByteCompare;
+    if (trigger == self_index or trigger >= ir.max_subsigs) return error.BadByteCompare;
+    var parts = std.mem.splitScalar(u8, text[open + 1 .. text.len - 1], '#');
+    const off_text = parts.next() orelse return error.BadByteCompare;
+    const opt_text = parts.next() orelse return error.BadByteCompare;
+    const cmp_text = parts.next() orelse return error.BadByteCompare;
+    if (parts.next() != null) return error.BadByteCompare;
+
+    var bc: ir.ByteCompare = .{ .trigger = trigger, .offset = 0, .kind = .hex, .big_endian = true, .exact = false, .width = 0, .comparison_count = 0 };
+    if (off_text.len < 3) return error.BadByteCompare;
+    if (std.mem.startsWith(u8, off_text, ">>")) {
+        bc.backward = false;
+    } else if (std.mem.startsWith(u8, off_text, "<<")) {
+        bc.backward = true;
+    } else return error.BadByteCompare;
+    bc.offset = try numberValue(u32, off_text[2..]);
+
+    var o = opt_text;
+    if (o.len == 0) return error.BadByteCompare;
+    bc.kind = switch (o[0]) {
+        'h' => .hex,
+        'd' => .decimal,
+        'a' => .auto,
+        'i' => .binary,
+        else => return error.BadByteCompare,
+    };
+    o = o[1..];
+    var endian_given = false;
+    if (o.len > 0 and (o[0] == 'l' or o[0] == 'b')) {
+        bc.big_endian = o[0] == 'b';
+        endian_given = true;
+        o = o[1..];
+    }
+    if (o.len > 0 and o[0] == 'e') {
+        bc.exact = true;
+        o = o[1..];
+    }
+    const width = try numberValue(u8, o);
+    switch (bc.kind) {
+        // Decimal is big-endian by definition: little-endian decimal is malformed.
+        .decimal => if (endian_given and !bc.big_endian) return error.BadByteCompare,
+        .binary => {
+            bc.exact = true;
+            if (!endian_given) bc.big_endian = false;
+            if (width != 1 and width != 2 and width != 4 and width != 8) return error.BadByteCompare;
+        },
+        else => {},
+    }
+    if (width == 0 or width > ir.max_text_width) return error.BadByteCompare;
+    bc.width = width;
+
+    var cmps = std.mem.splitScalar(u8, cmp_text, ',');
+    while (cmps.next()) |c| {
+        if (bc.comparison_count == 2 or c.len < 2) return error.BadByteCompare;
+        const op: ir.CmpOp = switch (c[0]) {
+            '<' => .lt,
+            '>' => .gt,
+            '=' => .eq,
+            else => return error.BadByteCompare,
+        };
+        bc.comparisons[bc.comparison_count] = .{ .op = op, .value = try numberValue(u64, c[1..]) };
+        bc.comparison_count += 1;
+    }
+    if (bc.comparison_count == 0) return error.BadByteCompare;
+    return bc;
+}
+
+test "byte-compare subsignatures: every encoding, width and endianness option" {
+    const Case = struct { []const u8, ir.ByteKind, bool, bool, u8, u32, bool };
+    for ([_]Case{
+        .{ "0(>>4#hb2#=0x10)", .hex, true, false, 2, 4, false },
+        .{ "0(>>0x10#hl4#>1)", .hex, false, false, 4, 16, false },
+        .{ "0(<<8#d3#<100)", .decimal, true, false, 3, 8, true },
+        .{ "0(>>2#db3#=5)", .decimal, true, false, 3, 2, false },
+        .{ "0(>>2#ae6#=5)", .auto, true, true, 6, 2, false },
+        .{ "0(>>2#ib1#=5)", .binary, true, true, 1, 2, false },
+        .{ "0(>>2#il2#=5)", .binary, false, true, 2, 2, false },
+        .{ "0(>>2#i4#=5)", .binary, false, true, 4, 2, false },
+        .{ "0(>>2#ib8#=5)", .binary, true, true, 8, 2, false },
+        .{ "0(>>2#he0x8#>0x10,<0x20)", .hex, true, true, 8, 2, false },
+    }) |c| {
+        const bc = try parseByteCompare(c[0], 1);
+        try testing.expectEqual(c[1], bc.kind);
+        try testing.expectEqual(c[2], bc.big_endian);
+        try testing.expectEqual(c[3], bc.exact);
+        try testing.expectEqual(c[4], bc.width);
+        try testing.expectEqual(c[5], bc.offset);
+        try testing.expectEqual(c[6], bc.backward);
+    }
+    const two = try parseByteCompare("0(>>2#he0x8#>0x10,<0x20)", 1);
+    try testing.expectEqual(@as(u8, 2), two.comparison_count);
+    try testing.expectEqual(ir.CmpOp.lt, two.comparisons[1].op);
+    try testing.expectEqual(@as(u64, 0x20), two.comparisons[1].value);
+    for ([_][]const u8{
+        "0(>>4#dl2#=1)", // little-endian decimal
+        "0(>>4#ib3#=1)", // binary width not 1, 2, 4, 8
+        "0(>>4#h0#=1)",
+        "0(>>4#h21#=1)",
+        "0(>>4#x2#=1)",
+        "0(4#h2#=1)",
+        "0(>>#h2#=1)",
+        "0(>>4#h2#)",
+        "0(>>4#h2#=1,=2,=3)",
+        "0(>>4#h2#!1)",
+        "0(>>4#h2)",
+        "0(>>4#h2#=1#x)",
+        "1(>>4#h2#=1)", // its own trigger
+        "0(>>4#h2#=0x)",
+        "0(>>4#h2#=1",
+    }) |bad| try testing.expectError(error.BadByteCompare, parseByteCompare(bad, 1));
 }
 
 /// `[Offset:]Trigger/Pattern/[Flags]`: the trigger may name only earlier subsigs, the pattern
@@ -458,7 +593,9 @@ test "ldb lines: subsignatures with offsets and modifiers, and every rejection" 
         .{ "X;Target:0;0&1;aabb;0/abc/q", error.BadExpression, 20 },
         .{ "X;Target:0;0&1;aabb;0//", error.BadExpression, 20 },
         .{ "X;Target:0;0&1;aabb;${6-7}12$", error.MacroUnsupported, 20 },
-        .{ "X;Target:0;0&1;aabb;0(>>4#ib2#=0x10)", error.ByteCompareUnsupported, 20 },
+        .{ "X;Target:0;0&1;aabb;0(>>4#ib3#=0x10)", error.BadByteCompare, 20 },
+        .{ "X;Target:0;0&1;aabb;1(>>4#ib2#=0x10)", error.BadByteCompare, 20 },
+        .{ "X;Target:0;0&1&2;aabb;0(>>4#ib2#=1);1(>>1#d2#=1)", error.BadByteCompare, 36 },
         .{ "X;Target:5;0&1;fuzzy_img#af2ad01ed42993c7#0;aabb", error.FuzzyImageUnsupported, 15 },
         .{ "X;Target:0,IconGroup1:A;0;aabb", error.IconUnsupported, 2 },
     }) |c| {

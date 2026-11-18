@@ -89,12 +89,12 @@ fn logicalFile(comptime which: usize) fn () void {
             const n: u32 = 1000;
             for (0..16) |k| {
                 const ldb: u32 = (logical_i +% @as(u32, @intCast(k)) *% 7919) % n;
-                logical_state.touch(table, .{}, ldb, 0) catch unreachable;
-                logical_state.touch(table, .{}, ldb, 1) catch unreachable;
+                logical_state.touch(table, .{}, ldb, 0, 0) catch unreachable;
+                logical_state.touch(table, .{}, ldb, 1, 0) catch unreachable;
             }
             logical_i +%= 1;
             var out: [4]u32 = undefined;
-            sink +%= logical_state.finalize(table, &out);
+            sink +%= logical_state.finalize(table, "", &out);
             logical_state.reset();
         }
     }.run;

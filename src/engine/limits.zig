@@ -43,6 +43,10 @@ pub const Event = enum(u8) {
     scan_time,
     big_window_budget,
     verify_steps,
+    /// A byte-compare subsig pointed outside the data.
+    byte_compare_bounds,
+    /// Logical-signature state filled its spill arena.
+    logical_state,
     /// A decoder window (zstd frame window, LZMA dictionary) larger than `max_window`.
     window_size,
     /// The worker's scratch arena could not hold a child's working set.
