@@ -668,7 +668,7 @@ test "HTML yields its normalised stream and scripts; text yields its normalised 
     try rig.init(.{});
     defer rig.deinit();
     try rig.scanBoth(page, "p.html");
-    const norm = "<html><body>hello <b>world</b><script>alert(1)</script></body></html> ";
+    const norm = "<html><body>hello <b>world</b><script>alert(1)</script></body></html>";
     var hasher = std.hash.Crc32.init();
     hasher.update(norm);
     var seen: usize = 0;

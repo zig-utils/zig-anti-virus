@@ -182,5 +182,6 @@ jobs:
           py=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')
           mkdir -p "$RUNNER_TEMP/text"
           find "$py" -name '*.py' -size -256k | head -1500 | while read -r f; do cp "$f" "$RUNNER_TEMP/text/$(echo "$f" | tr '/' '_')"; done
+          find /usr/share/doc "$py" -name '*.html' -size -256k 2>/dev/null | head -500 | while read -r f; do cp "$f" "$RUNNER_TEMP/text/$(echo "$f" | tr '/' '_')"; done
           # HTML parity is incomplete (#45): counted, not enforced.
           python3 tools/diff/norm.py --html-report-only --work "$RUNNER_TEMP/nwork" "$RUNNER_TEMP/text"
