@@ -33,6 +33,10 @@ pub fn main(init: std.process.Init) !void {
             hexBody(random);
             cases += 1;
         }
+        if (selected(only, "ndbLine")) {
+            ndbLine(random);
+            cases += 1;
+        }
     }
     std.debug.print("fuzz: {d} cases, seed {d}, ok\n", .{ cases, seed });
 }
@@ -93,6 +97,31 @@ fn hexBody(random: std.Random) void {
     if (!std.mem.eql(u8, w1.buffered(), w2.buffered())) @panic("fuzz: hex print is not a fixed point");
     const mods: zav.compile.ir.Modifiers = @bitCast(random.int(u8) & 0x0f);
     _ = hexsig.expand(arena, p, mods) catch {};
+}
+
+/// `.ndb` lines: targets, every offset form, flevels and bodies.
+fn ndbLine(random: std.Random) void {
+    const ndb = zav.compile.ndb;
+    const seeds = [_][]const u8{
+        "Win.Trojan.A-1-0:1:EP+12,4:e8????????5d(aa|bb):60:200",
+        "Doc.Mal.B-2-1:2:EOF-100:d0cf11e0*aabb{4-8}ccdd",
+        "Elf.C-3-0:6:S2+16:7f454c46~00??",
+        "Macho.D-4-0:9:SE1:cafebabe",
+        "Html.E-5-0:3:10,5:3c736372697074",
+    };
+    var mem: [64 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var buf: [256]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const line = mutate(random, &buf, seed.len, "0123456789abcdef:,+-*EPOFSLVI?{}()|");
+    var column: u32 = 0;
+    if (ndb.parseLine(fba.allocator(), line, &column)) |rule| {
+        if (rule.target > ndb.max_target) @panic("fuzz: ndb target out of range");
+        if (ndb.needsExecutable(rule.subsig.offset.kind) and !ndb.isExecutableTarget(rule.target)) @panic("fuzz: ndb executable offset on a non-executable target");
+    } else |_| {
+        if (column > line.len) @panic("fuzz: ndb column out of range");
+    }
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.

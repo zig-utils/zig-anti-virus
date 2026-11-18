@@ -101,6 +101,11 @@ pub const Reason = enum(u8) {
     hex_no_static_byte,
     hex_too_complex,
     bad_modifier,
+    // Extended (.ndb) signatures.
+    bad_target,
+    bad_offset,
+    offset_needs_executable,
+    version_info_unsupported,
 };
 
 pub const Rejection = struct {

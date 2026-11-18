@@ -63,9 +63,15 @@ pub const Ignore = struct {
 
 /// Why a rule should be skipped, or null to keep it.
 pub fn skipReason(rule: *const ir.HashRule, ignore: *const Ignore, flevel: u16) ?ir.Reason {
-    if (ignore.matches(rule.name, rule.line)) return .ignored;
-    if (rule.flevel_min != 0 and rule.flevel_min > flevel) return .flevel_out_of_range;
-    if (rule.flevel_max != 0 and rule.flevel_max < flevel) return .flevel_out_of_range;
+    return skipReasonFor(rule.name, rule.line, rule.flevel_min, rule.flevel_max, ignore, flevel);
+}
+
+/// The same decision for any rule kind: `.ign2` by name (or name and line MD5), then the
+/// functionality-level window.
+pub fn skipReasonFor(name: []const u8, line: []const u8, flevel_min: u16, flevel_max: u16, ignore: *const Ignore, flevel: u16) ?ir.Reason {
+    if (ignore.matches(name, line)) return .ignored;
+    if (flevel_min != 0 and flevel_min > flevel) return .flevel_out_of_range;
+    if (flevel_max != 0 and flevel_max < flevel) return .flevel_out_of_range;
     return null;
 }
 
