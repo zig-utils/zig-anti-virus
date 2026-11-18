@@ -44,6 +44,23 @@ jobs:
       - run: ./zig-out/bin/zav --version && ./zig-out/bin/zavd --version
         shell: bash
 
+  distro:
+    name: Host checks on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # rpm-based: package ownership is compared with `rpm -qf` here, `dpkg -S` on ubuntu.
+        image: ['fedora:latest']
+    steps:
+      - run: dnf install -y tar xz git
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test --summary all
+
   variants:
     name: CPU variant ${{ matrix.cpu }}
     runs-on: ${{ matrix.runner }}

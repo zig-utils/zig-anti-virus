@@ -9,6 +9,8 @@ const finding = @import("finding.zig");
 const context = @import("context.zig");
 const suppress = @import("suppress.zig");
 const host_mod = @import("host.zig");
+const pkgs = @import("linux/packages.zig");
+const cache_mod = @import("cache.zig");
 
 const Host = host_mod.Host;
 const Finding = finding.Finding;
@@ -56,8 +58,8 @@ pub const Options = struct {
     suppressions: ?*const suppress.Config = null,
     /// Run only checks whose id equals or starts with one of these (a dotted prefix).
     only: []const []const u8 = &.{},
-    /// Package ownership. When null the runner leaves ownership questions unanswered and checks
-    /// treat every file as unowned.
+    /// Package ownership override. When null, Linux scans load the dpkg, rpm and apk databases
+    /// under the host root on first use.
     ownership: ?Ownership = null,
     scanner: ?FileScanner = null,
     /// Where baselines and the file cache live (`zav host` uses /var/lib/zav or the user state
@@ -94,18 +96,29 @@ pub const Scan = struct {
     ran: std.ArrayList([]const u8) = .empty,
     /// The check running now; findings and coverage notes are attributed to it.
     current: []const u8 = "",
+    pkgdb: ?pkgs.Db = null,
+    pkgdb_tried: bool = false,
+    /// Digests of files already hashed, by inode, ctime, mtime and size.
+    file_cache: cache_mod.Cache,
+
+    pub const cache_file = "file-cache.zavc";
 
     pub fn init(gpa: std.mem.Allocator, h: Host, options: Options) Scan {
-        return .{
+        var s: Scan = .{
             .gpa = gpa,
             .arena_state = .init(gpa),
             .host = h,
             .context = options.context orelse detect(h),
             .options = options,
+            .file_cache = .init(gpa),
         };
+        if (options.state_dir) |d| s.file_cache.load(h.io, d, cache_file) catch {};
+        return s;
     }
 
     pub fn deinit(s: *Scan) void {
+        if (s.pkgdb) |*db| db.deinit();
+        s.file_cache.deinit();
         s.findings.deinit(s.gpa);
         s.suppressed.deinit(s.gpa);
         s.disabled.deinit(s.gpa);
@@ -143,8 +156,29 @@ pub const Scan = struct {
     }
 
     pub fn owner(s: *Scan, path: []const u8) ?[]const u8 {
-        const o = s.options.ownership orelse return null;
-        return o.owner(path);
+        if (s.options.ownership) |o| return o.owner(path);
+        const db = s.packages() orelse return null;
+        const p = db.ownerResolved(path) orelse return null;
+        return p.name;
+    }
+
+    /// The package databases under the host root, loaded on first use. Null when there are none
+    /// (or on macOS); load problems become coverage notes of the asking check.
+    pub fn packages(s: *Scan) ?*pkgs.Db {
+        if (s.pkgdb) |*db| return db;
+        if (s.pkgdb_tried or s.host.os != .linux) return null;
+        s.pkgdb_tried = true;
+        var db = pkgs.Db.load(s.gpa, s.host) catch |e| {
+            s.reduced("package database unreadable: {t}", .{e}) catch {};
+            return null;
+        };
+        for (db.problems.items) |p| s.reduced("package database: {s}", .{p}) catch {};
+        if (db.managers.count() == 0) {
+            db.deinit();
+            return null;
+        }
+        s.pkgdb = db;
+        return &s.pkgdb.?;
     }
 
     pub fn owned(s: *Scan, path: []const u8) bool {
@@ -187,6 +221,9 @@ pub const Scan = struct {
             };
         }
         s.current = "";
+        if (s.options.state_dir) |d| if (s.file_cache.dirty) {
+            s.file_cache.save(s.host.io, d, cache_file) catch |e| try s.reduced("file cache not saved: {t}", .{e});
+        };
         try s.finalize();
     }
 

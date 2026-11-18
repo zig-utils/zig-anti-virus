@@ -15,6 +15,13 @@ pub const suppress = @import("suppress.zig");
 pub const scan = @import("scan.zig");
 pub const schema = @import("schema.zig");
 pub const tokens = @import("tokens.zig");
+pub const cache = @import("cache.zig");
+pub const linux = struct {
+    pub const packages = @import("linux/packages.zig");
+    pub const sqlite = @import("linux/sqlite.zig");
+    pub const rpm = @import("linux/rpm.zig");
+    pub const integrity = @import("linux/integrity.zig");
+};
 
 pub const Host = host.Host;
 pub const Scan = scan.Scan;
@@ -24,7 +31,7 @@ pub const Severity = finding.Severity;
 pub const Category = finding.Category;
 
 /// Every check this build knows, in run order.
-pub const registry = [_]Check{};
+pub const registry = linux.integrity.checks;
 
 test {
     _ = finding;
@@ -35,4 +42,9 @@ test {
     _ = scan;
     _ = schema;
     _ = tokens;
+    _ = cache;
+    _ = linux.packages;
+    _ = linux.sqlite;
+    _ = linux.rpm;
+    _ = linux.integrity;
 }

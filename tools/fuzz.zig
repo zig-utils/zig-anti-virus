@@ -3,6 +3,7 @@
 //! `-Dfuzz-target=name` runs only the targets whose function name contains `name`.
 const std = @import("std");
 const zav = @import("zav");
+const host_fuzz = @import("fuzz_host.zig");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -37,6 +38,8 @@ pub fn main(init: std.process.Init) !void {
             ndbLine(random);
             cases += 1;
         }
+        // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
+        cases += try host_fuzz.run(gpa.allocator(), random, only);
     }
     std.debug.print("fuzz: {d} cases, seed {d}, ok\n", .{ cases, seed });
 }
