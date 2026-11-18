@@ -47,7 +47,7 @@ Every [E] figure is provisional until an experiment replaces it with a measureme
 | zig-xml | [R] Pull tokenizer over a whole slice. | Use it for small OOXML parts. Upstream an incremental `Io.Reader` input. HTML normalisation is its own byte-level state machine. |
 | zig-cli | [R] Typed command framework that also has TOML and JSON5 parsers. | Use it for the `zav` CLI and native config. `clamd.conf` gets its own small parser. |
 | zig-benchmarks | [R] Timer micro-benchmarks with baseline comparison. Allocator-only memory profiling. Some pre-0.17 std calls. | Port it, and add external-process RSS/PSS/smaps sampling. The end-to-end harness is new. |
-| Home language compression package | [R] gzip wraps `std.compress.flate`. The `zstd`, `brotli` and `lz4` modules do not implement the spec formats. | Do not use. Use `std.compress` flate, zstd, xz, lzma and lzma2 (streaming over `Io.Reader`). Write bzip2. |
+| Home language compression package | [R] gzip wraps `std.compress.flate`. The `zstd`, `brotli` and `lz4` modules do not implement the spec formats. | Do not use. All decoders are our own, streaming over `Io.Reader`: flate and zstd because std's ran at 23 to 52% and 1 to 13% of C (E7), xz and LZMA because std's lzma2 buffers without bound, and bzip2 because std has none. |
 | mail MIME parser | [R] Whole-body multipart parsing, not recursive, allocates per part. Recognises only CRLF header terminators. | Build the streaming `zig-mime` walker: SIMD boundary search, a nested stack, streaming base64 and quoted-printable decoding, tolerant line endings. Reuse the ContentType and boundary validation. |
 | `std.Io.File.MemoryMap` | [R] Defaults to read and write with populate. Silently falls back to heap allocation plus read if mmap fails. | Never use it for the database: a fallback would turn the blob into private memory. Call `posix.mmap(PROT_READ, MAP_PRIVATE)` directly and fail hard. |
 | `std.crypto` | [R] SHA-256 uses SHA-NI or ARMv8 instructions only when they are enabled at compile time. SHA-1 and MD5 are software only. | Build CPU-variant objects (x86-64-v2, v3, v3+sha, aarch64+crypto) and choose one at runtime. Add hardware SHA-1 kernels. MD5 is inherently serial, about 600-700 MB/s per core [K]. |
@@ -277,7 +277,8 @@ miss -> read first 4 KiB -> file-type trie
 - Zip overlap detection, with a central-directory and local-header consistency check.
 
 **Decoder windows:**
-- flate needs 64 KiB; bzip2 needs 900 KiB.
+- flate needs 108 KiB (32 KiB history, 64 KiB output room, decode tables); bzip2 needs 4 bytes per
+  block byte (3.6 MB at level 9).
 - zstd and xz/LZMA are capped at 8 MiB by default.
 - Any window over 1 MiB takes a token from a global 64 MiB big-window budget.
 
