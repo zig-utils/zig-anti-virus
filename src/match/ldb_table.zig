@@ -309,12 +309,14 @@ pub fn evalByteCompare(bc: BcRecord, data: []const u8, start: usize) BcResult {
             hexText(field[2..], exact, big) orelse return .no
         else
             decimal(field, exact) orelse return .no,
+        _ => return .no,
     };
     for (bc.ops[0..bc.comparison_count], bc.values[0..bc.comparison_count]) |op, k| {
         const ok = switch (op) {
             .lt => value < k,
             .gt => value > k,
             .eq => value == k,
+            _ => false,
         };
         if (!ok) return .no;
     }

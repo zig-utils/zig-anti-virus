@@ -73,6 +73,18 @@ pub fn main(init: std.process.Init) !void {
             byteCompare(random);
             cases += 1;
         }
+        if (selected(only, "ftmLine")) {
+            ftmLine(random);
+            cases += 1;
+        }
+        if (selected(only, "ftmClassify")) {
+            ftmClassify(random);
+            cases += 1;
+        }
+        if (selected(only, "cdbLine")) {
+            cdbLine(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
         // Format parsers and decoders (fmt/): one per iteration in rotation, or every target whose
@@ -651,8 +663,92 @@ fn byteCompare(random: std.Random) void {
             .lt => v < c.value,
             .gt => v > c.value,
             .eq => v == c.value,
+            _ => false,
         };
         if ((got == .yes) != want) @panic("fuzz: binary byte compare disagrees with a direct read");
+    }
+}
+
+/// `.ftm` lines.
+fn ftmLine(random: std.Random) void {
+    const seeds = [_][]const u8{
+        "0:0:4d5a:DOS executable:CL_TYPE_ANY:CL_TYPE_MSEXE",
+        "1:*:504b0304:ZIP-SFX:CL_TYPE_MSEXE:CL_TYPE_ZIPSFX:76",
+        "4:1024:482b0004:HFS+ partition:CL_TYPE_PART_ANY:CL_TYPE_PART_HFSPLUS::150",
+        "1:8:6674797068{2}6963:HEIC:CL_TYPE_ANY:CL_TYPE_GRAPHICS",
+    };
+    var mem: [32 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var buf: [160]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const line = mutate(random, &buf, seed.len, "0123456789abcdef:*?{}CL_TYPE_ANYZIP");
+    var column: u32 = 0;
+    if (zav.compile.ftm.parseLine(fba.allocator(), line, &column)) |rule| {
+        if ((rule.kind == .body) != (rule.pattern != null)) @panic("fuzz: ftm body kind without a pattern");
+    } else |_| {
+        if (column > line.len) @panic("fuzz: ftm column out of range");
+    }
+}
+
+var ftm_mem: [256 * 1024]u8 align(8) = undefined;
+
+/// Classification of random heads against a fixed set of overlapping magics, and corrupted copies
+/// of its trie.
+fn ftmClassify(random: std.Random) void {
+    const zc = zav.compile;
+    const text =
+        \\0:0:4d5a:DOS:CL_TYPE_ANY:CL_TYPE_MSEXE
+        \\0:0:504b0304:ZIP:CL_TYPE_ANY:CL_TYPE_ZIP
+        \\0:0:504b:PK:CL_TYPE_ANY:CL_TYPE_BINARY_DATA
+        \\0:4:4142:AB:CL_TYPE_ANY:CL_TYPE_GIF
+        \\0:2:4e53:NS:CL_TYPE_MSEXE:CL_TYPE_NULSFT
+        \\1:0:3c68{1}6d:HTMLish:CL_TYPE_ANY:CL_TYPE_HTML
+        \\1:*:504b0304:SFX:CL_TYPE_MSEXE:CL_TYPE_ZIPSFX
+        \\4:8:4842:Part:CL_TYPE_ANY:CL_TYPE_PART_HFSPLUS
+        \\
+    ;
+    var fba: std.heap.FixedBufferAllocator = .init(&ftm_mem);
+    const a = fba.allocator();
+    var rules: std.ArrayList(zc.ir.FtmRule) = .empty;
+    var rejected: std.ArrayList(zc.ir.Rejection) = .empty;
+    zc.ftm.parse(a, a, "f.ftm", text, .{ .rules = &rules, .rejected = &rejected }) catch unreachable;
+    const built = zc.ftm_build.build(a, rules.items) catch unreachable;
+    const pbytes = zc.prog_build.build(a, built.programs) catch unreachable;
+    const pimage = a.alignedAlloc(u8, .@"4", pbytes.len) catch unreachable;
+    @memcpy(pimage, pbytes);
+    const programs = zav.match.prog.Programs.init(pimage) catch unreachable;
+    const image = a.alignedAlloc(u8, .@"4", built.trie.len) catch unreachable;
+    @memcpy(image, built.trie);
+    if (random.boolean()) for (0..1 + random.uintLessThan(usize, 4)) |_| {
+        image[random.uintLessThan(usize, image.len)] = random.int(u8);
+    };
+    const f = zav.fmt.ftm.Ftm.init(image, programs) catch return;
+    var head: [64]u8 = undefined;
+    const alphabet = "MZPK\x03\x04ABNS<hm HB\x00\x01";
+    for (&head) |*b| b.* = if (random.uintLessThan(u8, 4) == 0) random.int(u8) else alphabet[random.uintLessThan(usize, alphabet.len)];
+    var budget: zav.match.verify_vm.Budget = .{ .per_verify = 1000, .per_file = 20_000 };
+    const c = zav.fmt.ftm.classify(f, head[0..random.uintAtMost(usize, head.len)], .{ .partitions = random.uintLessThan(u8, 4) == 0 }, &budget);
+    for (c.embedded()) |t| if (t.offset > head.len) @panic("fuzz: ftm trigger outside the head");
+}
+
+/// `.cdb` lines.
+fn cdbLine(random: std.Random) void {
+    const seeds = [_][]const u8{
+        "Zip.Exploit.A-1-0:CL_TYPE_ZIP:100-200:*:50:*:1:2-4:8a4f1c2e:*:81:255",
+        "Any.Container-2-0:*:*:*:*:*:*:*:*:*",
+        "Rar.B-3-0:CL_TYPE_RAR:*:.*\\.scr:*:1000-2000:0:1:*:*",
+    };
+    var buf: [128]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const line = mutate(random, &buf, seed.len, "0123456789abcdef:*-CL_TYPE_ZIP");
+    var column: u32 = 0;
+    if (zav.compile.cdb.parseLine(line, &column)) |rule| {
+        if (rule.filename_regex != null) @panic("fuzz: cdb accepted a regex it cannot evaluate");
+        if (rule.file_pos) |p| if (p.lo == 0) @panic("fuzz: cdb position 0");
+    } else |_| {
+        if (column > line.len) @panic("fuzz: cdb column out of range");
     }
 }
 

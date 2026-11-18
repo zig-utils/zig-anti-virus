@@ -84,6 +84,9 @@ pub const ClType = enum(u16) {
     xz,
     zip,
     zipsfx,
+    // Used by ClamAV's own type magic though not in the file types reference.
+    part_any,
+    ignored,
     _,
 
     /// `CL_TYPE_ZIP` and friends, case-sensitive as ClamAV writes them.

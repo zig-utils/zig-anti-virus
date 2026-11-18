@@ -118,6 +118,11 @@ pub const Reason = enum(u8) {
     icon_unsupported,
     handler_type_unsupported,
     bad_byte_compare,
+    // File-type magic (.ftm) and container metadata (.cdb).
+    bad_magic_type,
+    bad_magic,
+    bad_cdb_field,
+    cdb_regex_needs_zig_regex,
 };
 
 pub const Rejection = struct {
@@ -369,9 +374,10 @@ pub const ByteKind = enum(u8) {
     auto = 2,
     /// `i`: raw binary of 1, 2, 4 or 8 bytes
     binary = 3,
+    _,
 };
 
-pub const CmpOp = enum(u8) { lt = 0, gt = 1, eq = 2 };
+pub const CmpOp = enum(u8) { lt = 0, gt = 1, eq = 2, _ };
 
 pub const Comparison = struct { op: CmpOp, value: u64 };
 
@@ -408,6 +414,60 @@ pub const LogicalRule = struct {
     flevel_min: u16 = 0,
     flevel_max: u16 = 0,
     source: Source = .ldb,
+    flags: Flags = .{},
+    line: []const u8 = "",
+};
+
+// ---------------------------------------------------------------------------------------------
+// File-type magic and container metadata (docs/DESIGN.md sections 3.2 and 4.3).
+// ---------------------------------------------------------------------------------------------
+
+pub const MagicKind = enum(u8) {
+    /// Direct comparison at a fixed offset (magictype 0).
+    bytes = 0,
+    /// Body-format pattern at a fixed offset or anywhere (magictype 1).
+    body = 1,
+    /// Direct comparison, for partition types (magictype 4).
+    partition = 4,
+    _,
+};
+
+/// An `.ftm` line: `magictype:offset:magicbytes:name:rtype:type[:min_flevel[:max_flevel]]`.
+pub const FtmRule = struct {
+    kind: MagicKind,
+    /// Fixed offset, or null for `*` (body kind only).
+    offset: ?u32,
+    /// The literal magic for bytes and partition kinds.
+    magic: []const u8 = "",
+    /// The pattern for the body kind.
+    pattern: ?Pattern = null,
+    name: []const u8,
+    /// Required previously detected type (`fmt.types.ClType`), `any` (0) for none.
+    rtype: u16,
+    /// The type this magic identifies.
+    type: u16,
+    flevel_min: u16 = 0,
+    flevel_max: u16 = 0,
+    line: []const u8 = "",
+};
+
+/// A `.cdb` line: `VirusName:ContainerType:ContainerSize:FileNameREGEX:FileSizeInContainer:
+/// FileSizeReal:IsEncrypted:FilePos:Res1:Res2[:MinFL[:MaxFL]]`; null fields are `*`.
+pub const CdbRule = struct {
+    name: []const u8,
+    container: ?u16 = null,
+    container_size: ?Range = null,
+    filename_regex: ?[]const u8 = null,
+    size_in_container: ?Range = null,
+    size_real: ?Range = null,
+    encrypted: ?bool = null,
+    /// Position in the container, counting from 1.
+    file_pos: ?Range = null,
+    /// Res1: CRC of the member, for ZIP and RAR containers.
+    crc: ?u32 = null,
+    flevel_min: u16 = 0,
+    flevel_max: u16 = 0,
+    source: Source = .cdb,
     flags: Flags = .{},
     line: []const u8 = "",
 };

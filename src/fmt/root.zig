@@ -2,6 +2,7 @@
 //! See docs/DESIGN.md for the design this module implements.
 
 pub const types = @import("types.zig");
+pub const ftm = @import("ftm.zig");
 pub const detect = @import("detect.zig");
 pub const scan = @import("scan.zig");
 pub const decode = @import("decode.zig");
@@ -22,6 +23,7 @@ pub const fixtures = @import("fixtures/fixtures.zig");
 
 test {
     _ = types;
+    _ = ftm;
     _ = detect;
     _ = scan;
     _ = decode;
