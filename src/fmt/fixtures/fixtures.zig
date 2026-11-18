@@ -198,34 +198,37 @@ pub const archives = [_]Archive{
 
 pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };
 
+/// Stored in front of each executable fixture so the files are not executables on disk.
+pub const exe_prefix = "zav fixture, not an executable\n";
+
 pub const exes = [_]Exe{
-    .{ .name = "pe32.exe", .bytes = @embedFile("exe-pe32.exe.bin"), .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{
+    .{ .name = "pe32.exe", .bytes = @embedFile("exe-pe32.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{
         .{ .path = "resource/10/101/1033", .len = 184, .crc = 0x778d4418 },
         .{ .path = "resource/10/101/1033/eicar.com", .len = 68, .crc = 0x6851cf3c },
         .{ .path = "overlay", .len = 287, .crc = 0x7f75160a },
         .{ .path = "overlay/a.txt", .len = 13, .crc = 0x0a85f4a7 },
         .{ .path = "overlay/eicar.com", .len = 68, .crc = 0x6851cf3c },
     } },
-    .{ .name = "pe64.exe", .bytes = @embedFile("exe-pe64.exe.bin"), .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
-    .{ .name = "pe-ep-outside.exe", .bytes = @embedFile("exe-pe-ep-outside.exe.bin"), .entry = null, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
-    .{ .name = "pe-wx.exe", .bytes = @embedFile("exe-pe-wx.exe.bin"), .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
-    .{ .name = "pe-overlap.exe", .bytes = @embedFile("exe-pe-overlap.exe.bin"), .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "pe-truncated.exe", .bytes = @embedFile("exe-pe-truncated.exe.bin"), .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
-    .{ .name = "pe-many-sections.exe", .bytes = @embedFile("exe-pe-many-sections.exe.bin"), .entry = 528, .sections = 12, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
-    .{ .name = "x86_64.elf", .bytes = @embedFile("exe-x86_64.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "ppc32-be.elf", .bytes = @embedFile("exe-ppc32-be.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "i386-32.elf", .bytes = @embedFile("exe-i386-32.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "relocatable.elf", .bytes = @embedFile("exe-relocatable.elf.bin"), .entry = null, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "ep-outside.elf", .bytes = @embedFile("exe-ep-outside.elf.bin"), .entry = null, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "truncated.elf", .bytes = @embedFile("exe-truncated.elf.bin"), .entry = 256, .sections = 0, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
-    .{ .name = "wx.elf", .bytes = @embedFile("exe-wx.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "x86_64-main.macho", .bytes = @embedFile("exe-x86_64-main.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "arm64-thread.macho", .bytes = @embedFile("exe-arm64-thread.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "i386-thread.macho", .bytes = @embedFile("exe-i386-thread.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "ppc-be-thread.macho", .bytes = @embedFile("exe-ppc-be-thread.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "ep-outside.macho", .bytes = @embedFile("exe-ep-outside.macho.bin"), .entry = null, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "wx.macho", .bytes = @embedFile("exe-wx.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
-    .{ .name = "universal.fat", .bytes = @embedFile("exe-universal.fat.bin"), .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+    .{ .name = "pe64.exe", .bytes = @embedFile("exe-pe64.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
+    .{ .name = "pe-ep-outside.exe", .bytes = @embedFile("exe-pe-ep-outside.exe.bin")[exe_prefix.len..], .entry = null, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
+    .{ .name = "pe-wx.exe", .bytes = @embedFile("exe-pe-wx.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 3, .imphash = "98c88d882f01a3f6ac1e5f7dfd761624", .impsize = 39, .malformed = false, .members = &.{} },
+    .{ .name = "pe-overlap.exe", .bytes = @embedFile("exe-pe-overlap.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "pe-truncated.exe", .bytes = @embedFile("exe-pe-truncated.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+    .{ .name = "pe-many-sections.exe", .bytes = @embedFile("exe-pe-many-sections.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 12, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+    .{ .name = "x86_64.elf", .bytes = @embedFile("exe-x86_64.elf.bin")[exe_prefix.len..], .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ppc32-be.elf", .bytes = @embedFile("exe-ppc32-be.elf.bin")[exe_prefix.len..], .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "i386-32.elf", .bytes = @embedFile("exe-i386-32.elf.bin")[exe_prefix.len..], .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "relocatable.elf", .bytes = @embedFile("exe-relocatable.elf.bin")[exe_prefix.len..], .entry = null, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ep-outside.elf", .bytes = @embedFile("exe-ep-outside.elf.bin")[exe_prefix.len..], .entry = null, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "truncated.elf", .bytes = @embedFile("exe-truncated.elf.bin")[exe_prefix.len..], .entry = 256, .sections = 0, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+    .{ .name = "wx.elf", .bytes = @embedFile("exe-wx.elf.bin")[exe_prefix.len..], .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "x86_64-main.macho", .bytes = @embedFile("exe-x86_64-main.macho.bin")[exe_prefix.len..], .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "arm64-thread.macho", .bytes = @embedFile("exe-arm64-thread.macho.bin")[exe_prefix.len..], .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "i386-thread.macho", .bytes = @embedFile("exe-i386-thread.macho.bin")[exe_prefix.len..], .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ppc-be-thread.macho", .bytes = @embedFile("exe-ppc-be-thread.macho.bin")[exe_prefix.len..], .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ep-outside.macho", .bytes = @embedFile("exe-ep-outside.macho.bin")[exe_prefix.len..], .entry = null, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "wx.macho", .bytes = @embedFile("exe-wx.macho.bin")[exe_prefix.len..], .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "universal.fat", .bytes = @embedFile("exe-universal.fat.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
         .{ .path = "slice/x86_64", .len = 1024, .crc = 0xbad2e7c7 },
         .{ .path = "slice/arm64", .len = 1024, .crc = 0x1d55a2d0 },
     } },

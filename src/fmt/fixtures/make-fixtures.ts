@@ -585,9 +585,13 @@ archive('same-entry-bomb.zip', sameEntryBomb(1000), [], false)
 
 interface Exe { name: string, file: string, entry: number | null, sections: number, imphash: string, impsize: number, members: Member[], malformed: boolean }
 const exes: Exe[] = []
+// Executable fixtures are stored behind a text prefix so they are not executables on disk (CI
+// rejects tracked binaries by type); fixtures.zig strips it when embedding.
+const exePrefix = 'zav fixture, not an executable\n'
+
 function exe(name: string, bytes: Uint8Array, o: { entry: number | null, sections: number, imphash?: string, impsize?: number, members?: Member[], malformed?: boolean }) {
   const file = `exe-${name}.bin`
-  writeFileSync(join(dir, file), bytes)
+  writeFileSync(join(dir, file), concat(enc.encode(exePrefix), bytes))
   exes.push({ name, file, entry: o.entry, sections: o.sections, imphash: o.imphash ?? '', impsize: o.impsize ?? 0, members: o.members ?? [], malformed: o.malformed ?? false })
 }
 
@@ -972,10 +976,13 @@ lines.push('};', '')
 lines.push(
   'pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };',
   '',
+  `/// Stored in front of each executable fixture so the files are not executables on disk.`,
+  `pub const exe_prefix = "${exePrefix.replace('\n', '\\n')}";`,
+  '',
   'pub const exes = [_]Exe{',
 )
 for (const e of exes) {
-  const head = `    .{ .name = "${e.name}", .bytes = @embedFile("${e.file}"), .entry = ${e.entry ?? 'null'}, .sections = ${e.sections}, .imphash = "${e.imphash}", .impsize = ${e.impsize}, .malformed = ${e.malformed}, .members = &.{`
+  const head = `    .{ .name = "${e.name}", .bytes = @embedFile("${e.file}")[exe_prefix.len..], .entry = ${e.entry ?? 'null'}, .sections = ${e.sections}, .imphash = "${e.imphash}", .impsize = ${e.impsize}, .malformed = ${e.malformed}, .members = &.{`
   if (e.members.length === 0) {
     lines.push(`${head}} },`)
     continue
