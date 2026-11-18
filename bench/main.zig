@@ -132,6 +132,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.fs.path.dirname(out_path)) |dir| try std.Io.Dir.cwd().createDirPath(init.io, dir);
 
     io_global = init.io;
+    // `zig build bench -- <out.json> e7`: only the decoder experiment (docs/experiments/E7).
+    if (args.len > 2 and std.mem.eql(u8, args[2], "e7")) return decoderBenchmarks(init.io, init.gpa);
     try std.Io.Dir.cwd().createDirPath(init.io, "zig-out/bench-data");
     dir_global = try std.Io.Dir.cwd().openDir(init.io, "zig-out/bench-data", .{});
     defer dir_global.close(init.io);
@@ -185,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
     try suite.add("logical state, 16 touched, 1k-signature table", logicalFile(0));
     try suite.add("logical state, 16 touched, 100k-signature table", logicalFile(1));
     try normaliserBenchmarks(init.io, init.gpa, &suite);
+    try decoderBenchmarks(init.io, init.gpa);
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);
@@ -346,4 +349,120 @@ fn normaliserBenchmarks(io: std.Io, gpa: std.mem.Allocator, suite: *bench.Benchm
     std.debug.print("text normaliser: {d:.0} MB/s\n", .{@as(f64, len) / nsPerCall(io, textNormalize) * 1000.0});
     try suite.add("html normaliser, 1 MiB", htmlNormalize);
     try suite.add("text normaliser, 1 MiB", textNormalize);
+}
+
+// E7 (docs/experiments/E7-decoders.md): decode throughput of std flate and zstd and our bzip2
+// and xz over the corpus `bun bench/e7/run.ts` writes to zig-out/e7 (skipped when absent).
+
+var e7_input: []const u8 = undefined;
+var e7_plain_len: usize = 0;
+var e7_out: [64 * 1024]u8 = undefined;
+var e7_window: []u8 = undefined;
+var e7_tt: []u32 = undefined;
+var e7_tables: *zav.fmt.bzip2.Decoder.TablesType = undefined;
+var e7_dict: []u8 = undefined;
+var e7_probs: []u16 = undefined;
+var e7_zbuf: []u8 = undefined;
+
+fn drainAll(r: *std.Io.Reader) usize {
+    var n: usize = 0;
+    while (true) {
+        const got = zav.engine.container.readSome(r, &e7_out) catch break;
+        n += got;
+    }
+    return n;
+}
+
+fn e7Gzip() void {
+    var in: std.Io.Reader = .fixed(e7_input);
+    var d = zav.fmt.gzip.Decoder.init(&in, e7_window);
+    if (drainAll(&d.interface) != e7_plain_len) @panic("e7: gzip length");
+}
+
+fn e7Bzip2() void {
+    var in: std.Io.Reader = .fixed(e7_input);
+    var d = zav.fmt.bzip2.Decoder.init(&in, e7_tt, e7_tables, &.{}) catch @panic("e7: bzip2 header");
+    if (drainAll(&d.interface) != e7_plain_len) @panic("e7: bzip2 length");
+}
+
+fn e7Xz() void {
+    var in: std.Io.Reader = .fixed(e7_input);
+    var d = zav.fmt.xz.Decoder.init(&in, e7_dict, e7_probs, &.{}, &.{});
+    if (drainAll(&d.interface) != e7_plain_len) @panic("e7: xz length");
+}
+
+fn e7Zstd() void {
+    var in: std.Io.Reader = .fixed(e7_input);
+    const s = zav.fmt.zstd.sizing(zav.fmt.zstd.frameWindow(e7_input, 8 << 20) catch unreachable);
+    var d = std.compress.zstd.Decompress.init(&in, e7_zbuf[0..s.buffer_len], .{ .window_len = s.window_len });
+    if (drainAll(&d.reader) != e7_plain_len) @panic("e7: zstd length");
+}
+
+/// Best-of-5 MB/s of decompressed output, each round at least 300 ms.
+fn e7Measure(io: std.Io, f: *const fn () void) f64 {
+    var best: f64 = std.math.inf(f64);
+    for (0..5) |_| {
+        var calls: u64 = 0;
+        const start = std.Io.Clock.awake.now(io);
+        var elapsed: i96 = 0;
+        while (elapsed < 300 * std.time.ns_per_ms) {
+            f();
+            calls += 1;
+            elapsed = start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds;
+        }
+        best = @min(best, @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(calls)));
+    }
+    return @as(f64, @floatFromInt(e7_plain_len)) / best * 1000.0;
+}
+
+fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, "zig-out/e7", .{}) catch {
+        std.debug.print("e7: no corpus in zig-out/e7 (run `bun bench/e7/run.ts`), skipped\n", .{});
+        return;
+    };
+    defer dir.close(io);
+    e7_window = try gpa.alloc(u8, zav.fmt.gzip.window_len);
+    defer gpa.free(e7_window);
+    e7_tt = try gpa.alloc(u32, 900_000);
+    defer gpa.free(e7_tt);
+    e7_tables = try gpa.create(zav.fmt.bzip2.Decoder.TablesType);
+    defer gpa.destroy(e7_tables);
+    e7_dict = try gpa.alloc(u8, 8 << 20);
+    defer gpa.free(e7_dict);
+    e7_probs = try gpa.alloc(u16, zav.fmt.lzma.Lzma2.probs_len);
+    defer gpa.free(e7_probs);
+    e7_zbuf = try gpa.alloc(u8, 2 * (8 << 20) + std.compress.zstd.block_size_max);
+    defer gpa.free(e7_zbuf);
+
+    var results: std.ArrayList(u8) = .empty;
+    defer results.deinit(gpa);
+    try results.appendSlice(gpa, "[\n");
+    const cases = [_]struct { file: []const u8, decoder: []const u8, f: *const fn () void }{
+        .{ .file = "text.gz", .decoder = "std.compress.flate", .f = e7Gzip },
+        .{ .file = "binary.gz", .decoder = "std.compress.flate", .f = e7Gzip },
+        .{ .file = "text.zst", .decoder = "std.compress.zstd", .f = e7Zstd },
+        .{ .file = "binary.zst", .decoder = "std.compress.zstd", .f = e7Zstd },
+        .{ .file = "text.zst19", .decoder = "std.compress.zstd", .f = e7Zstd },
+        .{ .file = "binary.zst19", .decoder = "std.compress.zstd", .f = e7Zstd },
+        .{ .file = "text.bz2", .decoder = "zav bzip2", .f = e7Bzip2 },
+        .{ .file = "binary.bz2", .decoder = "zav bzip2", .f = e7Bzip2 },
+        .{ .file = "text.xz", .decoder = "zav xz/lzma2", .f = e7Xz },
+        .{ .file = "binary.xz", .decoder = "zav xz/lzma2", .f = e7Xz },
+    };
+    for (cases, 0..) |c, i| {
+        const data = dir.readFileAlloc(io, c.file, gpa, .limited(1 << 30)) catch {
+            std.debug.print("e7: {s} missing, skipped\n", .{c.file});
+            continue;
+        };
+        defer gpa.free(data);
+        e7_input = data;
+        e7_plain_len = 16 * 1024 * 1024;
+        const rate = e7Measure(io, c.f);
+        std.debug.print("e7: {s:<14} {s:<20} {d:>6.0} MB/s\n", .{ c.file, c.decoder, rate });
+        const line = try std.fmt.allocPrint(gpa, "  {{\"file\": \"{s}\", \"decoder\": \"{s}\", \"mbps\": {d:.1}}}{s}\n", .{ c.file, c.decoder, rate, if (i + 1 < cases.len) "," else "" });
+        defer gpa.free(line);
+        try results.appendSlice(gpa, line);
+    }
+    try results.appendSlice(gpa, "]\n");
+    try dir.writeFile(io, .{ .sub_path = "zig-results.json", .data = results.items });
 }

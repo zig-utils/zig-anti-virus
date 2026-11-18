@@ -43,9 +43,13 @@ pub fn frameWindow(head: []const u8, fallback: u64) Error!u64 {
 }
 
 /// Window length to configure and the buffer size it needs.
+/// The buffer is twice the window plus one block. std's decoder keeps the whole window in its
+/// buffer and slides it with a memmove whenever the buffer fills; with only one block of slack
+/// that is a window-sized copy per 128 KiB block (E7 measured 12 MB/s), with a window of slack
+/// it is one copy per window of output.
 pub fn sizing(window: u64) struct { window_len: u32, buffer_len: usize } {
     const w: u32 = @intCast(@max(window, floor_window));
-    return .{ .window_len = w, .buffer_len = @as(usize, w) + zstd.block_size_max };
+    return .{ .window_len = w, .buffer_len = 2 * @as(usize, w) + zstd.block_size_max };
 }
 
 const fixtures = @import("fixtures/fixtures.zig");

@@ -51,6 +51,25 @@ pub const Dict = struct {
         return d.buf[if (dist <= d.pos) d.pos - dist else d.buf.len + d.pos - dist];
     }
 
+    /// Copy `n` bytes from `dist` back to the end of the dictionary and to `dest`, in runs that
+    /// neither wrap nor overrun the distance (so each run is a plain forward copy).
+    fn copyMatch(d: *Dict, dist: usize, n: usize, dest: []u8) void {
+        var left = n;
+        var o: usize = 0;
+        while (left > 0) {
+            const src = if (dist <= d.pos) d.pos - dist else d.buf.len + d.pos - dist;
+            const run = @min(left, dist, d.buf.len - src, d.buf.len - d.pos);
+            const from = d.buf[src..][0..run];
+            std.mem.copyForwards(u8, d.buf[d.pos..][0..run], from);
+            @memcpy(dest[o..][0..run], d.buf[d.pos..][0..run]);
+            d.pos += run;
+            if (d.pos == d.buf.len) d.pos = 0;
+            d.total += run;
+            o += run;
+            left -= run;
+        }
+    }
+
     inline fn has(d: *const Dict, dist: u64) bool {
         return dist <= d.total and dist <= d.buf.len;
     }
@@ -110,7 +129,7 @@ const RangeDecoder = struct {
         return res;
     }
 
-    fn tree(rc: *RangeDecoder, in: *Io.Reader, probs: []u16, comptime bits: u5) Error!u32 {
+    inline fn tree(rc: *RangeDecoder, in: *Io.Reader, probs: []u16, comptime bits: u5) Error!u32 {
         var m: u32 = 1;
         for (0..bits) |_| m = (m << 1) | try rc.bit(in, &probs[m]);
         return m - (@as(u32, 1) << bits);
@@ -172,16 +191,23 @@ pub const Lzma = struct {
         l.finished = false;
     }
 
-    fn lenDecode(l: *Lzma, in: *Io.Reader, base: usize, pos_state: usize) Error!u32 {
+    inline fn lenDecode(l: *Lzma, rc: *RangeDecoder, in: *Io.Reader, base: usize, pos_state: usize) Error!u32 {
         const p = l.probs[base..][0..len_size];
-        if (try l.rc.bit(in, &p[0]) == 0) return l.rc.tree(in, p[2 + pos_state * 8 ..][0..8], 3);
-        if (try l.rc.bit(in, &p[1]) == 0) return 8 + try l.rc.tree(in, p[2 + pos_states_max * 8 + pos_state * 8 ..][0..8], 3);
-        return 16 + try l.rc.tree(in, p[2 + pos_states_max * 16 ..][0..256], 8);
+        if (try rc.bit(in, &p[0]) == 0) return rc.tree(in, p[2 + pos_state * 8 ..][0..8], 3);
+        if (try rc.bit(in, &p[1]) == 0) return 8 + try rc.tree(in, p[2 + pos_states_max * 8 + pos_state * 8 ..][0..8], 3);
+        return 16 + try rc.tree(in, p[2 + pos_states_max * 16 ..][0..256], 8);
     }
 
     /// Decode into `dest`, producing at most `max_out` bytes. Returns the count; `finished` is set
     /// when the end marker is decoded.
     pub fn decode(l: *Lzma, in: *Io.Reader, dest: []u8, max_out: u64) Error!usize {
+        // The range coder lives in locals for the loop (registers, not memory behind `l`).
+        var rc = l.rc;
+        defer l.rc = rc;
+        return l.decodeWith(&rc, in, dest, max_out);
+    }
+
+    fn decodeWith(l: *Lzma, rc: *RangeDecoder, in: *Io.Reader, dest: []u8, max_out: u64) Error!usize {
         const want: usize = @intCast(@min(dest.len, max_out));
         var i: usize = 0;
         const d = l.dict;
@@ -192,19 +218,15 @@ pub const Lzma = struct {
             if (l.pending > 0) {
                 const dist = @as(usize, l.reps[0]) + 1;
                 const n = @min(l.pending, want - i);
-                for (0..n) |_| {
-                    const b = d.get(dist);
-                    d.put(b);
-                    dest[i] = b;
-                    i += 1;
-                }
+                d.copyMatch(dist, n, dest[i..]);
+                i += n;
                 l.pending -= @intCast(n);
                 continue;
             }
             if (l.finished) break;
             const pos_state: usize = @intCast(d.total & pb_mask);
             const state = l.state;
-            if (try l.rc.bit(in, &l.probs[is_match + @as(usize, state) * pos_states_max + pos_state]) == 0) {
+            if (try rc.bit(in, &l.probs[is_match + @as(usize, state) * pos_states_max + pos_state]) == 0) {
                 const prev: u32 = if (d.total > 0) d.get(1) else 0;
                 const lit_state = ((@as(u32, @truncate(d.total)) & lp_mask) << lc) + (prev >> @intCast(8 - @as(u5, lc)));
                 const probs = l.probs[lit_base + 0x300 * @as(usize, lit_state) ..][0..0x300];
@@ -215,12 +237,12 @@ pub const Lzma = struct {
                     while (sym < 0x100) {
                         const match_bit = (match_byte >> 7) & 1;
                         match_byte <<= 1;
-                        const b = try l.rc.bit(in, &probs[((1 + match_bit) << 8) + sym]);
+                        const b = try rc.bit(in, &probs[((1 + match_bit) << 8) + sym]);
                         sym = (sym << 1) | b;
                         if (match_bit != b) break;
                     }
                 }
-                while (sym < 0x100) sym = (sym << 1) | try l.rc.bit(in, &probs[sym]);
+                while (sym < 0x100) sym = (sym << 1) | try rc.bit(in, &probs[sym]);
                 const b: u8 = @truncate(sym);
                 d.put(b);
                 dest[i] = b;
@@ -229,10 +251,10 @@ pub const Lzma = struct {
                 continue;
             }
             var len: u32 = undefined;
-            if (try l.rc.bit(in, &l.probs[is_rep + state]) == 1) {
+            if (try rc.bit(in, &l.probs[is_rep + state]) == 1) {
                 if (d.total == 0) return error.Corrupt;
-                if (try l.rc.bit(in, &l.probs[is_rep_g0 + state]) == 0) {
-                    if (try l.rc.bit(in, &l.probs[is_rep0_long + @as(usize, state) * pos_states_max + pos_state]) == 0) {
+                if (try rc.bit(in, &l.probs[is_rep_g0 + state]) == 0) {
+                    if (try rc.bit(in, &l.probs[is_rep0_long + @as(usize, state) * pos_states_max + pos_state]) == 0) {
                         if (!d.has(@as(u64, l.reps[0]) + 1)) return error.Corrupt;
                         l.state = if (state < 7) 9 else 11;
                         const b = d.get(@as(usize, l.reps[0]) + 1);
@@ -243,10 +265,10 @@ pub const Lzma = struct {
                     }
                 } else {
                     var dist: u32 = undefined;
-                    if (try l.rc.bit(in, &l.probs[is_rep_g1 + state]) == 0) {
+                    if (try rc.bit(in, &l.probs[is_rep_g1 + state]) == 0) {
                         dist = l.reps[1];
                     } else {
-                        if (try l.rc.bit(in, &l.probs[is_rep_g2 + state]) == 0) {
+                        if (try rc.bit(in, &l.probs[is_rep_g2 + state]) == 0) {
                             dist = l.reps[2];
                         } else {
                             dist = l.reps[3];
@@ -257,25 +279,25 @@ pub const Lzma = struct {
                     l.reps[1] = l.reps[0];
                     l.reps[0] = dist;
                 }
-                len = try l.lenDecode(in, rep_len_probs, pos_state);
+                len = try l.lenDecode(rc, in, rep_len_probs, pos_state);
                 l.state = if (state < 7) 8 else 11;
             } else {
                 l.reps[3] = l.reps[2];
                 l.reps[2] = l.reps[1];
                 l.reps[1] = l.reps[0];
-                len = try l.lenDecode(in, len_probs, pos_state);
+                len = try l.lenDecode(rc, in, len_probs, pos_state);
                 l.state = if (state < 7) 7 else 10;
                 const len_state: usize = @min(len, 3);
-                const slot = try l.rc.tree(in, l.probs[pos_slot + len_state * 64 ..][0..64], 6);
+                const slot = try rc.tree(in, l.probs[pos_slot + len_state * 64 ..][0..64], 6);
                 var dist: u32 = slot;
                 if (slot >= 4) {
                     const direct_bits: u5 = @intCast((slot >> 1) - 1);
                     dist = (2 | (slot & 1)) << direct_bits;
                     if (slot < 14) {
-                        dist +%= try l.rc.reverse(in, l.probs[spec_pos + dist - slot ..], direct_bits);
+                        dist +%= try rc.reverse(in, l.probs[spec_pos + dist - slot ..], direct_bits);
                     } else {
-                        dist +%= (try l.rc.direct(in, direct_bits - 4)) << 4;
-                        dist +%= try l.rc.reverse(in, l.probs[align_probs..][0..16], 4);
+                        dist +%= (try rc.direct(in, direct_bits - 4)) << 4;
+                        dist +%= try rc.reverse(in, l.probs[align_probs..][0..16], 4);
                     }
                 }
                 l.reps[0] = dist;
