@@ -11,6 +11,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const zig_cli = b.dependency("cli", .{ .target = target, .optimize = optimize }).module("zig_cli");
+
     // Executables: the CLI and the daemon.
     for ([_][]const u8{ "zav", "zavd" }) |exe_name| {
         const exe = b.addExecutable(.{
@@ -19,7 +21,11 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("src/cli/{s}.zig", .{exe_name})),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "zav", .module = zav }},
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "zav", .module = zav },
+                    .{ .name = "zig_cli", .module = zig_cli },
+                },
             }),
         });
         b.installArtifact(exe);

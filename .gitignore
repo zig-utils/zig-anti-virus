@@ -29,3 +29,6 @@ coverage/
 *.profdata
 *.tmp
 *.log
+
+# Zig package cache (fetched dependencies)
+zig-pkg/
