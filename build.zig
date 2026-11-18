@@ -1,4 +1,5 @@
 const std = @import("std");
+const hash_variants = @import("src/hash/variants.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -10,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    addHashVariants(b, zav, target, optimize);
 
     const zig_cli = b.dependency("cli", .{ .target = target, .optimize = optimize }).module("zig_cli");
 
@@ -45,11 +47,13 @@ pub fn build(b: *std.Build) void {
 
     // Tests: the whole module tree, the C ABI, and a C program linking libzav.
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+    const tree_tests = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-    }) })).step);
+    });
+    addHashVariants(b, tree_tests, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_tests })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = capiModule(b, target, optimize, zav) })).step);
 
     const c_smoke = b.addExecutable(.{
@@ -80,6 +84,13 @@ pub fn build(b: *std.Build) void {
     // Kernel benchmarks (zig-bench is a lazy dependency, fetched only by this step).
     const bench_step = b.step("bench", "Run kernel benchmarks and write a JSON result file");
     if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {
+        // The engine itself is built optimised for benchmarks, whatever -Doptimize says.
+        const zav_fast = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .fast,
+        });
+        addHashVariants(b, zav_fast, target, .fast);
         const bench_exe = b.addExecutable(.{
             .name = "bench",
             .root_module = b.createModule(.{
@@ -87,7 +98,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = .fast,
                 .imports = &.{
-                    .{ .name = "zav", .module = zav },
+                    .{ .name = "zav", .module = zav_fast },
                     .{ .name = "bench", .module = bench_dep.module("bench") },
                 },
             }),
@@ -105,4 +116,40 @@ fn capiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
         .optimize = optimize,
         .imports = &.{.{ .name = "zav", .module = zav }},
     });
+}
+
+/// Compile the hash kernels once per CPU variant of the target architecture (src/hash/variants.zig)
+/// and link every object into `module`, so one binary carries all of them and src/hash/dispatch.zig
+/// picks one at runtime. std.crypto only emits SHA-NI or ARMv8 SHA instructions when the target
+/// enables them at compile time, which is why this cannot be a single object.
+fn addHashVariants(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
+    const arch = target.result.cpu.arch;
+    for (hash_variants.forArch(arch)) |spec| {
+        var query = target.query;
+        query.cpu_arch = arch;
+        query.cpu_model = .{ .explicit = arch.parseCpuModel(spec.model) orelse
+            std.debug.panic("hash variant {s}: unknown CPU model {s}", .{ spec.name, spec.model }) };
+        query.cpu_features_add = .empty;
+        query.cpu_features_sub = .empty;
+        for (spec.features) |feature_name| {
+            const feature = for (arch.allFeaturesList()) |f| {
+                if (std.mem.eql(u8, f.name, feature_name)) break f;
+            } else std.debug.panic("hash variant {s}: unknown CPU feature {s}", .{ spec.name, feature_name });
+            query.cpu_features_add.addFeature(feature.index);
+        }
+        const options = b.addOptions();
+        options.addOption([]const u8, "name", spec.name);
+        const object = b.addObject(.{
+            .name = b.fmt("zav-hash-{s}", .{spec.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/hash/variant_object.zig"),
+                .target = b.resolveTargetQuery(query),
+                .optimize = optimize,
+                // Linked into the shared libzav too.
+                .pic = true,
+                .imports = &.{.{ .name = "zav_hash_variant", .module = options.createModule() }},
+            }),
+        });
+        module.addObject(object);
+    }
 }

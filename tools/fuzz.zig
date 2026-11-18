@@ -89,3 +89,57 @@ fn hashSections(random: std.Random) void {
         _ = t.lookup(random.int(u16), d[0..t.algo.digestLen()]);
     } else |_| {}
 }
+
+/// Multihash on a random runnable kernel variant, random algorithm subset, random update splits
+/// and random speculative limits, against std.crypto on the same bytes.
+fn multihashDiff(random: std.Random) void {
+    const hash = zav.hash;
+    var data: [3000]u8 = undefined;
+    const len = random.uintAtMost(usize, data.len);
+    random.bytes(data[0..len]);
+
+    const features = zav.simd.arch.detect();
+    var runnable: [8]*const hash.Kernels = undefined;
+    var n: usize = 0;
+    for (hash.dispatch.all) |*k| if (hash.dispatch.supports(features, k.requires)) {
+        runnable[n] = k;
+        n += 1;
+    };
+    runnable[n] = &hash.dispatch.portable;
+    n += 1;
+    const kernels = runnable[random.uintLessThan(usize, n)];
+
+    var algos: hash.Set = .empty;
+    var limits: hash.Limits = .{};
+    inline for (comptime std.enums.values(hash.Algo)) |algo| {
+        if (random.boolean()) algos.insert(algo);
+        if (random.uintLessThan(u8, 4) == 0) @field(limits, @tagName(algo)) = random.uintAtMost(u64, data.len);
+    }
+
+    var m = hash.Multihash.init(algos, .{ .limits = limits, .kernels = kernels });
+    var off: usize = 0;
+    while (off < len) {
+        const cut = @min(len - off, random.uintAtMost(usize, 300));
+        m.update(data[off..][0..cut]);
+        off += cut;
+    }
+    const d = m.final();
+
+    inline for (comptime std.enums.values(hash.Algo)) |algo| {
+        const name = @tagName(algo);
+        const over = if (@field(limits, name)) |limit| len > limit else false;
+        const want_computed = algos.contains(algo) and !over;
+        if (d.computed.contains(algo) != want_computed) @panic("fuzz: multihash computed set");
+        if (d.dropped.contains(algo) != (algos.contains(algo) and over)) @panic("fuzz: multihash dropped set");
+        if (want_computed) {
+            const Std = switch (algo) {
+                .md5 => std.crypto.hash.Md5,
+                .sha1 => std.crypto.hash.Sha1,
+                .sha256 => std.crypto.hash.sha2.Sha256,
+            };
+            var want: [Std.digest_length]u8 = undefined;
+            Std.hash(data[0..len], &want, .{});
+            if (!std.mem.eql(u8, &want, &@field(d, name))) @panic("fuzz: multihash digest differs from std on " ++ name);
+        }
+    }
+}

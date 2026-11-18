@@ -71,10 +71,116 @@ pub fn main(init: std.process.Init) !void {
     var suite = bench.BenchmarkSuite.init(init.gpa, init.io);
     defer suite.deinit();
     try suite.add("db open 200 MB (warm cache)", dbOpen);
+
+    hash_input = try init.gpa.alloc(u8, hash_input_len);
+    defer init.gpa.free(hash_input);
+    var hash_prng = std.Random.DefaultPrng.init(8);
+    hash_prng.random().bytes(hash_input);
+    try hashBenchmarks(init.io, &suite);
     try suite.add("hash lookup, 1M MD5 entries", hashLookup);
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);
+}
+
+// Hashing (E8, docs/experiments/E8-hashers.md): MB/s per algorithm on every kernel variant this
+// CPU can run, the fused pass, std.crypto built for the bench target, and the dispatch overhead.
+
+const hash_input_len = 1024 * 1024;
+var hash_input: []u8 = undefined;
+
+fn HashBench(comptime kernels: *const zav.hash.Kernels, comptime algo: zav.hash.Algo) type {
+    return struct {
+        fn run() void {
+            var h = zav.hash.hasher.Hasher(algo).initWith(kernels);
+            h.update(hash_input);
+            sink +%= h.finalResult()[0];
+        }
+    };
+}
+
+fn StdBench(comptime Std: type) type {
+    return struct {
+        fn run() void {
+            var out: [Std.digest_length]u8 = undefined;
+            Std.hash(hash_input, &out, .{});
+            sink +%= out[0];
+        }
+
+        fn small() void {
+            var out: [Std.digest_length]u8 = undefined;
+            Std.hash(hash_input[0..64], &out, .{});
+            sink +%= out[0];
+        }
+    };
+}
+
+fn fusedAll() void {
+    var m = zav.hash.Multihash.init(.full, .{});
+    m.update(hash_input);
+    sink +%= m.final().sha256[0];
+}
+
+fn dispatchedSmall() void {
+    sink +%= zav.hash.Sha256.hash(hash_input[0..64])[0];
+}
+
+fn detectFeatures() void {
+    const f = zav.simd.arch.detect();
+    sink +%= @intFromBool(f.x86_sha or f.aarch64_sha2);
+}
+
+/// Best-of-5 nanoseconds per call, each round running `f` for at least 100 ms.
+fn nsPerCall(io: std.Io, f: *const fn () void) f64 {
+    var best: f64 = std.math.inf(f64);
+    for (0..5) |_| {
+        var calls: u64 = 0;
+        const start = std.Io.Clock.awake.now(io);
+        var elapsed: i96 = 0;
+        while (elapsed < 100 * std.time.ns_per_ms) {
+            f();
+            calls += 1;
+            elapsed = start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds;
+        }
+        best = @min(best, @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(calls)));
+    }
+    return best;
+}
+
+fn mbps(io: std.Io, f: *const fn () void) f64 {
+    return @as(f64, hash_input_len) / nsPerCall(io, f) * 1000.0;
+}
+
+fn hashBenchmarks(io: std.Io, suite: *bench.BenchmarkSuite) !void {
+    const hash = zav.hash;
+    const features = zav.simd.arch.detect();
+    const all_kernels = comptime hash.dispatch.all ++ [_]hash.Kernels{hash.dispatch.portable};
+    std.debug.print("hash: active variant {s}; MB/s (10^6 bytes) over a 1 MiB buffer, best of 5\n", .{hash.dispatch.active().name});
+    std.debug.print("hash: {s:<18} {s:>9} {s:>9} {s:>9}  hw sha1/sha256\n", .{ "variant", "md5", "sha1", "sha256" });
+    inline for (all_kernels) |*k| {
+        if (hash.dispatch.supports(features, k.requires)) {
+            std.debug.print("hash: {s:<18} {d:>9.0} {d:>9.0} {d:>9.0}  {}/{}\n", .{
+                k.name,
+                mbps(io, HashBench(k, .md5).run),
+                mbps(io, HashBench(k, .sha1).run),
+                mbps(io, HashBench(k, .sha256).run),
+                k.hwSha1(),
+                k.hwSha256(),
+            });
+            inline for (comptime std.enums.values(hash.Algo)) |algo|
+                try suite.add("hash " ++ @tagName(algo) ++ " 1 MiB " ++ k.name, HashBench(k, algo).run);
+        } else std.debug.print("hash: {s:<18} skipped: this CPU cannot run it\n", .{k.name});
+    }
+    const Md5Std = StdBench(std.crypto.hash.Md5);
+    const Sha1Std = StdBench(std.crypto.hash.Sha1);
+    const Sha256Std = StdBench(std.crypto.hash.sha2.Sha256);
+    std.debug.print("hash: {s:<18} {d:>9.0} {d:>9.0} {d:>9.0}\n", .{ "std (bench target)", mbps(io, Md5Std.run), mbps(io, Sha1Std.run), mbps(io, Sha256Std.run) });
+    std.debug.print("hash: fused md5+sha1+sha256 (active) {d:.0} MB/s\n", .{mbps(io, fusedAll)});
+    std.debug.print("hash: sha256 of 64 bytes: dispatched {d:.1} ns, std direct {d:.1} ns; feature detection {d:.0} ns\n", .{
+        nsPerCall(io, dispatchedSmall), nsPerCall(io, Sha256Std.small), nsPerCall(io, detectFeatures),
+    });
+    try suite.add("hash fused md5+sha1+sha256 1 MiB", fusedAll);
+    try suite.add("hash sha256 64 B dispatched", dispatchedSmall);
 }
 
 /// Linux: Private_Dirty from /proc/self/smaps_rollup. Null elsewhere.
