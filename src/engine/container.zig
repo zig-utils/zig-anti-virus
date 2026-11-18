@@ -76,6 +76,12 @@ pub const Notice = struct {
         unsupported,
         /// A heuristic fired; `detail` holds its Heuristics.Guardian.* name.
         heuristic,
+        /// A document that carries macros (an OOXML macro-enabled content type).
+        macros,
+        /// A reference to something outside the file (an OOXML external relationship target).
+        external,
+        /// An embedded object or package declared by the document.
+        embedded,
     };
 };
 

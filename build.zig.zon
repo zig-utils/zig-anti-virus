@@ -15,6 +15,10 @@
             .url = "https://registry.pantry.dev/zig/packages/zig-cli/0.1.5/tarball",
             .hash = "zig_cli-0.1.5-18T51KpyBACRc0h578AMa-7dezKwF5EcHS9hi6OEeBns",
         },
+        .xml = .{
+            .url = "https://pantry.dev/zig/packages/zig-xml/0.2.0/tarball",
+            .hash = "zig_xml-0.2.0-Lvy3xeipAgCUrrv8lGeXgv0isfW9cht6cYZgdeNoi8zx",
+        },
     },
 
     .paths = .{

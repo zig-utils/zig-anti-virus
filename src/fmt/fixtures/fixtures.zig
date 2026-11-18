@@ -197,6 +197,21 @@ pub const archives = [_]Archive{
     .{ .name = "nested-bomb.zip", .bytes = @embedFile("archive-nested-bomb.zip.bin"), .malformed = false, .members = &.{} },
     .{ .name = "deep-40.zip", .bytes = @embedFile("archive-deep-40.zip.bin"), .malformed = false, .members = &.{} },
     .{ .name = "deep-40.gz", .bytes = @embedFile("archive-deep-40.gz.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "macro.doc", .bytes = @embedFile("archive-macro.doc.bin"), .malformed = false, .members = &.{
+        .{ .path = "WordDocument", .len = 6068, .crc = 0x65fc3e19 },
+        .{ .path = "?SummaryInformation", .len = 300, .crc = 0xef629b7a },
+        .{ .path = "Macros/VBA/Module1", .len = 162, .crc = 0xfce6a869 },
+        .{ .path = "Macros/VBA/macro/Module1", .len = 134, .crc = 0x402c5168 },
+    } },
+    .{ .name = "macro.docm", .bytes = @embedFile("archive-macro.docm.bin"), .malformed = false, .members = &.{
+        .{ .path = "word/document.xml", .len = 199, .crc = 0xe8d50a28 },
+        .{ .path = "word/vbaProject.bin", .len = 3072, .crc = 0xc933c0ad },
+        .{ .path = "word/vbaProject.bin/VBA/macro/Module1", .len = 134, .crc = 0x402c5168 },
+        .{ .path = "word/embeddings/oleObject1.bin", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "plain.docx", .bytes = @embedFile("archive-plain.docx.bin"), .malformed = false, .members = &.{
+        .{ .path = "word/document.xml", .len = 199, .crc = 0xe8d50a28 },
+    } },
 };
 
 pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };

@@ -22,6 +22,7 @@ pub const Format = enum(u8) {
     elf,
     macho,
     macho_fat,
+    ole2,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
@@ -34,7 +35,7 @@ pub const Format = enum(u8) {
     /// Formats parsed with positional reads (central directories, section tables).
     pub fn needsRandomAccess(f: Format) bool {
         return switch (f) {
-            .zip, .pe, .elf, .macho, .macho_fat => true,
+            .zip, .pe, .elf, .macho, .macho_fat, .ole2 => true,
             else => false,
         };
     }
@@ -54,6 +55,7 @@ pub fn detect(head: []const u8) Format {
     if (std.mem.startsWith(u8, head, "PK\x03\x04") or std.mem.startsWith(u8, head, "PK\x05\x06") or
         std.mem.startsWith(u8, head, "PK\x07\x08")) return .zip;
     if (std.mem.startsWith(u8, head, "\x7fELF")) return .elf;
+    if (std.mem.startsWith(u8, head, "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")) return .ole2;
     if (head.len >= 4) {
         const be = std.mem.readInt(u32, head[0..4], .big);
         switch (be) {
@@ -134,6 +136,7 @@ test "magic numbers" {
     try std.testing.expectEqual(Format.zstd, detect("\x28\xb5\x2f\xfd"));
     try std.testing.expectEqual(Format.zip, detect("PK\x03\x04"));
     try std.testing.expectEqual(Format.elf, detect("\x7fELF\x02"));
+    try std.testing.expectEqual(Format.ole2, detect("\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"));
     try std.testing.expectEqual(Format.macho, detect("\xcf\xfa\xed\xfe"));
     try std.testing.expectEqual(Format.macho_fat, detect("\xca\xfe\xba\xbe\x00\x00\x00\x02"));
     try std.testing.expectEqual(Format.binary, detect("\xca\xfe\xba\xbe\x00\x00\x00\x34")); // Java class

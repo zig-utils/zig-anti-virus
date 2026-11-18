@@ -18,6 +18,9 @@ pub const zip = @import("zip.zig");
 pub const pe = @import("pe.zig");
 pub const elf = @import("elf.zig");
 pub const macho = @import("macho.zig");
+pub const ole2 = @import("ole2.zig");
+pub const ooxml = @import("ooxml.zig");
+pub const vba = @import("vba.zig");
 pub const html_norm = @import("html_norm.zig");
 pub const text_norm = @import("text_norm.zig");
 /// Reference vectors (tests, fuzzing, benchmarks).
@@ -41,6 +44,9 @@ test {
     _ = pe;
     _ = elf;
     _ = macho;
+    _ = ole2;
+    _ = ooxml;
+    _ = vba;
     _ = html_norm;
     _ = text_norm;
     _ = @import("adversarial.zig");

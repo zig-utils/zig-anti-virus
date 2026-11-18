@@ -20,6 +20,7 @@ const Source = @import("../engine/source.zig").Source;
 const Walker = container.Walker;
 const Error = container.Error;
 const decode = @import("decode.zig");
+const ooxml = @import("ooxml.zig");
 
 const sig_local = 0x04034b50;
 const sig_central = 0x02014b50;
@@ -410,6 +411,8 @@ fn member(w: *Walker, src: Source, name: []const u8, data_off: u64, csize: u64, 
     }
     const data = src.slice(data_off, avail) catch return;
     const hint: ?u64 = if (usize_v != 0) usize_v else null;
+    // OOXML package parts declare macros, external targets and embedded objects.
+    ooxml.inspect(w, name, data, method, usize_v);
     switch (method) {
         0 => try w.child(name, data, .member),
         8 => try decode.child(w, .deflate_raw, data, name, hint),

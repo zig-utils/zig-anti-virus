@@ -12,6 +12,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addHashVariants(b, zav, target, optimize);
+    // zig-xml's incremental tokenizer reads OOXML package parts (src/fmt/ooxml.zig).
+    const xml = b.dependency("xml", .{ .target = target, .optimize = optimize }).module("xml");
+    zav.addImport("xml", xml);
 
     const zig_cli = b.dependency("cli", .{ .target = target, .optimize = optimize }).module("zig_cli");
 
@@ -55,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addHashVariants(b, tree_tests, target, optimize);
+    tree_tests.addImport("xml", xml);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_tests })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = capiModule(b, target, optimize, zav) })).step);
 
@@ -128,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         });
         addHashVariants(b, zav_fast, target, .fast);
+        zav_fast.addImport("xml", b.dependency("xml", .{ .target = target, .optimize = .fast }).module("xml"));
         const bench_exe = b.addExecutable(.{
             .name = "bench",
             .root_module = b.createModule(.{
