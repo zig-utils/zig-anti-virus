@@ -18,6 +18,13 @@ const pf = zav.match.prefilter;
 const bodyscan = zav.engine.bodyscan;
 const vm = zav.match.verify_vm;
 
+/// `--partition N`: type every file as target N (E2 measures the PE partition over all of B1).
+var force_partition: ?u8 = null;
+/// `--rounds N`: best of N passes in `stages` (a loaded machine needs more than three), and of
+/// N scans per file in `scan` (default 1 there).
+var rounds: usize = 3;
+var rounds_set = false;
+
 const Corpus = struct {
     paths: std.ArrayList([]const u8) = .empty,
     bytes: u64 = 0,
@@ -40,19 +47,34 @@ pub fn main(init: std.process.Init) !void {
     var reference = false;
     var limit: usize = std.math.maxInt(usize);
     var i: usize = 3;
+    force_partition = null;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--reference")) {
             reference = true;
+        } else if (std.mem.eql(u8, args[i], "--rounds")) {
+            i += 1;
+            rounds = try std.fmt.parseInt(usize, args[i], 10);
+            rounds_set = true;
+        } else if (std.mem.eql(u8, args[i], "--partition")) {
+            i += 1;
+            force_partition = try std.fmt.parseInt(u8, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--limit")) {
             i += 1;
             limit = try std.fmt.parseInt(usize, args[i], 10);
         } else try dirs.append(arena, args[i]);
     }
     var corpus: Corpus = .{};
-    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
+    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "short") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
 
     if (std.mem.eql(u8, cmd, "census")) return census(database, index);
-    if (std.mem.eql(u8, cmd, "scan")) return scan(gpa, io, index, corpus, if (reference) .reference else .auto);
+    if (std.mem.eql(u8, cmd, "short")) {
+        if (dirs.items.len > 1) hot_key = @byteSwap(try std.fmt.parseInt(u16, dirs.items[1], 16));
+        return shortAtoms(gpa, index, if (dirs.items.len > 0) try std.fmt.parseInt(u8, dirs.items[0], 10) else 1);
+    }
+    if (std.mem.eql(u8, cmd, "scan")) {
+        if (!rounds_set) rounds = 1;
+        return scan(gpa, io, index, corpus, if (reference) .reference else .auto);
+    }
     if (std.mem.eql(u8, cmd, "stages")) return stages(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "diff")) return diff(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "prefix")) return prefix(gpa, io, index, corpus);
@@ -105,8 +127,9 @@ pub fn main(init: std.process.Init) !void {
     return usage();
 }
 
-/// compile <out.zavdb> <cvd>... [--prefix] [--penalty-scale X]: a database with atom selection
-/// varied, for E2 and E3 (prefix selection; the stride penalties scaled).
+/// compile <out.zavdb> <cvd>... [--prefix] [--no-defer] [--strides 8,4] [--gate-ns X]
+/// [--penalty-scale X]: a database with atom selection varied, for E2 and E3 (prefix
+/// selection; no deferral; other sampled strides; the gate cost; the stride penalties scaled).
 fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const tmp = try std.fmt.allocPrint(gpa, "{s}.spill", .{args[0]});
@@ -126,6 +149,16 @@ fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             c.atom_costs.prefix = true;
         } else if (std.mem.eql(u8, a, "--no-defer")) {
             c.atom_costs.no_defer = true;
+        } else if (std.mem.eql(u8, a, "--gate-ns")) {
+            i += 1;
+            c.atom_costs.gate_ns = try std.fmt.parseFloat(f64, args[i]);
+        } else if (std.mem.eql(u8, a, "--strides")) {
+            // --strides 8,4: the sampled strides windows may use (the previous design's tiers).
+            i += 1;
+            var picked: std.ArrayList(u8) = .empty;
+            var it = std.mem.splitScalar(u8, args[i], ',');
+            while (it.next()) |x| try picked.append(gpa, try std.fmt.parseInt(u8, x, 10));
+            c.atom_costs.sampled = picked.items;
         } else if (std.mem.eql(u8, a, "--penalty-scale")) {
             i += 1;
             const k = try std.fmt.parseFloat(f64, args[i]);
@@ -140,6 +173,11 @@ fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     try c.addBuiltin();
     const summary = try c.write(io, cwd, args[0], .{ .db_version = 1 });
     std.debug.print("{s}: {d} programs\n", .{ args[0], summary.programs });
+    var buf: [1024]u8 = undefined;
+    var w = std.debug.lockStderr(&buf).terminal().writer;
+    defer std.debug.unlockStderr();
+    try c.histogram.render(w);
+    try w.flush();
 }
 
 fn usage() void {
@@ -168,6 +206,7 @@ fn list(io: std.Io, arena: std.mem.Allocator, dir_path: []const u8, corpus: *Cor
 /// ClamAV target type from the first bytes (enough for benchmarks; the engine has the real
 /// file-type pipeline).
 fn targetOf(data: []const u8) u8 {
+    if (force_partition) |p| return p;
     if (data.len >= 2 and data[0] == 'M' and data[1] == 'Z') return 1;
     if (data.len >= 4 and std.mem.eql(u8, data[0..4], "\x7fELF")) return 6;
     if (data.len >= 4) {
@@ -226,12 +265,20 @@ fn scan(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: C
     var slowest: struct { ns: u64 = 0, path: []const u8 = "", size: usize = 0 } = .{};
     var name_buf: [512]u8 = undefined;
     const names = try zav.engine.hashscan.HashIndex.load(index_db);
+    // With --rounds N each file is scanned N times and its fastest scan counts (counters and
+    // verdicts from the last).
     for (corpus.paths.items) |p| {
         const data = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31));
         defer gpa.free(data);
-        const t = now(io);
-        const verdict = try scanOne(&index, w, data, mode, &stats);
-        const dt = nsSince(io, t);
+        var dt: u64 = std.math.maxInt(u64);
+        var verdict: bodyscan.Verdict = undefined;
+        for (0..rounds) |r| {
+            const before = stats;
+            const t = now(io);
+            verdict = try scanOne(&index, w, data, mode, &stats);
+            dt = @min(dt, nsSince(io, t));
+            if (r + 1 < rounds) stats = before;
+        }
         ns += dt;
         if (dt > slowest.ns) slowest = .{ .ns = dt, .path = p, .size = data.len };
         switch (verdict) {
@@ -256,7 +303,7 @@ fn scan(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: C
         @as(f64, @floatFromInt(stats.verifies)) / mb,
         @as(f64, @floatFromInt(stats.deferred)) / mb,
     });
-    for (stats.by_kind, [_][]const u8{ "stride 8", "stride 4", "stride 1", "3-gram", "2-gram" }) |k, name| {
+    for (stats.by_kind, [_][]const u8{ "stride 8", "stride 4", "stride 3", "stride 2", "stride 1", "3-gram", "2-gram" }) |k, name| {
         std.debug.print("  {s:<9} per MB: {d:>9.1} candidates {d:>9.1} probes {d:>8.1} verifies\n", .{ name, @as(f64, @floatFromInt(k.candidates)) / mb, @as(f64, @floatFromInt(k.probes)) / mb, @as(f64, @floatFromInt(k.verifies)) / mb });
     }
     std.debug.print("slowest: {s} ({d} bytes) {d:.2} ms\n", .{ slowest.path, slowest.size, @as(f64, @floatFromInt(slowest.ns)) / 1e6 });
@@ -281,12 +328,12 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
     for (corpus.paths.items) |p| try datas.append(gpa, try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31)));
     var ring: [pf.ring_len]pf.Candidate = undefined;
     const mb = @as(f64, @floatFromInt(corpus.bytes)) / 1e6;
-    // Best of three passes each.
+    // Best of `rounds` passes each.
     var best1: u64 = std.math.maxInt(u64);
     var best12: u64 = std.math.maxInt(u64);
     var cands: u64 = 0;
     var stats: pf.Stats = .{};
-    for (0..3) |round| {
+    for (0..rounds) |round| {
         var t = now(io);
         cands = 0;
         for (datas.items) |d| {
@@ -321,6 +368,54 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
         }
         gate_pos += d.len - 1;
     }
+    // What a vector filter on one byte of the pair would pass: the gate's first and second bytes.
+    var first_pass: u64 = 0;
+    var second_pass: u64 = 0;
+    var firsts: [256]bool = @splat(false);
+    var seconds: [256]bool = @splat(false);
+    for (datas.items) |d| {
+        const part = index.partitionFor(targetOf(d)) orelse continue;
+        if (part.gate.len == 0 or d.len < 2) continue;
+        firsts = @splat(false);
+        seconds = @splat(false);
+        for (part.gate, 0..) |g, k| if (g != 0) {
+            firsts[k & 0xff] = true;
+            seconds[k >> 8] = true;
+        };
+        for (0..d.len - 1) |k| {
+            first_pass += @intFromBool(firsts[d[k]]);
+            second_pass += @intFromBool(seconds[d[k + 1]]);
+        }
+    }
+    {
+        // The gate keys that pass most often.
+        const counts = try gpa.alloc(u64, 65536);
+        defer gpa.free(counts);
+        @memset(counts, 0);
+        var gp: ?*const pf.Partition = null;
+        for (datas.items) |d| {
+            const part = index.partitionFor(targetOf(d)) orelse continue;
+            gp = part;
+            if (part.gate.len == 0 or d.len < 2) continue;
+            for (0..d.len - 1) |k| {
+                const two = @as(u32, d[k]) | @as(u32, d[k + 1]) << 8;
+                if (part.gate[two] != 0) counts[two] += 1;
+            }
+        }
+        for (0..12) |_| {
+            const top_k = std.mem.indexOfMax(u64, counts);
+            if (counts[top_k] == 0) break;
+            std.debug.print("  gate key {x:0>2}{x:0>2} flags {d}: {d:.3}% of positions\n", .{ top_k & 0xff, top_k >> 8, gp.?.gate[top_k], 100 * @as(f64, @floatFromInt(counts[top_k])) / @as(f64, @floatFromInt(@max(gate_pos, 1))) });
+            counts[top_k] = 0;
+        }
+    }
+    var nf: usize = 0;
+    var ns: usize = 0;
+    for (firsts, seconds) |f, sec| {
+        nf += @intFromBool(f);
+        ns += @intFromBool(sec);
+    }
+    std.debug.print("gate: {d} first bytes pass {d:.1}%, {d} second bytes pass {d:.1}% (last file's partition)\n", .{ nf, 100 * @as(f64, @floatFromInt(first_pass)) / @as(f64, @floatFromInt(@max(gate_pos, 1))), ns, 100 * @as(f64, @floatFromInt(second_pass)) / @as(f64, @floatFromInt(@max(gate_pos, 1))) });
     std.debug.print("{d} files, {d:.1} MB, stride-one gate passes {d:.2}% of positions\n", .{ datas.items.len, mb, 100 * @as(f64, @floatFromInt(gate_pass)) / @as(f64, @floatFromInt(@max(gate_pos, 1))) });
     std.debug.print("stage 1:     {d:.1} MB/s per core, {d:.1} candidates per MB\n", .{ mb / (@as(f64, @floatFromInt(best1)) / 1e9), @as(f64, @floatFromInt(cands)) / mb });
     std.debug.print("stages 1+2:  {d:.1} MB/s per core, {d:.1} probes and {d:.1} verifies per MB\n", .{ mb / (@as(f64, @floatFromInt(best12)) / 1e9), @as(f64, @floatFromInt(stats.probes)) / mb, @as(f64, @floatFromInt(stats.verifies)) / mb });
@@ -735,4 +830,51 @@ fn census(database: zav.db.reader.Database, index: bodyscan.BodyIndex) !void {
     defer std.debug.unlockStderr();
     try zav.match.prefilter.describe(&index.prefilters, w);
     try w.flush();
+}
+
+/// short <db> [target]: the stride-one atoms of one partition (its own target and type 0), by
+/// gram length and anchor literal length, with sample patterns.
+var hot_key: ?u16 = null;
+
+fn shortAtoms(gpa: std.mem.Allocator, index: bodyscan.BodyIndex, target: u8) !void {
+    const progs = index.programs.?;
+    const part = index.partitionFor(target).?;
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(gpa);
+    var hist: [5][17]u32 = @splat(@splat(0));
+    var buf: [200]u8 = undefined;
+    var shown: usize = 0;
+    // Each entry's key, from the slots.
+    const keys = try gpa.alloc(u32, part.entries.len);
+    defer gpa.free(keys);
+    for (part.slots) |sl| {
+        if (sl.first == pf.empty_slot) continue;
+        var k = sl.first;
+        while (true) : (k += 1) {
+            keys[k] = sl.key;
+            if (part.entries[k].flags & pf.entry_last != 0) break;
+        }
+    }
+    for (part.entries) |*ep| {
+        const e = ep.*;
+        if (e.stride != 1) continue;
+        const t = e.flags >> pf.entry_target_shift;
+        if (t != 0 and t != target) continue;
+        if ((try seen.getOrPut(gpa, e.prog)).found_existing) continue;
+        const p = progs.get(e.prog);
+        const lit_len = p.pattern.ops[p.header.anchor_op].len;
+        hist[e.q][@min(lit_len, 16)] += 1;
+        const key_hot = if (hot_key) |hk| @as(u16, @truncate(keys[(@intFromPtr(ep) - @intFromPtr(part.entries.ptr)) / @sizeOf(pf.Entry)])) == hk else false;
+        if (key_hot or (hot_key == null and shown < 400 and (e.prog % 7 == 0))) {
+            shown += 1;
+            var wr: std.Io.Writer = .fixed(&buf);
+            zav.compile.hexsig.format(p.pattern, &wr) catch {};
+            std.debug.print("q{d} lit{d} t{d} {s}\n", .{ e.q, lit_len, t, wr.buffered() });
+        }
+    }
+    for (2..5) |qq| {
+        std.debug.print("q={d}:", .{qq});
+        for (hist[qq], 0..) |n, l| if (n > 0) std.debug.print(" lit{d}={d}", .{ l, n });
+        std.debug.print("\n", .{});
+    }
 }

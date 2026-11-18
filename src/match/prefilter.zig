@@ -21,7 +21,7 @@
 //!     gate:    [65536]u8          which stride-one filters hold grams starting with two bytes
 //!     blobs:   zig-regex `literals.Sbbf` blobs, each 64-byte aligned
 //!
-//! Each filter is a split-block Bloom filter over the `q`-byte grams (4, or 3 or 2 for tier D) at
+//! Each filter (stride 8, 4, 3, 2 or 1) is a split-block Bloom filter over the `q`-byte grams (4, or 3 or 2 for tier D) at
 //! offsets `0 .. stride - 1` of every atom of its tier, so sampling every `stride`-th position
 //! cannot miss an atom (zig-regex `literals.sbbf`). Every filter of a partition shares one hash
 //! seed: one hash per position serves all of them. Partition k >= 1 holds the atoms of its own
@@ -177,7 +177,7 @@ pub fn loadAll(section: []const u8, programs: prog.Programs) Error![partitions]?
     return out;
 }
 
-pub const max_filters = 5;
+pub const max_filters = 7;
 
 pub const Filter = struct {
     stride: u8,
@@ -222,7 +222,7 @@ pub const Partition = struct {
         if (refs_end > pf_bytes.len) return error.BadPrefilter;
         const refs = std.mem.bytesAsSlice(FilterRef, pf_bytes[@sizeOf(Header)..refs_end]);
         for (refs, 0..) |r, i| {
-            const ok_stride = (r.q == 4 and (r.stride == 1 or r.stride == 4 or r.stride == 8)) or ((r.q == 3 or r.q == 2) and r.stride == 1);
+            const ok_stride = (r.q == 4 and (r.stride == 1 or r.stride == 2 or r.stride == 3 or r.stride == 4 or r.stride == 8)) or ((r.q == 3 or r.q == 2) and r.stride == 1);
             if (!ok_stride or r.off % 64 != 0 or @as(u64, r.off) + r.len > pf_bytes.len) return error.BadPrefilter;
             const f = sbbf.Sbbf.load(pf_bytes[r.off..][0..r.len]) catch return error.BadPrefilter;
             if (f.seed != h.seed or f.stride != r.stride) return error.BadPrefilter;
@@ -280,7 +280,7 @@ pub const Partition = struct {
                 if (entry.prog >= programs.count() or entry.ext_len > 4) return error.BadPrefilter;
                 if (entry.flags & entry_check != 0 and (entry.ext >= part.checks.len or entry.ext_len != 0)) return error.BadPrefilter;
                 // Entries of filters this partition lacks belong to other partitions.
-                const ok = (entry.q == 4 and (entry.stride == 1 or entry.stride == 4 or entry.stride == 8)) or ((entry.q == 3 or entry.q == 2) and entry.stride == 1);
+                const ok = (entry.q == 4 and (entry.stride == 1 or entry.stride == 2 or entry.stride == 3 or entry.stride == 4 or entry.stride == 8)) or ((entry.q == 3 or entry.q == 2) and entry.stride == 1);
                 if (!ok or entry.flags >> entry_target_shift > 14) return error.BadPrefilter;
                 if (entry.flags & entry_last != 0) break;
             }
@@ -398,8 +398,8 @@ pub const Stats = struct {
     scans: u64 = 0,
     /// Verify calls that ran out of their own step budget, per program.
     per_prog_exhausted: ?[]u32 = null,
-    /// Candidates and probes by filter kind: stride 8, 4, 1 (4-byte grams), 3-gram, 2-gram.
-    by_kind: [5]struct { candidates: u64 = 0, probes: u64 = 0, verifies: u64 = 0 } = @splat(.{}),
+    /// Candidates and probes by filter kind: stride 8, 4, 3, 2, 1 (4-byte grams), 3-gram, 2-gram.
+    by_kind: [7]struct { candidates: u64 = 0, probes: u64 = 0, verifies: u64 = 0 } = @splat(.{}),
 };
 
 /// Run stages one and two over `data`, calling `sink.candidate(prog_index, anchor_start)` for
@@ -432,10 +432,12 @@ pub fn stage2(part: *const Partition, data: []const u8, cands: []const Candidate
             4 => switch (f.stride) {
                 8 => 0,
                 4 => 1,
-                else => 2,
+                3 => 2,
+                2 => 3,
+                else => 4,
             },
-            3 => 3,
-            else => 4,
+            3 => 5,
+            else => 6,
         };
         if (stats) |s| s.by_kind[kind].candidates += 1;
         var k: usize = 0;
@@ -512,6 +514,10 @@ const Fixture = struct {
 /// Programs for `hexes` (all type 0, searched, atoms chosen by the default model), and
 /// partition 0 built over them.
 fn fixture(hexes: []const []const u8) !Fixture {
+    return fixtureCosts(hexes, .{});
+}
+
+fn fixtureCosts(hexes: []const []const u8, costs: @import("../compile/atoms.zig").Costs) !Fixture {
     const zc = struct {
         const hexsig = @import("../compile/hexsig.zig");
         const prog_build = @import("../compile/prog_build.zig");
@@ -527,7 +533,7 @@ fn fixture(hexes: []const []const u8) !Fixture {
         var diag: zc.hexsig.Diag = .{};
         try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i) });
     }
-    const planned = try zc.atoms.plan(a, zc.gm.Model.default(), .{}, inputs.items, &.{});
+    const planned = try zc.atoms.plan(a, zc.gm.Model.default(), costs, inputs.items, &.{});
     var w = zc.prog_build.Writer.init(a, null);
     for (inputs.items, planned) |*in, p| {
         in.atom = p.atom(in.offset.kind);
@@ -630,8 +636,14 @@ test "every planted atom is found: tiers A to D, nocase, wide, the end of the da
 }
 
 test "the kernel and the scalar reference return the same candidates" {
-    const hexes = [_][]const u8{ "13a7c95be2f1408d77e3b1aa", "5be2f1408d77e3", "c95be2f1", "ff25a4{3}0000000000000000", "8185??f?ffff{4}81ad", "4142434445464748494a4b", "000000ff" };
-    var f = try fixture(&hexes);
+    // Every sampled stride the format allows, alone and together, with the gated filters.
+    const sets = [_][]const u8{ &.{3}, &.{ 8, 4 }, &.{2}, &.{ 8, 4, 3, 2 }, &.{8} };
+    for (sets) |set| try kernelMatchesReference(set);
+}
+
+fn kernelMatchesReference(sampled: []const u8) !void {
+    const hexes = [_][]const u8{ "13a7c95be2f1408d77e3b1aa", "5be2f1408d77e3", "c95be2f1", "ff25a4{3}0000000000000000", "8185??f?ffff{4}81ad", "4142434445464748494a4b", "000000ff", "73a7c95be2" };
+    var f = try fixtureCosts(&hexes, .{ .sampled = sampled });
     defer f.deinit();
     var prng = std.Random.DefaultPrng.init(11);
     const r = prng.random();
@@ -695,8 +707,10 @@ test "false-positive rate on random data is within twice the theoretical rate" {
     const data = try a.alloc(u8, 1 << 22);
     r.bytes(data);
     var ring: [ring_len]Candidate = undefined;
+    var checked: usize = 0;
     for (f.part.filters[0..f.part.filter_count], 0..) |filt, fi| {
-        if (filt.stride != 8) continue;
+        if (filt.stride == 1) continue;
+        checked += 1;
         var hits: u64 = 0;
         var tested: u64 = 0;
         var pos: usize = 0;
@@ -705,10 +719,11 @@ test "false-positive rate on random data is within twice the theoretical rate" {
             for (ring[0..n]) |c| hits += @intFromBool(c.filter == fi);
             pos = next;
         }
-        tested = data.len / 8;
+        tested = data.len / filt.stride;
         const rate = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(tested));
         const theory = filt.sbbf.expectedFalsePositiveRate();
         try testing.expect(rate <= 2 * theory);
         try testing.expect(rate >= theory / 2);
     }
+    try testing.expect(checked > 0);
 }

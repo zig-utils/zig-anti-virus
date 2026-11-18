@@ -152,10 +152,10 @@ keys:    [N]u32 first 4 digest bytes, big-endian, sorted within each size bucket
 
 **`PREFILTER[p]`:**
 - A 64-byte header: partition, filter count, the one hash seed every filter shares (one hash per position serves them all), the list of programs with no atom, the gate.
-- Up to five zig-regex split-block Bloom filters (32-byte blocks of 8 x u32 words, 16 bits per gram): stride 8 and stride 4 over 4-byte grams (tiers A and B), stride 1 over 4-, 3- and 2-byte grams (tier C and tier D). Small filters get at least 2 KiB.
-- The stride-one gate: 64 KiB, one byte per possible first two bytes, naming the stride-one filters that hold a gram starting with them [M: passes 5.9% of B1 positions].
+- Up to seven zig-regex split-block Bloom filters (32-byte blocks of 8 x u32 words, 16 bits per gram): sampled filters over 4-byte grams at stride 8, 4, 3 or 2, and stride 1 over 4-, 3- and 2-byte grams (4- and 5-byte runs, tier D). The compiler emits one sampled stride, 3 (section 4.2). Small filters get at least 2 KiB.
+- The stride-one gate: 64 KiB, one byte per possible first two bytes, naming the stride-one filters that hold a gram starting with them [M: passes 0.94% of the positions of B1's PE files, 0.15% of B1].
 
-**`ATOM_TABLE`:** one table shared by every partition, linear probing, at most 50% full. Slots are `{key u32, first u32}`; entries are `{prog u32, ext u32, back u32, ext_len u8, stride u8, q u8, flags u8}` with the program's target in the top nibble of `flags`, so a partition keeps only its own and type 0's entries and type 0's atoms are not copied per partition. `ext` holds up to 4 bytes after the key, or the index of a masked 8-byte check of the anchor part for atoms whose own bytes say little (zero padding beside a short opcode). Main + daily: 1,048,576 slots (28.6% used), 396,964 entries, 331,709 checks, 22.7 MB; the whole PREFILTER section is 32 MB [M].
+**`ATOM_TABLE`:** one table shared by every partition, linear probing, at most 50% full. Slots are `{key u32, first u32}`; entries are `{prog u32, ext u32, back u32, ext_len u8, stride u8, q u8, flags u8}` with the program's target in the top nibble of `flags`, so a partition keeps only its own and type 0's entries and type 0's atoms are not copied per partition. `ext` holds up to 4 bytes after the key, or the index of a masked 8-byte check of the anchor part for atoms whose own bytes say little (zero padding beside a short opcode). Main + daily + bytecode: 524,288 slots (37.2% used), 394,953 entries, 198,715 checks, 15.3 MB; the whole PREFILTER section is 19.1 MB [M] (32 MB with strides 8 and 4, where an atom's 11-byte window put 8 grams in the filter and keyed the table on more distinct grams).
 
 **`SUBSIG_PROG`:** one program per subsignature.
 - Header: ldb, index, target, modifiers (nocase, wide, ascii, fullword), offset kind and values, anchor location, min and max length.
@@ -192,12 +192,13 @@ Large sections (programs, cold rows, sort runs) live in spill files and are mapp
 
 ### 4.2 Atom selection and tiers
 
-For each searched program (src/compile/atoms.zig), enumerate every window inside a literal at a fixed distance from its part's start, of `stride + 3` bytes for strides 8, 4 and 1, then 3- and 2-byte windows. A window costs its grams' summed benign probability times a probe (20 ns), its key gram's probability times a verify (200 ns), and a small bias for the filter its stride needs; the cheapest wins. Probabilities come from a 4-gram model of the benign corpus B1 (src/compile/gram_model.zig: bigram costs plus the 32,768 most frequent 4-grams, 230 KB, deterministic). A run of zeros beside a rare 3-byte opcode therefore gets the 3-byte atom.
+For each searched program (src/compile/atoms.zig), enumerate every window inside a literal at a fixed distance from its part's start, of `stride + 3` bytes for the sampled stride and for stride 1, then 3- and 2-byte windows. A window costs its grams' summed benign probability times a probe (20 ns), its key gram's probability times a verify (200 ns), a small bias for the filter its stride needs, and for stride-one windows the benign rate of their first two bytes times a gate pass (30 ns, see `Costs.gate_ns`); the cheapest wins. Probabilities come from a 4-gram model of the benign corpus B1 (src/compile/gram_model.zig: bigram costs plus the 32,768 most frequent 4-grams, 230 KB, deterministic). A run of zeros beside a rare 3-byte opcode therefore gets the 3-byte atom.
 
-Tiers name the window chosen:
-- **A: stride 8**, all 8 4-grams of an 11-byte window in the filter.
-- **B: stride 4.**
-- **C: stride 1**, behind the stride-one gate.
+**One sampled stride.** A sampled filter costs one block test per `stride` bytes whatever it holds, and filters of several strides add up: strides 8 and 4 (the first design's tiers A and B) cost 6 tests per 16 bytes, and once 6-byte literals needed stride 2 that became 14. Every window long enough for the smallest stride present could share its filter at no extra test, with fewer grams per atom. So the compiler uses one sampled stride, 3 (5.3 tests per 16 bytes, windows of 6 bytes or more); E2 compared 2, 3 and 4 and the old tiers on B1's PE files, B1 and B2.
+
+The windows chosen:
+- **Sampled: stride 3**, the 3 4-grams of a 6-byte window in the filter.
+- **C: stride 1**, 4- and 5-byte runs, behind the stride-one gate.
 - **D: a 3-byte or 2-byte atom**, stride 1, behind the gate; no atom at all only for programs without a 2-byte literal (none in main + daily).
 
 **Deferral by covers** (P4.10, Hyperscan's Rose idea applied to ClamAV expressions): a cover of a logical expression is a set of subsigs one of which must match whenever it holds (`0&1`: either; `0|1`: both; `(0|1)>2`: both; byte compares by their trigger, PCRE by its trigger expression, pinned subsigs free). Only the cheapest cover is searched; every other subsig, of any tier, is deferred to a second pass over files whose signature was touched, all pending atoms in one batched pass. Expressions without a cover defer nothing, so detections are those of searching everything (planted differential on the full database: no mismatch).
@@ -249,8 +250,9 @@ miss -> read first 4 KiB -> file-type trie
 - Append the position to the ring without a branch.
 - Positions are independent, so many misses stay in flight. An Aho-Corasick walk is a chain of dependent loads: zig-regex's sparse automaton over 400k binary literals scans at 40 MB/s, and the dense one is not built past 100k [M].
 - Vectorise the hashing (overlapping loads from one vector via comptime shuffles), not the probes.
-- The sampled filters hash their four lanes per 16 bytes in one vector; the stride-one filters run only behind the gate, one byte load per position, and test only the lanes and filters it names.
-- Measured on B1 with the full database (E2) [M]: strides 8 and 4 alone 2.26 GB/s per core; the PE partition with every tier 0.76-0.88 GB/s, 0.69-0.70 GB/s with stage two (Apple M3 Pro, shared machine). Per tier over random data: tier A 1.7-2.1 GB/s, tiers A and B 2.1 GB/s (M3 Pro, EPYC 9V74). The 1 GB/s pass line is missed because of the stride-one tier.
+- The sampled filter hashes the lanes its stride lands on in one vector (stride 3 steps 48 bytes, three loads); each test sets a bit of a mask and the rare hits are appended afterwards, so no test waits on the ring position of the one before.
+- The stride-one filters run only behind the gate, one byte load per position; passed positions are collected without a branch and tested once per batch against every gated filter, kept where the gate names it, so a pass costs block tests in L1 rather than mispredicted branches (a pass cost about 14 ns tested in place, 9 ns batched).
+- Measured with the full database (E2) [M]: on B1's PE files the PE partition runs 1.1 GB/s per core in stage one and about 0.97 GB/s with stage two (before: 0.50 and 0.39-0.43); B1 as typed 1.29 and 1.19 GB/s; B2 1.16 and 0.88 GB/s (Apple M3 Pro, shared machine).
 
 **Verify VM:**
 - Starts at the anchor part and searches the other parts within their gap bounds, using SIMD memchr and masked compares.

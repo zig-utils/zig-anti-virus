@@ -67,7 +67,8 @@ pub fn build(b: *std.Build) void {
     tree_tests.addImport("xml", xml);
     tree_tests.addImport("regex", regex);
     tree_tests.addImport("mime", mime);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_tests })).step);
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only module-tree tests whose names contain this") orelse &.{};
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_tests, .filters = test_filters })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = capiModule(b, target, optimize, zav) })).step);
 
     const c_smoke = b.addExecutable(.{

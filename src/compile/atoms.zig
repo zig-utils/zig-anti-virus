@@ -3,17 +3,23 @@
 //! Candidate rate, not signature count, decides scan speed, so each searched program gets the
 //! rarest window the benign 4-gram model (gram_model.zig) knows of. A window is a run of
 //! `stride + 3` bytes inside one literal op whose distance from its part's start is fixed (the
-//! verify VM starts a candidate from there). Its stride is its tier:
+//! verify VM starts a candidate from there). Every 4-gram of it at offsets `0 .. stride - 1`
+//! goes into the filter of its stride, so sampling every `stride`-th position finds it:
 //!
-//!     A  run of 11 or more bytes   stride 8   all 8 grams of the window go into the filter
-//!     B  run of 7 to 10            stride 4
-//!     C  run of 4 to 6             stride 1
-//!     D  run of 3 or fewer         no 4-gram atom
+//!     sampled   run of 6 or more bytes   stride 3   the window's 3 grams in the sampled filter
+//!     C         run of 4 or 5            stride 1, behind the gate
+//!     D         run of 3 or fewer        a 3- or 2-byte gram, behind the gate
 //!
-//! A filter's stage-one cost is one probe per `stride` bytes whatever it holds, so a partition
-//! pays for a stride-1 filter as soon as one tier-C atom lands in it. A window therefore costs
-//! its grams' summed benign probability (stage-two probes per byte) plus a penalty for the
-//! filter its stride needs, and the cheapest window wins.
+//! A sampled filter's stage-one cost is one block test per `stride` bytes whatever it holds,
+//! and filters of different strides add up: strides 8 and 4 together cost 6 tests per 16
+//! bytes, stride 2 alone 8, stride 3 alone 5.3. So each partition has one sampled stride
+//! (`Costs.sampled`, 3 by default): every window long enough for it shares its filter, which
+//! also keeps the filter small (3 grams per atom instead of 8). E2 records the measurements.
+//! A window costs its grams' summed benign probability (stage-two probes per byte) plus a
+//! penalty for the filter its stride needs, and the cheapest window wins. Stride-one windows
+//! (4-byte and tier D) also pay for the positions their first two bytes open in the gate in
+//! front of the stride-one filters: on PE files a gate holding text grams passed 30% of
+//! positions.
 //!
 //! Logical signatures need far fewer atoms than they have subsigs. A *cover* of an expression
 //! is a set of subsigs one of which must match whenever the expression is true: `0&1` is
@@ -33,57 +39,37 @@ const gm = @import("gram_model.zig");
 
 pub const q = 4;
 
-pub const Tier = enum(u8) {
-    a,
-    b,
-    c,
-    d,
-
-    pub fn stride(t: Tier) u8 {
-        return switch (t) {
-            .a => 8,
-            .b => 4,
-            .c => 1,
-            .d => 0,
-        };
-    }
-
-    pub fn ofStride(s: u8) Tier {
-        return switch (s) {
-            8 => .a,
-            4 => .b,
-            1 => .c,
-            else => .d,
-        };
-    }
-
-    /// The tier of the longest fixed run.
-    pub fn ofRun(len: usize) Tier {
-        if (len >= 11) return .a;
-        if (len >= 7) return .b;
-        if (len >= 4) return .c;
-        return .d;
-    }
-};
-
 /// What atom selection weighs, in nanoseconds per scanned byte.
 pub const Costs = struct {
     /// An atom table probe (the table is larger than the caches).
     probe_ns: f64 = 20,
     /// A verify call (its program is in the warm region).
     verify_ns: f64 = 200,
-    /// What a window pays for using the filter of its stride (1, 4, 8): a bias towards
+    /// The sampled strides windows may use (each of 2, 3, 4, 8 at most once); windows too
+    /// short for every one of them go behind the gate at stride 1.
+    sampled: []const u8 = &.{3},
+    /// What a window pays for using the filter of its stride (`strides`): a bias towards
     /// sampled filters between windows of similar candidate cost. Whether a stride-1 filter
     /// exists at all is decided by the programs that cannot avoid one, and once it does an
     /// atom in it costs a probe only where its gram occurs, so the bias stays small.
-    stride_penalty: [3]f64 = .{ 0.0005, 0.0001, 0 },
+    stride_penalty: [strides.len]f64 = .{ 0.0005, 0.0003, 0.0002, 0.0001, 0 },
     q3_penalty: f64 = 0.002,
     q2_penalty: f64 = 0.005,
+    /// A position the stride-one gate passes, paid at the benign rate of a stride-one window's
+    /// first two bytes. A pass costs about 9 ns in the batched kernel (a hash and up to three
+    /// block tests); the bigram model, built mostly from non-PE files, rates the byte pairs of
+    /// PE code rarer than PE files show, and 30 is the value of 4, 10 and 30 that gave the
+    /// fastest stage one on B2, which the model never saw (E2).
+    gate_ns: f64 = 30,
     /// Prefix selection (E3): the first 4-byte window of the first literal, stride 1, and no
     /// deferral.
     prefix: bool = false,
     /// Search every subsig (the non-deferred path the deferred one is checked against).
     no_defer: bool = false,
+
+    fn allows(c: Costs, s: u8) bool {
+        return s == 1 or std.mem.indexOfScalar(u8, c.sampled, s) != null;
+    }
 };
 
 /// Cost of a program with no atom at all (the reference scanner finds it): avoided whenever a
@@ -91,12 +77,16 @@ pub const Costs = struct {
 pub const no_atom_cost: f64 = 1000;
 pub const tier_d_cost = no_atom_cost;
 
+/// The strides of 4-byte windows, as `Costs.stride_penalty` orders them.
+pub const strides = [_]u8{ 1, 2, 3, 4, 8 };
+
 pub const Choice = struct {
-    tier: Tier = .d,
+    /// Sampling stride of the atom's filter: 8, 4, 3, 2 or 1 (always 1 for 3- and 2-byte atoms).
+    stride: u8 = 0,
     anchor: prog_build.Anchor = .{},
     /// Offset of the atom's first byte inside the anchor literal.
     atom_off: u16 = 0,
-    /// Gram length: 4 for tiers A to C, 3 for a tier-D atom, 0 for none.
+    /// Gram length: 4, or 3 or 2 for a tier-D atom, 0 for none.
     q: u8 = 0,
     /// Estimated stage-two and verify nanoseconds per byte, plus the filter penalty (or
     /// `no_atom_cost`).
@@ -174,6 +164,20 @@ pub fn gram3Prob(model: gm.Model, bytes: *const [3]u8, nocase: bool) f64 {
     return total;
 }
 
+/// Benign probability of a window's first two bytes: how often the stride-one gate opens
+/// for it.
+pub fn gram2Prob(model: gm.Model, bytes: *const [2]u8, nocase: bool) f64 {
+    if (!nocase) return model.prob2(bytes);
+    var total: f64 = 0;
+    var it = Variants.init(&(bytes.* ++ [2]u8{ 0, 0 }));
+    while (it.next()) |g| {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, g, .little);
+        total += model.prob2(b[0..2]);
+    }
+    return total;
+}
+
 /// The case variants of a 4-byte (or 3-byte) window, ASCII letters only, as little-endian
 /// grams (a 3-byte window's fourth byte is 0).
 pub const Variants = struct {
@@ -230,17 +234,18 @@ pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Ch
         var probs: [512]f64 = undefined;
         const grams = @min(bytes.len - q + 1, probs.len);
         for (0..grams) |k| probs[k] = gramProb(model, bytes[k..][0..4], nocase);
-        for ([_]u8{ 1, 4, 8 }, 0..) |s, si| {
-            if (grams < s) continue;
+        for (strides, 0..) |s, si| {
+            if (grams < s or !costs.allows(s)) continue;
             var sum: f64 = 0;
             for (probs[0..s]) |x| sum += x;
             var off: usize = 0;
             while (true) : (off += 1) {
                 // Every sampled gram of the window costs a probe when it occurs; the atom's
                 // first gram (its table key) costs a verify.
-                const cost = costs.probe_ns * sum + costs.verify_ns * probs[off] + costs.stride_penalty[si];
+                var cost = costs.probe_ns * sum + costs.verify_ns * probs[off] + costs.stride_penalty[si];
+                if (s == 1) cost += costs.gate_ns * gram2Prob(model, bytes[off..][0..2], nocase);
                 if (cost < best.cost) best = .{
-                    .tier = Tier.ofStride(s),
+                    .stride = s,
                     .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
                     .atom_off = @intCast(off),
                     .q = 4,
@@ -261,9 +266,10 @@ pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Ch
         if (bytes.len < 3) continue;
         const nocase = o.flags & ir.op_nocase != 0;
         for (0..bytes.len - 2) |off| {
-            const cost = costs.q3_penalty + (costs.probe_ns + costs.verify_ns) * gram3Prob(model, bytes[off..][0..3], nocase);
+            const cost = costs.q3_penalty + (costs.probe_ns + costs.verify_ns) * gram3Prob(model, bytes[off..][0..3], nocase) +
+                costs.gate_ns * gram2Prob(model, bytes[off..][0..2], nocase);
             if (cost < best.cost) best = .{
-                .tier = .d,
+                .stride = 1,
                 .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
                 .atom_off = @intCast(off),
                 .q = 3,
@@ -290,9 +296,9 @@ pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Ch
                     prob += model.prob2(b[0..2]);
                 }
             } else prob = model.prob2(bytes[off..][0..2]);
-            const cost = costs.q2_penalty + (costs.probe_ns + costs.verify_ns) * prob;
+            const cost = costs.q2_penalty + (costs.probe_ns + costs.verify_ns + costs.gate_ns) * prob;
             if (cost < best.cost) best = .{
-                .tier = .d,
+                .stride = 1,
                 .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
                 .atom_off = @intCast(off),
                 .q = 2,
@@ -314,7 +320,7 @@ fn choosePrefix(p: ir.Pattern, part0_only: bool) Choice {
             const o = p.ops[lit.op];
             c.longest = @max(c.longest, o.len);
             if (o.len < q_len) continue;
-            return .{ .tier = if (q_len == 4) .c else .d, .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta }, .atom_off = 0, .q = q_len, .cost = 0, .longest = c.longest };
+            return .{ .stride = 1, .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta }, .atom_off = 0, .q = q_len, .cost = 0, .longest = c.longest };
         }
     }
     return c;
@@ -332,7 +338,7 @@ pub const Planned = struct {
     pub fn atom(p: Planned, kind: ir.OffsetKind) prog_build.Atom {
         const c = p.choice;
         if (kind != .any or p.deferred or c.q == 0) return .{ .anchor = c.anchor };
-        return .{ .anchor = c.anchor, .spec = .{ .off = c.atom_off, .q = c.q, .stride = if (c.q < 4) 1 else c.tier.stride() } };
+        return .{ .anchor = c.anchor, .spec = .{ .off = c.atom_off, .q = c.q, .stride = c.stride } };
     }
 };
 
@@ -479,28 +485,48 @@ pub const Logical = struct {
 
 /// Tier counts for the coverage report and E3.
 pub const Histogram = struct {
-    /// Searched programs by class: A, B, C, D with a 3-byte atom, D with a 2-byte one, D with
-    /// none.
-    searched: [6]u64 = @splat(0),
+    /// Searched programs by class: 4-byte atoms at stride 8, 4, 3, 2 and 1, D with a 3-byte
+    /// atom, D with a 2-byte one, D with none.
+    searched: [classes]u64 = @splat(0),
     /// Deferred programs by the class they would have had.
-    deferred: [6]u64 = @splat(0),
-    /// Programs pinned to an offset (the anchored index), by the tier of their longest run.
-    anchored: [6]u64 = @splat(0),
+    deferred: [classes]u64 = @splat(0),
+    /// Programs pinned to an offset (the anchored index), by the longest stride their longest
+    /// run allows.
+    anchored: [classes]u64 = @splat(0),
+    /// Tier D proper, the programs whose longest fixed literal is under 4 bytes (E3's
+    /// definition), by what became of them: searched through a 3- or 2-byte atom, searched
+    /// through a 4-byte one (a window across masks, alternations or wildcards), deferred,
+    /// anchored, or searched with no atom.
+    tier_d: [5]u64 = @splat(0),
+
+    const classes = 8;
 
     fn class(c: Choice) usize {
-        if (c.tier != .d) return @backingInt(c.tier);
+        if (c.q == 4) return switch (c.stride) {
+            8 => 0,
+            4 => 1,
+            3 => 2,
+            2 => 3,
+            else => 4,
+        };
         return switch (c.q) {
-            3 => 3,
-            2 => 4,
-            else => 5,
+            3 => 5,
+            2 => 6,
+            else => 7,
         };
     }
 
     pub fn add(h: *Histogram, in: prog_build.Input, p: Planned) void {
+        if (p.choice.longest < 4) h.tier_d[
+            if (in.offset.kind != .any) 3 else if (p.deferred) 2 else switch (p.choice.q) {
+                4 => 1,
+                3, 2 => 0,
+                else => 4,
+            }
+        ] += 1;
         if (in.offset.kind != .any) {
             const n = p.choice.longest;
-            const t = Tier.ofRun(n);
-            h.anchored[if (t != .d) @backingInt(t) else if (n == 3) 3 else if (n == 2) 4 else 5] += 1;
+            h.anchored[if (n >= 11) 0 else if (n >= 7) 1 else if (n >= 6) 2 else if (n == 5) 3 else if (n == 4) 4 else if (n == 3) 5 else if (n == 2) 6 else 7] += 1;
         } else if (p.deferred) {
             h.deferred[class(p.choice)] += 1;
         } else h.searched[class(p.choice)] += 1;
@@ -508,9 +534,18 @@ pub const Histogram = struct {
 
     pub fn render(h: Histogram, w: *std.Io.Writer) !void {
         try w.writeAll("atom tiers (programs)\n  tier          searched  deferred  anchored\n");
-        for ([_][]const u8{ "A  s=8", "B  s=4", "C  s=1", "D  3-gram", "D  2-gram", "D  none" }, 0..) |name, i| {
+        for ([_][]const u8{ "s=8", "s=4", "s=3", "s=2", "C  s=1", "D  3-gram", "D  2-gram", "D  none" }, 0..) |name, i| {
             try w.print("  {s:<12} {d:>9} {d:>9} {d:>9}\n", .{ name, h.searched[i], h.deferred[i], h.anchored[i] });
         }
+        const d = h.tier_d;
+        var total: u64 = 0;
+        for (d) |x| total += x;
+        const pct = struct {
+            fn f(x: u64, t: u64) f64 {
+                return 100 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(@max(t, 1)));
+            }
+        }.f;
+        try w.print("tier D (longest fixed literal under 4 bytes): {d} programs; searched through 3- or 2-byte atoms {d} ({d:.1}%), through 4-byte atoms {d}, deferred {d}, anchored {d} (deferred or anchored {d:.1}%), no atom {d}\n", .{ total, d[0], pct(d[0], total), d[1], d[2], d[3], pct(d[2] + d[3], total), d[4] });
     }
 };
 
@@ -522,24 +557,33 @@ fn parse(a: std.mem.Allocator, hex: []const u8) !ir.Pattern {
     return hexsig.parse(a, hex, &diag);
 }
 
-test "tiers follow the run length and windows avoid common grams" {
+test "strides follow the run length and windows avoid common grams" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const m = gm.Model.default();
-    // Zero padding then a rare 11-byte tail: stride 8, with the window on the tail.
+    // Zero padding then a rare tail: the sampled stride, with the window on the tail.
     const long = choose(m, .{}, try parse(a, "000000000000000013a7c95be2f1408d77e3b1"), false);
-    try testing.expectEqual(Tier.a, long.tier);
-    try testing.expectEqual(@as(u16, 8), long.atom_off);
-    // With only 8 rare bytes, a stride-4 window on them beats a stride-8 one over zeros.
-    try testing.expectEqual(Tier.b, choose(m, .{}, try parse(a, "000000000000000013a7c95be2f1408d"), false).tier);
+    try testing.expectEqual(@as(u8, 3), long.stride);
+    try testing.expect(long.atom_off >= 8);
+    // The previous design's strides, when asked for: stride 8 on the 11-byte tail, and with
+    // only 8 rare bytes a stride-4 window on them beats a stride-8 one over zeros.
+    const tiers: Costs = .{ .sampled = &.{ 8, 4 } };
+    const long8 = choose(m, tiers, try parse(a, "000000000000000013a7c95be2f1408d77e3b1"), false);
+    try testing.expectEqual(@as(u8, 8), long8.stride);
+    try testing.expectEqual(@as(u16, 8), long8.atom_off);
+    try testing.expectEqual(@as(u8, 4), choose(m, tiers, try parse(a, "000000000000000013a7c95be2f1408d"), false).stride);
     // A rare 3-byte opcode beats a 4-byte window of zeros.
     const opcode = choose(m, .{}, try parse(a, "ff25a4{3}0000000000000000"), false);
     try testing.expectEqual(@as(u8, 3), opcode.q);
     try testing.expectEqual(@as(u16, 0), opcode.anchor.op);
-    try testing.expectEqual(Tier.b, choose(m, .{}, try parse(a, "13a7c95be2f140"), false).tier);
-    try testing.expectEqual(Tier.c, choose(m, .{}, try parse(a, "13a7c95b"), false).tier);
-    try testing.expectEqual(Tier.d, choose(m, .{}, try parse(a, "13a7??c9"), false).tier);
+    try testing.expectEqual(@as(u8, 3), choose(m, .{}, try parse(a, "13a7c95be2f140"), false).stride);
+    // Runs of 4 and 5 bytes: stride 1, behind the gate.
+    const c4 = choose(m, .{}, try parse(a, "13a7c95b"), false);
+    try testing.expectEqual(@as(u8, 1), c4.stride);
+    try testing.expectEqual(@as(u8, 4), c4.q);
+    try testing.expectEqual(@as(u8, 1), choose(m, .{}, try parse(a, "13a7c95be2"), false).stride);
+    try testing.expect(choose(m, .{}, try parse(a, "13a7??c9"), false).q < 4);
     const d3 = choose(m, .{}, try parse(a, "13a7??c95be2"), false);
     try testing.expectEqual(@as(u8, 3), d3.q);
     try testing.expectEqual(@as(u16, 2), d3.anchor.op);
@@ -547,11 +591,12 @@ test "tiers follow the run length and windows avoid common grams" {
     try testing.expectEqual(@as(u8, 0), choose(m, .{}, try parse(a, "13??c9??2a"), false).q);
     // A short rare literal can beat a long common one.
     const mixed = choose(m, .{}, try parse(a, "0000000000000000000000*8d3e1fa7"), false);
-    try testing.expectEqual(Tier.c, mixed.tier);
+    try testing.expectEqual(@as(u8, 4), mixed.q);
+    try testing.expectEqual(@as(u8, 1), mixed.stride);
     try testing.expectEqual(@as(u8, 1), mixed.anchor.part);
     // After a variable alternation the distance is unknown: no window there.
     const alt = choose(m, .{}, try parse(a, "4d5a(aa|bbbb)13a7c95be2f1408d77"), false);
-    try testing.expectEqual(Tier.d, alt.tier);
+    try testing.expect(alt.q < 4);
 }
 
 test "case variants" {

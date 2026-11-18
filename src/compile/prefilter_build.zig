@@ -16,7 +16,7 @@ pub const Options = struct {
     seed: u32 = 0x7a61_7631,
 };
 
-const filter_specs = [_]struct { stride: u8, q: u8 }{ .{ .stride = 8, .q = 4 }, .{ .stride = 4, .q = 4 }, .{ .stride = 1, .q = 4 }, .{ .stride = 1, .q = 3 }, .{ .stride = 1, .q = 2 } };
+const filter_specs = [_]struct { stride: u8, q: u8 }{ .{ .stride = 8, .q = 4 }, .{ .stride = 4, .q = 4 }, .{ .stride = 3, .q = 4 }, .{ .stride = 2, .q = 4 }, .{ .stride = 1, .q = 4 }, .{ .stride = 1, .q = 3 }, .{ .stride = 1, .q = 2 } };
 /// Filters with only a few grams still get this many bits (2 KiB), so their false-positive
 /// rate stays near zero instead of a block holding every key.
 const min_filter_bits = 16384;
@@ -198,7 +198,7 @@ pub fn build(gpa: std.mem.Allocator, programs: prog.Programs, specs: []const pro
     };
     const refs_at = @sizeOf(pf.Header);
     const short_at = refs_at + count * @sizeOf(pf.FilterRef);
-    const stride_one = builders[2] != null or builders[3] != null or builders[4] != null;
+    const stride_one = builders[4] != null or builders[5] != null or builders[6] != null;
     const gate_at = std.mem.alignForward(usize, short_at + short.items.len * 4, 64);
     var len = if (stride_one) gate_at + pf.gate_len else gate_at;
     len = std.mem.alignForward(usize, len, 64);

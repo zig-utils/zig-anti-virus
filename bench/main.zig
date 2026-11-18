@@ -502,13 +502,14 @@ const Tiered = struct {
     count: usize,
 };
 
-/// Partitions of random atoms of one length each (11 bytes: tier A, 7: B, 5: C, 3: a 3-gram
-/// tier D), plus one of tiers A and B together, the PE partition's common case.
+/// Partitions of random atoms of one length each (11 and 7 bytes: the sampled stride-3 filter,
+/// 5: stride 1 behind the gate, 3: a 3-gram tier D), plus the previous design's strides 8 and
+/// 4 over 11- and 7-byte atoms for comparison.
 var tier_parts: [5]zav.match.prefilter.Partition = undefined;
 var tier_data: []u8 = &.{};
 var tier_ring: [zav.match.prefilter.ring_len]zav.match.prefilter.Candidate = undefined;
 
-fn buildTier(gpa: std.mem.Allocator, random: std.Random, lens: []const usize, count: usize) !zav.match.prefilter.Partition {
+fn buildTier(gpa: std.mem.Allocator, random: std.Random, lens: []const usize, count: usize, costs: zav.compile.atoms.Costs) !zav.match.prefilter.Partition {
     const zc = zav.compile;
     // Lives for the whole run: the partition points into it.
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -523,7 +524,7 @@ fn buildTier(gpa: std.mem.Allocator, random: std.Random, lens: []const usize, co
         var diag: zc.hexsig.Diag = .{};
         try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i) });
     }
-    const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), .{}, inputs.items, &.{});
+    const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), costs, inputs.items, &.{});
     var w = zc.prog_build.Writer.init(a, null);
     for (inputs.items, planned) |*in, pl| {
         in.atom = pl.atom(in.offset.kind);
@@ -555,15 +556,15 @@ fn Stage1Bench(comptime k: usize) type {
 fn prefilterBenchmarks(io: std.Io, gpa: std.mem.Allocator, suite: *bench.BenchmarkSuite) !void {
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const r = prng.random();
-    const names = [_][]const u8{ "tier A (stride 8)", "tier B (stride 4)", "tier C (stride 1, gated)", "tier D (3-gram, gated)", "tiers A+B" };
+    const names = [_][]const u8{ "stride 3, 11-byte atoms", "stride 3, 7-byte atoms", "stride 1 gated, 5-byte", "tier D (3-gram, gated)", "strides 8+4 (before)" };
     const lens = [_][]const usize{ &.{11}, &.{7}, &.{5}, &.{3}, &.{ 11, 11, 11, 7 } };
     // 100k atoms per partition, about the PE partition's size.
-    for (&tier_parts, lens) |*part, l| part.* = try buildTier(gpa, r, l, if (l[0] == 3) 2000 else 100_000);
+    for (&tier_parts, lens, 0..) |*part, l, k| part.* = try buildTier(gpa, r, l, if (l[0] == 3) 2000 else 100_000, if (k == 4) .{ .sampled = &.{ 8, 4 } } else .{});
     tier_data = try gpa.alloc(u8, hash_input_len);
     r.bytes(tier_data);
     std.debug.print("stage 1: MB/s (10^6 bytes) per core over 1 MiB of random bytes, best of 5\n", .{});
     inline for (0..5) |k| {
         std.debug.print("stage 1: {s:<26} {d:>8.0}\n", .{ names[k], mbps(io, Stage1Bench(k).run) });
-        try suite.add("stage 1 " ++ ([_][]const u8{ "A", "B", "C", "D", "A+B" })[k] ++ " 1 MiB", Stage1Bench(k).run);
+        try suite.add("stage 1 " ++ ([_][]const u8{ "s3 11B", "s3 7B", "s1 gated", "D", "s8+s4" })[k] ++ " 1 MiB", Stage1Bench(k).run);
     }
 }

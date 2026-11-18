@@ -640,9 +640,10 @@ test "compile .ndb signatures and detect them end to end" {
     budget.reset();
     try std.testing.expect(try scanBuffer(&index, pe, .{ .info = .{ .size = pe.len }, .target = 3 }, &budget, &tracker, null) == .infected);
 
-    // A budget that runs out is a limit, not a clean verdict.
+    // A budget that runs out is a limit, not a clean verdict. Both literals occur (so a
+    // candidate comes whichever one holds the atom), never within 8 bytes of each other.
     var tiny: vm.Budget = .{ .per_verify = 1, .per_file = 1 };
-    const many = "EXAMPLE EXAMPLE EXAMPLE";
+    const many = "PAYLOAD EXAMPLE..........PAYLOAD EXAMPLE..........PAYLOAD";
     try std.testing.expectEqual(Verdict{ .limited = .verify_steps }, try scanBuffer(&index, many, .{ .info = .{ .size = many.len } }, &tiny, &tracker, null));
     try std.testing.expect(tracker.raised.contains(.verify_steps));
 }
