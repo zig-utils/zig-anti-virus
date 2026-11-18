@@ -26,6 +26,8 @@ const zip = @import("zip.zig");
 const pe = @import("pe.zig");
 const elf = @import("elf.zig");
 const macho = @import("macho.zig");
+const html_norm = @import("html_norm.zig");
+const text_norm = @import("text_norm.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -59,12 +61,19 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .elf => try elf.walk(w, src),
         .macho => try macho.walk(w, src),
         .macho_fat => try macho.walkFat(w, src),
-        .binary, .text => if (zip.hasTrailer(w, src)) {
-            // Data with a zip appended (a self-extractor stub, a polyglot): walk the zip too.
-            w.notice(.mismatch, "zip: archive appended to other data");
-            try zip.walk(w, src);
+        .html => try normalizeHtml(w, src),
+        .binary, .text => {
+            if (obj.format == .text) {
+                const buf = w.alloc(u8, container.block_len) orelse return;
+                var sr: container.SourceReader = .init(w.io, src, buf);
+                try normalizeText(w, &sr.interface);
+            }
+            if (zip.hasTrailer(w, src)) {
+                // Data with a zip appended (a self-extractor stub, a polyglot): walk the zip too.
+                w.notice(.mismatch, "zip: archive appended to other data");
+                try zip.walk(w, src);
+            }
         },
-        else => {},
     }
 }
 
@@ -89,7 +98,9 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
             var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
             try cpio.walk(w, &cursor);
         },
-        .zip, .pe, .elf, .macho, .macho_fat => {
+        // Normalised text is produced in the same pass that feeds the raw bytes.
+        .text => try normalizeText(w, &tee.interface),
+        .zip, .pe, .elf, .macho, .macho_fat, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             try randomAccess(w, obj.format, mat.source);
@@ -107,9 +118,100 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
         .elf => try elf.walk(w, src),
         .macho => try macho.walk(w, src),
         .macho_fat => try macho.walkFat(w, src),
+        .html => try normalizeHtml(w, src),
         else => unreachable,
     }
 }
+
+/// The target type 7 stream of a text object, as a derived child named "text". Input past
+/// MaxScriptNormalize is reported and left unnormalised (its raw bytes are still scanned).
+fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
+    var d: Object = undefined;
+    try w.beginDerived(&d, "text", .normalized_text);
+    defer w.endDerived(&d);
+    const out = w.alloc(u8, container.block_len) orelse return;
+    var n: text_norm.Normalizer = .{};
+    var done: u64 = 0;
+    const max = w.tracker.limits.max_script_normalize;
+    while (true) {
+        const chunk = r.peekGreedy(1) catch |e| switch (e) {
+            error.EndOfStream => return,
+            error.ReadFailed => return if (w.halt != null) error.Halted else {},
+        };
+        const take = @min(chunk.len, out.len, max -| done);
+        if (take == 0) return w.limit(.script_normalize);
+        try w.feed(&d, out[0..n.feed(chunk[0..take], out)]);
+        r.toss(take);
+        done += take;
+    }
+}
+
+/// The target type 3 stream of an HTML object (derived child "html"), then each script body as
+/// a derived child "script/<n>". Two passes over a positional source, bounded state, no
+/// whole-document buffer; input past MaxHTMLNormalize is reported and left unnormalised.
+fn normalizeHtml(w: *Walker, src: Source) Error!void {
+    const buf = w.alloc(u8, container.block_len) orelse return;
+    inline for (.{ html_norm.Mode.normalized, html_norm.Mode.scripts }) |mode| {
+        var sink: HtmlSink = .{ .w = w, .mode = mode };
+        defer sink.close();
+        if (mode == .normalized) try w.beginDerived(&sink.obj, "html", .normalized_html);
+        sink.open = mode == .normalized;
+        var n = html_norm.Normalizer.init(mode, .{ .ctx = &sink, .write = HtmlSink.write, .boundary = HtmlSink.boundary });
+        var off: u64 = 0;
+        const total = src.len().?;
+        const max = w.tracker.limits.max_html_normalize;
+        var limited = false;
+        while (off < total) {
+            if (off >= max) {
+                limited = true;
+                break;
+            }
+            const want: usize = @intCast(@min(buf.len, max - off));
+            const got = src.readAt(w.io, off, buf[0..want]) catch break;
+            if (got == 0) break;
+            n.feed(buf[0..got]) catch return sink.failure();
+            off += got;
+        }
+        n.finish() catch return sink.failure();
+        if (limited and mode == .normalized) w.limit(.html_normalize);
+    }
+}
+
+const HtmlSink = struct {
+    w: *Walker,
+    mode: html_norm.Mode,
+    obj: Object = undefined,
+    open: bool = false,
+    scripts: u32 = 0,
+    name_buf: [24]u8 = undefined,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        if (!s.open) return;
+        s.w.feed(&s.obj, bytes) catch return error.Stop;
+    }
+
+    fn boundary(ctx: *anyopaque, begin: bool) error{Stop}!void {
+        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        if (begin) {
+            const name = std.fmt.bufPrint(&s.name_buf, "script/{d}", .{s.scripts}) catch "script";
+            s.scripts += 1;
+            s.w.beginDerived(&s.obj, name, .script) catch return error.Stop;
+            s.open = true;
+        } else s.close();
+    }
+
+    fn close(s: *HtmlSink) void {
+        if (!s.open) return;
+        s.w.endDerived(&s.obj);
+        s.open = false;
+    }
+
+    fn failure(s: *HtmlSink) Error {
+        _ = s;
+        return error.Halted;
+    }
+};
 
 /// Name for a compression wrapper's output: the parent's name without its extension.
 fn innerName(name: []const u8, format: Format) []const u8 {
@@ -366,4 +468,50 @@ test "executables: children from overlays and resources, positional and streamed
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "HTML yields its normalised stream and scripts; text yields its normalised stream" {
+    const page = "<HTML><Body>Hello   <B>World</B><!-- x --><script>Alert(1)</script></body></HTML>\n";
+    var rig: TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    try rig.scanBoth(page, "p.html");
+    const norm = "<html><body>hello <b>world</b><script>alert(1)</script></body></html> ";
+    var hasher = std.hash.Crc32.init();
+    hasher.update(norm);
+    var seen: usize = 0;
+    for (rig.rec.objects.items) |e| {
+        if (std.mem.eql(u8, e.path, "p.html/html")) {
+            seen += 1;
+            try std.testing.expectEqual(container.Kind.normalized_html, e.kind);
+            try std.testing.expectEqual(@as(u64, norm.len), e.bytes);
+            try std.testing.expectEqual(hasher.final(), e.crc);
+        }
+        if (std.mem.eql(u8, e.path, "p.html/script/0")) {
+            seen += 1;
+            try std.testing.expectEqual(@as(u64, "Alert(1)".len), e.bytes);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen);
+
+    var rig2: TestRig = undefined;
+    try rig2.init(.{});
+    defer rig2.deinit();
+    try rig2.scanBoth("Plain  TEXT\twith\r\nLines\n", "t.txt");
+    var texts: usize = 0;
+    for (rig2.rec.objects.items) |e| if (std.mem.eql(u8, e.path, "t.txt/text")) {
+        texts += 1;
+        try std.testing.expectEqual(@as(u64, "plain text with lines ".len), e.bytes);
+    };
+    try std.testing.expectEqual(@as(usize, 2), texts);
+}
+
+test "normaliser limits are reported" {
+    var rig: TestRig = undefined;
+    try rig.init(.{ .max_html_normalize = 10, .max_script_normalize = 5 });
+    defer rig.deinit();
+    try rig.walker.scan(.{ .memory = "<html><body>a long enough page</body></html>" }, "p.html");
+    try std.testing.expect(rig.rec.hasLimit(.html_normalize));
+    try rig.walker.scan(.{ .memory = "some longer text" }, "t.txt");
+    try std.testing.expect(rig.rec.hasLimit(.script_normalize));
 }

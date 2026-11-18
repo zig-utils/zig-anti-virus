@@ -170,6 +170,23 @@ pub const Walker = struct {
         obj.entered = true;
     }
 
+    /// Open a derived stream of the object being parsed (normaliser output, an extracted
+    /// script): a child that is fed directly with `feed` instead of being parsed. Close it with
+    /// `endDerived`.
+    pub fn beginDerived(w: *Walker, d: *Object, name: []const u8, kind: Kind) Error!void {
+        w.path.push(name);
+        d.* = .{ .path = w.path.get(), .name = name, .depth = w.tracker.depth +| 1, .kind = kind, .format = .text, .size = null };
+        w.begin(d) catch |e| {
+            w.path.pop();
+            return e;
+        };
+    }
+
+    pub fn endDerived(w: *Walker, d: *Object) void {
+        w.end(d);
+        w.path.pop();
+    }
+
     fn end(w: *Walker, obj: *Object) void {
         if (obj.entered) w.visitor.vtable.leave(w.visitor.ptr, obj);
     }

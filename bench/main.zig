@@ -184,6 +184,7 @@ pub fn main(init: std.process.Init) !void {
     try buildLogical(init.gpa);
     try suite.add("logical state, 16 touched, 1k-signature table", logicalFile(0));
     try suite.add("logical state, 16 touched, 100k-signature table", logicalFile(1));
+    try normaliserBenchmarks(init.io, init.gpa, &suite);
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);
@@ -302,4 +303,47 @@ fn privateDirtyKiB(io: std.Io) ?u64 {
         return std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch null;
     }
     return null;
+}
+
+// Normalisers (P5.07, P5.08): MB/s over 1 MiB of generated markup and text.
+
+var norm_html: []u8 = undefined;
+var norm_text: []u8 = undefined;
+var norm_out: [64 * 1024]u8 = undefined;
+
+fn normDiscard(_: *anyopaque, bytes: []const u8) error{Stop}!void {
+    sink +%= bytes.len;
+}
+
+fn htmlNormalize() void {
+    var ctx: u8 = 0;
+    var n = zav.fmt.html_norm.Normalizer.init(.normalized, .{ .ctx = &ctx, .write = normDiscard });
+    n.feed(norm_html) catch unreachable;
+    n.finish() catch unreachable;
+}
+
+fn textNormalize() void {
+    var n: zav.fmt.text_norm.Normalizer = .{};
+    var off: usize = 0;
+    while (off < norm_text.len) : (off += norm_out.len) {
+        const chunk = norm_text[off..@min(norm_text.len, off + norm_out.len)];
+        sink +%= n.feed(chunk, &norm_out);
+    }
+}
+
+fn normaliserBenchmarks(io: std.Io, gpa: std.mem.Allocator, suite: *bench.BenchmarkSuite) !void {
+    const len = 1024 * 1024;
+    norm_html = try gpa.alloc(u8, len);
+    norm_text = try gpa.alloc(u8, len);
+    const piece = "<DIV Class='Row'>  <A HREF=\"http://example.com/Path?a=1&amp;b=2\">Link &#x41;</A>\n<!-- note -->" ++
+        "<script>var X = 1;</script> Some   Body TEXT with words\r\n";
+    const words = "The Quick  Brown\tFox JUMPS over the lazy dog.\r\n";
+    for (0..len) |i| {
+        norm_html[i] = piece[i % piece.len];
+        norm_text[i] = words[i % words.len];
+    }
+    std.debug.print("html normaliser: {d:.0} MB/s\n", .{@as(f64, len) / nsPerCall(io, htmlNormalize) * 1000.0});
+    std.debug.print("text normaliser: {d:.0} MB/s\n", .{@as(f64, len) / nsPerCall(io, textNormalize) * 1000.0});
+    try suite.add("html normaliser, 1 MiB", htmlNormalize);
+    try suite.add("text normaliser, 1 MiB", textNormalize);
 }
