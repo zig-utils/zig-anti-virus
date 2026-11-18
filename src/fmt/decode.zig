@@ -13,7 +13,7 @@ const bzip2 = @import("bzip2.zig");
 const xz = @import("xz.zig");
 const lzma = @import("lzma.zig");
 const zstd = @import("zstd.zig");
-const flate = std.compress.flate;
+const inflate = @import("inflate.zig");
 
 pub const Codec = enum {
     gzip,
@@ -54,8 +54,8 @@ pub fn childFrom(
         },
         .deflate_raw => {
             const window = w.alloc(u8, gzip.window_len) orelse return;
-            var dec = flate.Decompress.init(in, .raw, window);
-            var meter: container.Meter = .init(w, &dec.reader, pulled, meter_buf);
+            var dec = inflate.Inflate.init(in, .raw, window);
+            var meter: container.Meter = .init(w, &dec.interface, pulled, meter_buf);
             try emit(w, name, &meter, size_hint, kind);
             if (dec.err) |e| if (meter.tripped == null) w.notice(.malformed, @errorName(e));
         },

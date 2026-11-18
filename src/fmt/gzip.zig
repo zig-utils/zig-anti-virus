@@ -1,23 +1,20 @@
-//! gzip (RFC 1952) over std.compress.flate, including multi-member streams: when one member
-//! ends and the next bytes are another gzip header, decoding continues with a fresh inflater over
-//! the same 64 KiB window. Anything else after a member is trailing data, left for the parent.
-//! std's inflater does not verify the CRC-32 trailer; neither do we (a scanner reads damaged
-//! data anyway).
+//! gzip (RFC 1952) over our inflater (inflate.zig), including multi-member streams: when one
+//! member ends and the next bytes are another gzip header, decoding continues with the inflater
+//! reset over the same memory. Anything else after a member is trailing data, left for the
+//! parent. The CRC-32 trailer is skipped, not verified (a scanner reads damaged data anyway).
 const std = @import("std");
 const Io = std.Io;
-const flate = std.compress.flate;
+const inflate = @import("inflate.zig");
 const container = @import("../engine/container.zig");
 
-/// The inflater's window buffer: at least flate.max_window_len. Twice that gives 64 KiB of new
-/// output per refill instead of 32 KiB.
-pub const window_len = 2 * flate.max_window_len;
+/// Caller memory a decoder needs: the inflater's output buffer and tables.
+pub const window_len = inflate.work_len;
 
 pub const Decoder = struct {
     in: *Io.Reader,
-    inflate: flate.Decompress,
-    window: []u8,
+    inflate: inflate.Inflate,
     members: u32 = 0,
-    err: ?flate.Decompress.Error = null,
+    err: ?inflate.Error = null,
     interface: Io.Reader,
 
     /// `window` must hold at least `window_len` bytes. Fill the result in place (`d.* = init()`)
@@ -26,26 +23,21 @@ pub const Decoder = struct {
         return .{
             .in = in,
             .inflate = .init(in, .gzip, window),
-            .window = window,
             .interface = .{ .vtable = container.fillVTable(Decoder), .buffer = &.{}, .seek = 0, .end = 0 },
         };
     }
 
     pub fn fill(d: *Decoder, dest: []u8) Io.Reader.Error!usize {
         while (true) {
-            return container.readSome(&d.inflate.reader, dest) catch |e| switch (e) {
-                error.EndOfStream => {
-                    d.members += 1;
-                    const next = d.in.peek(3) catch return 0;
-                    if (!(next[0] == 0x1f and next[1] == 0x8b and next[2] == 8)) return 0;
-                    d.inflate = .init(d.in, .gzip, d.window);
-                    continue;
-                },
-                error.ReadFailed => {
-                    d.err = d.inflate.err;
-                    return error.ReadFailed;
-                },
+            const n = d.inflate.fill(dest) catch {
+                d.err = d.inflate.err;
+                return error.ReadFailed;
             };
+            if (n != 0) return n;
+            d.members += 1;
+            const next = d.in.peek(3) catch return 0;
+            if (!(next[0] == 0x1f and next[1] == 0x8b and next[2] == 8)) return 0;
+            d.inflate.reset();
         }
     }
 };

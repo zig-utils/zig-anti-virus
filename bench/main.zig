@@ -132,8 +132,9 @@ pub fn main(init: std.process.Init) !void {
     if (std.fs.path.dirname(out_path)) |dir| try std.Io.Dir.cwd().createDirPath(init.io, dir);
 
     io_global = init.io;
-    // `zig build bench -- <out.json> e7`: only the decoder experiment (docs/experiments/E7).
-    if (args.len > 2 and std.mem.eql(u8, args[2], "e7")) return decoderBenchmarks(init.io, init.gpa);
+    // `zig build bench -- <out.json> e7 [filter]`: only the decoder experiment
+    // (docs/experiments/E7), optionally only the corpus files whose name contains `filter`.
+    if (args.len > 2 and std.mem.eql(u8, args[2], "e7")) return decoderBenchmarks(init.io, init.gpa, if (args.len > 3) args[3] else "");
     try std.Io.Dir.cwd().createDirPath(init.io, "zig-out/bench-data");
     dir_global = try std.Io.Dir.cwd().openDir(init.io, "zig-out/bench-data", .{});
     defer dir_global.close(init.io);
@@ -187,7 +188,7 @@ pub fn main(init: std.process.Init) !void {
     try suite.add("logical state, 16 touched, 1k-signature table", logicalFile(0));
     try suite.add("logical state, 16 touched, 100k-signature table", logicalFile(1));
     try normaliserBenchmarks(init.io, init.gpa, &suite);
-    try decoderBenchmarks(init.io, init.gpa);
+    try decoderBenchmarks(init.io, init.gpa, "");
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);
@@ -415,7 +416,7 @@ fn e7Measure(io: std.Io, f: *const fn () void) f64 {
     return @as(f64, @floatFromInt(e7_plain_len)) / best * 1000.0;
 }
 
-fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator) !void {
+fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator, filter: []const u8) !void {
     var dir = std.Io.Dir.cwd().openDir(io, "zig-out/e7", .{}) catch {
         std.debug.print("e7: no corpus in zig-out/e7 (run `bun bench/e7/run.ts`), skipped\n", .{});
         return;
@@ -438,8 +439,8 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator) !void {
     defer results.deinit(gpa);
     try results.appendSlice(gpa, "[\n");
     const cases = [_]struct { file: []const u8, decoder: []const u8, f: *const fn () void }{
-        .{ .file = "text.gz", .decoder = "std.compress.flate", .f = e7Gzip },
-        .{ .file = "binary.gz", .decoder = "std.compress.flate", .f = e7Gzip },
+        .{ .file = "text.gz", .decoder = "zav inflate", .f = e7Gzip },
+        .{ .file = "binary.gz", .decoder = "zav inflate", .f = e7Gzip },
         .{ .file = "text.zst", .decoder = "std.compress.zstd", .f = e7Zstd },
         .{ .file = "binary.zst", .decoder = "std.compress.zstd", .f = e7Zstd },
         .{ .file = "text.zst19", .decoder = "std.compress.zstd", .f = e7Zstd },
@@ -449,7 +450,9 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator) !void {
         .{ .file = "text.xz", .decoder = "zav xz/lzma2", .f = e7Xz },
         .{ .file = "binary.xz", .decoder = "zav xz/lzma2", .f = e7Xz },
     };
-    for (cases, 0..) |c, i| {
+    var written: usize = 0;
+    for (cases) |c| {
+        if (std.mem.indexOf(u8, c.file, filter) == null) continue;
         const data = dir.readFileAlloc(io, c.file, gpa, .limited(1 << 30)) catch {
             std.debug.print("e7: {s} missing, skipped\n", .{c.file});
             continue;
@@ -459,10 +462,12 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator) !void {
         e7_plain_len = 16 * 1024 * 1024;
         const rate = e7Measure(io, c.f);
         std.debug.print("e7: {s:<14} {s:<20} {d:>6.0} MB/s\n", .{ c.file, c.decoder, rate });
-        const line = try std.fmt.allocPrint(gpa, "  {{\"file\": \"{s}\", \"decoder\": \"{s}\", \"mbps\": {d:.1}}}{s}\n", .{ c.file, c.decoder, rate, if (i + 1 < cases.len) "," else "" });
+        const line = try std.fmt.allocPrint(gpa, "{s}  {{\"file\": \"{s}\", \"decoder\": \"{s}\", \"mbps\": {d:.1}}}", .{ if (written > 0) ",\n" else "", c.file, c.decoder, rate });
+        written += 1;
         defer gpa.free(line);
         try results.appendSlice(gpa, line);
     }
-    try results.appendSlice(gpa, "]\n");
-    try dir.writeFile(io, .{ .sub_path = "zig-results.json", .data = results.items });
+    try results.appendSlice(gpa, "\n]\n");
+    // A filtered run is partial: keep the full results file.
+    if (filter.len == 0) try dir.writeFile(io, .{ .sub_path = "zig-results.json", .data = results.items });
 }

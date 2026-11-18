@@ -6,6 +6,7 @@ pub const ftm = @import("ftm.zig");
 pub const detect = @import("detect.zig");
 pub const scan = @import("scan.zig");
 pub const decode = @import("decode.zig");
+pub const inflate = @import("inflate.zig");
 pub const gzip = @import("gzip.zig");
 pub const bzip2 = @import("bzip2.zig");
 pub const lzma = @import("lzma.zig");
@@ -33,6 +34,7 @@ test {
     _ = detect;
     _ = scan;
     _ = decode;
+    _ = inflate;
     _ = gzip;
     _ = bzip2;
     _ = lzma;
