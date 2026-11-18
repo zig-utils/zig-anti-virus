@@ -415,11 +415,11 @@ fn fixture(lines: []const []const u8) !Fixture {
 
 test "touch, target descriptions, counts, finalize and an O(touched) reset" {
     var f = try fixture(&.{
-        "A-1-0;Target:0;0&1;aa;bb", // 0
-        "B-2-0;Target:1;0;aa", // 1: PE only
-        "C-3-0;Target:0;0>2;aa", // 2: counts
-        "D-4-0;Target:0,FileSize:10-20;0;aa", // 3
-        "E-5-0;Target:0;(0|1)=2,2;aa;bb", // 4: counts and distinct
+        "A-1-0;Target:0;0&1;aaaa;bbbb", // 0
+        "B-2-0;Target:1;0;aaaa", // 1: PE only
+        "C-3-0;Target:0;0>2;aaaa", // 2: counts
+        "D-4-0;Target:0,FileSize:10-20;0;aaaa", // 3
+        "E-5-0;Target:0;(0|1)=2,2;aaaa;bbbb", // 4: counts and distinct
     });
     defer f.deinit();
     var mem: [1024 * 1024]u8 = undefined;
@@ -465,7 +465,7 @@ test "past the table limit entries spill into scratch and still evaluate" {
     defer a.deinit();
     const n_sigs = table_limit + 10;
     var column: u32 = 0;
-    const r = try ldb_parse.parseLine(a.allocator(), "S-1-0;Target:0;0>0;aa", &column);
+    const r = try ldb_parse.parseLine(a.allocator(), "S-1-0;Target:0;0>0;aaaa", &column);
     const entries = try a.allocator().alloc(ldb_build.Entry, n_sigs);
     for (entries, 0..) |*e, i| e.* = .{ .rule = &r, .sig = @intCast(i), .prog_first = 0, .prog_count = 0 };
     const bytes = try ldb_build.build(a.allocator(), entries);
@@ -488,8 +488,8 @@ test "past the table limit entries spill into scratch and still evaluate" {
 
 test "byte compares evaluate against recorded trigger starts" {
     var f = try fixture(&.{
-        "BC-1-0;Target:0;0&1;aa;0(>>2#ib1#=0x7f)",
-        "BC-2-0;Target:0;0>1&1;aa;0(>>1#d2#>50)",
+        "BC-1-0;Target:0;0&1;aaaa;0(>>2#ib1#=0x7f)",
+        "BC-2-0;Target:0;0>1&1;aaaa;0(>>1#d2#>50)",
     });
     defer f.deinit();
     var mem: [1024 * 1024]u8 = undefined;
@@ -519,12 +519,12 @@ test "pcre subsigs: triggers, offsets, rolling, encompass, anchored and global c
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const lines = [_][]const u8{
-        "Exact-1-0;Target:0;0&1;aa;4:0/abc/", // 0: must start at 4
-        "Rolling-2-0;Target:0;0&1;aa;4:0/abc/r", // 1: anywhere from 4 on
-        "Window-3-0;Target:0;0&1;aa;4,4:0/abc/e", // 2: inside 4..8
-        "Anchored-4-0;Target:0;0&1;aa;0/abc/A", // 3: at 0 only
-        "Global-5-0;Target:0;0&1>1;aa;0/abc/g", // 4: more than one
-        "Trigger-6-0;Target:0;0&1&2;aa;bb;1/abc/", // 5: runs only when bb hit
+        "Exact-1-0;Target:0;0&1;aaaa;4:0/abc/", // 0: must start at 4
+        "Rolling-2-0;Target:0;0&1;aaaa;4:0/abc/r", // 1: anywhere from 4 on
+        "Window-3-0;Target:0;0&1;aaaa;4,4:0/abc/e", // 2: inside 4..8
+        "Anchored-4-0;Target:0;0&1;aaaa;0/abc/A", // 3: at 0 only
+        "Global-5-0;Target:0;0&1>1;aaaa;0/abc/g", // 4: more than one
+        "Trigger-6-0;Target:0;0&1&2;aaaa;bbbb;1/abc/", // 5: runs only when bb hit
     };
     const rules = try a.alloc(ir.LogicalRule, lines.len);
     const entries = try a.alloc(@import("../compile/ldb_build.zig").Entry, lines.len);
@@ -587,7 +587,7 @@ test "a worst-case PCRE input stops at the step budget and is reported" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var column: u32 = 0;
-    const rule = try ldb_parse.parseLine(a, "Slow-1-0;Target:0;0&1;61;0/[ab]*[ab]*[ab]*[ab]*c/g", &column);
+    const rule = try ldb_parse.parseLine(a, "Slow-1-0;Target:0;0&1;6161;0/[ab]*[ab]*[ab]*[ab]*c/g", &column);
     var blobs: std.ArrayList([]const u8) = .empty;
     try @import("../compile/ldb_build.zig").pcrePrograms(&rule, &blobs, a);
     const pool_bytes = try regex_pool.build(a, blobs.items);

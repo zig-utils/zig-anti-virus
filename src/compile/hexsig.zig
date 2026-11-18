@@ -10,8 +10,11 @@
 //!   alternatives may differ in length and hold nibble wildcards and `{n}` below 128.
 //! - `(B)` word boundary, `(L)` line marker, `(W)` non-alphanumeric byte.
 //!
-//! Every part must contain a static byte. Every rejection carries the byte position of the
-//! construct that caused it.
+//! Every part must contain a static byte; ClamAV bodies (`parseClamav`) need two consecutive
+//! literal bytes outside alternations in every part, as libclamav requires
+//! (tests/differential/cases/hex-rules.case). A gap maximum of 0 means no maximum, and a
+//! minimum above a nonzero maximum is accepted and never matches, as in libclamav. Every
+//! rejection carries the byte position of the construct that caused it.
 const std = @import("std");
 const ir = @import("ir.zig");
 const Allocator = std.mem.Allocator;
@@ -176,7 +179,15 @@ const Parser = struct {
     diag: *Diag,
     emitter: Emitter,
     part_start: usize = 0,
+    /// The part holds two consecutive literal bytes (outside alternations), which libclamav
+    /// requires of every part.
     part_static: bool = false,
+    /// Literal bytes in a row at the end of the current part.
+    run_len: usize = 0,
+    /// libclamav's rule: a part needs two literal bytes in a row (`Options.literal_pairs`).
+    pairs: bool = false,
+    /// What the part after a `[x-y]` gap must be: the single byte, or a part with static bytes.
+    bracket_next: enum { none, single, static } = .none,
     parts: usize = 1,
     branches: usize = 0,
 
@@ -227,17 +238,36 @@ const Parser = struct {
 
     fn breakPart(p: *Parser, at: usize, min: u32, max: u32, syntax: ir.GapSyntax) Error!void {
         try p.endPart(at);
+        if (syntax == .bracket) {
+            // `BYTE[x-y]HEXSIG` or `HEXSIG[x-y]BYTE`: one side is a single literal byte.
+            if (p.singleByte()) {
+                p.bracket_next = .static;
+            } else if (p.part_static) {
+                p.bracket_next = .single;
+            } else return p.fail(at, error.NoStaticByte);
+        } else p.bracket_next = .none;
         if (p.parts == limits.max_parts) return p.fail(at, error.TooComplex);
         try p.emitter.op(.{ .code = .part_end, .flags = @backingInt(syntax), .a = min, .b = max });
         p.parts += 1;
         p.part_start = p.emitter.ops.items.len;
         p.part_static = false;
+        p.run_len = 0;
     }
 
     fn endPart(p: *Parser, at: usize) Error!void {
         try p.emitter.flushMasked();
         if (p.emitter.ops.items.len == p.part_start) return p.fail(at, error.EmptyPart);
-        if (!p.part_static) return p.fail(at, error.NoStaticByte);
+        switch (p.bracket_next) {
+            .single => if (!p.singleByte()) return p.fail(at, error.BadRange),
+            // A single byte after `[x-y]` may itself face another bracket gap.
+            .none, .static => if (!p.part_static and !(p.singleByte() and at < p.body.len and p.body[at] == '[')) return p.fail(at, error.NoStaticByte),
+        }
+    }
+
+    /// The current part is one literal byte.
+    fn singleByte(p: *Parser) bool {
+        const ops = p.emitter.ops.items[p.part_start..];
+        return ops.len == 1 and ops[0].code == .lit and ops[0].len == 1;
     }
 
     fn branch(p: *Parser, at: usize) Error!void {
@@ -255,10 +285,15 @@ const Parser = struct {
                     const t = try p.byteToken();
                     if (t.mask == 0xff) {
                         try p.emitter.lit(t.value, 0);
-                        p.part_static = true;
-                    } else try p.emitter.masked(t.value, t.mask);
+                        p.run_len += 1;
+                        if (p.run_len >= 2 or !p.pairs) p.part_static = true;
+                    } else {
+                        try p.emitter.masked(t.value, t.mask);
+                        p.run_len = 0;
+                    }
                 },
                 '~' => {
+                    p.run_len = 0;
                     p.pos += 1;
                     const next = p.peek(0) orelse return p.fail(start, error.BadNegation);
                     if (!isNibbleChar(next)) return p.fail(start, error.BadNegation);
@@ -271,19 +306,23 @@ const Parser = struct {
                     try p.breakPart(start, 0, ir.unbounded, .star);
                 },
                 '{' => {
+                    // libclamav reads a maximum of 0 as no maximum: `{0}`, `{-0}` and `{n-0}`
+                    // are unbounded. A minimum above a nonzero maximum loads and never matches.
                     p.pos += 1;
                     if (p.peek(0) == '-') {
                         p.pos += 1;
                         const n = try p.number();
                         try p.expect('}', error.BadRange);
-                        try p.breakPart(start, 0, n, .upto);
+                        try p.breakPart(start, 0, if (n == 0) ir.unbounded else n, .upto);
                     } else {
                         const n = try p.number();
                         if (p.peek(0) == '}') {
                             p.pos += 1;
-                            if (n < ir.inline_gap_limit) {
-                                if (n == 0) return p.fail(start, error.BadRange);
+                            if (n == 0) {
+                                try p.breakPart(start, 0, ir.unbounded, .exact);
+                            } else if (n < ir.inline_gap_limit) {
                                 try p.emitter.op(.{ .code = .gapf, .a = n });
+                                p.run_len = 0;
                             } else try p.breakPart(start, n, n, .exact);
                         } else {
                             try p.expect('-', error.BadRange);
@@ -293,8 +332,7 @@ const Parser = struct {
                             } else {
                                 const m = try p.number();
                                 try p.expect('}', error.BadRange);
-                                if (m < n) return p.fail(start, error.BadRange);
-                                try p.breakPart(start, n, m, .range);
+                                try p.breakPart(start, n, if (m == 0) ir.unbounded else m, .range);
                             }
                         }
                     }
@@ -318,17 +356,20 @@ const Parser = struct {
                         };
                         if (class) |b| {
                             p.pos += 3;
+                            p.run_len = 0;
                             try p.branch(start);
                             try p.emitter.op(.{ .code = .bound, .flags = @backingInt(b) });
                             continue;
                         }
                     }
                     try p.alternation(start, false);
+                    p.run_len = 0;
                 },
                 '!' => {
                     if (p.peek(1) != '(') return p.fail(start, error.BadAlternation);
                     p.pos += 1;
                     try p.alternation(start, true);
+                    p.run_len = 0;
                 },
                 ')', '|' => return p.fail(start, error.BadAlternation),
                 else => return p.fail(start, error.BadChar),
@@ -388,7 +429,7 @@ const Parser = struct {
             try p.emitter.altTable(.nalt, 0, subs.items);
         } else {
             try p.emitter.altTable(.alt, 0, subs.items);
-            if (all_literal) p.part_static = true;
+            if (all_literal and !p.pairs) p.part_static = true;
         }
     }
 };
@@ -400,13 +441,29 @@ fn isStructural(c: u8) bool {
     };
 }
 
+pub const Options = struct {
+    /// Require two consecutive literal bytes (outside alternations) in every part, as
+    /// libclamav does for .ndb bodies and logical subsignatures; otherwise one static byte (a
+    /// literal or an all-literal alternation) is enough.
+    literal_pairs: bool = false,
+};
+
 /// Parse a hex body. All memory comes from `arena`.
 pub fn parse(arena: Allocator, body: []const u8, diag: *Diag) Error!ir.Pattern {
+    return parseWith(arena, body, diag, .{});
+}
+
+/// Parse a ClamAV body signature (.ndb or logical subsignature), with libclamav's rules.
+pub fn parseClamav(arena: Allocator, body: []const u8, diag: *Diag) Error!ir.Pattern {
+    return parseWith(arena, body, diag, .{ .literal_pairs = true });
+}
+
+pub fn parseWith(arena: Allocator, body: []const u8, diag: *Diag, options: Options) Error!ir.Pattern {
     if (std.mem.trim(u8, body, " \t").len == 0) return error.Empty;
     if (body.len > limits.max_body_len) return error.TooComplex;
     const data = try arena.create(std.ArrayList(u8));
     data.* = .empty;
-    var p: Parser = .{ .body = body, .diag = diag, .emitter = .{ .arena = arena, .data = data } };
+    var p: Parser = .{ .body = body, .diag = diag, .emitter = .{ .arena = arena, .data = data }, .pairs = options.literal_pairs };
     try p.run();
     return p.emitter.finish();
 }
@@ -435,8 +492,8 @@ fn formatOps(p: ir.Pattern, ops: []const ir.Op, w: *std.Io.Writer) std.Io.Writer
         }),
         .part_end => switch (@as(ir.GapSyntax, @fromBackingInt(o.flags))) {
             .star => try w.writeByte('*'),
-            .range => try w.print("{{{d}-{d}}}", .{ o.a, o.b }),
-            .upto => try w.print("{{-{d}}}", .{o.b}),
+            .range => if (o.b == ir.unbounded) try w.print("{{{d}-0}}", .{o.a}) else try w.print("{{{d}-{d}}}", .{ o.a, o.b }),
+            .upto => try w.print("{{-{d}}}", .{if (o.b == ir.unbounded) 0 else o.b}),
             .from => try w.print("{{{d}-}}", .{o.a}),
             .exact => try w.print("{{{d}}}", .{o.a}),
             .bracket => try w.print("[{d}-{d}]", .{ o.a, o.b }),
@@ -834,8 +891,6 @@ test "rejected constructs report their reason and position" {
     try parseErr("aabb**ccdd", error.EmptyPart, 5);
     try parseErr("aabb*????", error.NoStaticByte, 9);
     try parseErr("????", error.NoStaticByte, 4);
-    try parseErr("aa{5-3}bb", error.BadRange, 2);
-    try parseErr("aa{0}bb", error.BadRange, 2);
     try parseErr("aa{x}bb", error.BadRange, 3);
     try parseErr("aa{5bb", error.BadRange, 4);
     try parseErr("aa[1-33]bbcc", error.BadRange, 2);

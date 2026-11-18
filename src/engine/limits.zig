@@ -3,6 +3,10 @@
 //! configuration) whether a limited scan counts as clean, suspicious or an error.
 const std = @import("std");
 
+/// Files smaller than this are not scanned at all, as libclamav ignores files of five bytes or
+/// fewer (tests/differential/cases/hex-rules.case, hex-file-too-small).
+pub const min_scan_size: u64 = 6;
+
 pub const Limits = struct {
     /// Total bytes scanned across a file and everything inside it (clamd MaxScanSize).
     max_scan_size: u64 = 400 * 1024 * 1024,

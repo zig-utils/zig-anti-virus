@@ -203,7 +203,7 @@ fn verifyDiff(random: std.Random) void {
         "61(62|6364|6?)65",
         "61!(62|63)64*65",
         "(B)6162(L)63",
-        "61~62??63[1-3]6465",
+        "61~62??63[1-3]64",
         "6162{3}63(W)64",
         "61*62*63*64",
         "6261{2-}6162",
@@ -286,7 +286,7 @@ fn plant(p: zav.compile.ir.Pattern, data: []u8, pos: usize, random: std.Random) 
                 at += 1;
             },
             .gapf => at += o.a,
-            .part_end => at += o.a + random.uintAtMost(usize, @min(3, o.b - o.a)),
+            .part_end => at += o.a + if (o.b < o.a) 0 else random.uintAtMost(usize, @min(3, o.b - o.a)),
             .alt => {
                 const alts = p.alternatives(o);
                 for (p.altOps(alts[random.uintLessThan(usize, alts.len)])) |inner| switch (inner.code) {
@@ -314,6 +314,20 @@ fn naiveFrom(program: zav.match.prog.Program, data: []const u8, w: zav.match.ver
     if (start < w.lo or start > w.hi) return false;
     if (flags & prog.flag_fullword != 0 and naiveWordBefore(data, start, flags)) return false;
     return naiveOps(program.pattern, program.pattern.ops, data, w, start, flags);
+}
+
+fn naiveBoundByte(class: zav.compile.ir.Bound, b: u8, where: enum { before, after, middle }, data: []const u8, at: usize) bool {
+    const before = " -./<@_";
+    const after = "\n\r \"'-/=>_";
+    return switch (class) {
+        .nonalnum => !naiveAlnum(b),
+        .line => b == '\n' or (where == .after and b == '\r' and at + 1 < data.len and data[at + 1] == '\n'),
+        .word => switch (where) {
+            .before => std.mem.indexOfScalar(u8, before, b) != null,
+            .after => std.mem.indexOfScalar(u8, after, b) != null,
+            .middle => std.mem.indexOfScalar(u8, before, b) != null or std.mem.indexOfScalar(u8, after, b) != null,
+        },
+    };
 }
 
 fn naiveAlnum(b: u8) bool {
@@ -392,38 +406,26 @@ fn naiveOps(p: zav.compile.ir.Pattern, ops: []const zav.compile.ir.Op, data: []c
             return false;
         },
         .bound => {
-            const edge = pos == 0 or pos == data.len;
+            // libclamav's anchors: zero-width lookarounds before the first and after the last
+            // byte-consuming op, one consumed byte in between.
             const class: ir.Bound = @fromBackingInt(o.flags);
-            var lens: [3]usize = undefined;
-            var n: usize = 0;
-            switch (class) {
-                .nonalnum, .word => {
-                    if (pos < data.len and !naiveAlnum(data[pos])) {
-                        lens[n] = 1;
-                        n += 1;
-                    }
-                    if (class == .word and edge) {
-                        lens[n] = 0;
-                        n += 1;
-                    }
-                },
-                .line => {
-                    if (pos + 1 < data.len and data[pos] == '\r' and data[pos + 1] == '\n') {
-                        lens[n] = 2;
-                        n += 1;
-                    }
-                    if (pos < data.len and (data[pos] == '\r' or data[pos] == '\n')) {
-                        lens[n] = 1;
-                        n += 1;
-                    }
-                    if (edge) {
-                        lens[n] = 0;
-                        n += 1;
-                    }
-                },
+            const idx = p.ops.len - ops.len;
+            const at_start = for (p.ops[0..idx]) |q| {
+                if (q.code != .bound) break false;
+            } else true;
+            const at_end = for (rest) |q| {
+                if (q.code != .bound) break false;
+            } else true;
+            if (at_start) {
+                if (pos > 0 and !naiveBoundByte(class, data[pos - 1], .before, data, pos - 1)) return false;
+                return naiveOps(p, rest, data, w, pos, flags);
             }
-            for (lens[0..n]) |l| if (naiveOps(p, rest, data, w, pos + l, flags)) return true;
-            return false;
+            if (at_end) {
+                if (pos < data.len and !naiveBoundByte(class, data[pos], .after, data, pos)) return false;
+                return naiveOps(p, rest, data, w, pos, flags);
+            }
+            if (pos >= data.len or !naiveBoundByte(class, data[pos], .middle, data, pos)) return false;
+            return naiveOps(p, rest, data, w, pos + 1, flags);
         },
         .part_end => {
             var q = pos +| o.a;
@@ -442,7 +444,7 @@ fn progSection(random: std.Random) void {
     var fba: std.heap.FixedBufferAllocator = .init(&mem);
     const arena = fba.allocator();
     var diag: zc.hexsig.Diag = .{};
-    const bodies = [_][]const u8{ "aa(bb|cc??|{3}dd)ee*ff{-3}11(B)", "!(aabb|ccdd)eeff[1-4]00~11", "deadbeef" };
+    const bodies = [_][]const u8{ "aa(bb|cc??|{3}dd)ee*ff{-3}11(B)", "!(aabb|ccdd)eeff[1-4]00*1122~33", "deadbeef" };
     var inputs: [3]zc.prog_build.Input = undefined;
     for (bodies, &inputs, 0..) |b, *in, i| in.* = .{ .pattern = zc.hexsig.parse(arena, b, &diag) catch unreachable, .sig = @intCast(i), .target = 1, .offset = .{ .kind = .entry_point, .a = 4 } };
     const bytes = zc.prog_build.build(arena, &inputs) catch return;
@@ -507,7 +509,7 @@ fn anchoredSection(random: std.Random) void {
 fn ldbLine(random: std.Random) void {
     const ldb = zav.compile.ldb;
     const seeds = [_][]const u8{
-        "Win.Trojan.L-1-0;Engine:81-255,Target:1;0&1&2;EP+0:e8??;6b65726e656c::iw;aabb{2-4}ccdd",
+        "Win.Trojan.L-1-0;Engine:81-255,Target:1;0&1&2;EP+0:e8??5dc3;6b65726e656c::iw;aabb{2-4}ccdd",
         "Doc.Mal.M-2-0;Target:2,FileSize:100-2000,Container:CL_TYPE_ZIP;(0|1)>2,2&2=0;aabb;ccdd;eeff",
         "Pdf.N-3-0;Target:10,Intermediates:CL_TYPE_ANY>CL_TYPE_ZIP;0&1;2f4a53;0/eval\\(/si",
         "Elf.O-4-0;Target:6,NumberOfSections:1-9,EntryPoint:0-4096;0&1;S0+4:7f454c46;0(>>4#ib2#=0x10)",
@@ -581,14 +583,14 @@ fn logicalDiff(random: std.Random) void {
     const zc = zav.compile;
     const lt = zav.match.ldb_table;
     const lines = [_][]const u8{
-        "A;Target:0;0&1;aa;bb",
-        "B;Target:1;0|1;aa;bb",
-        "C;Target:0;0>2;aa",
-        "D;Target:0,FileSize:10-20;0&1=0;aa;bb",
-        "E;Target:0;(0|1|2)=2,2;aa;bb;cc",
-        "F;Target:0;((0&1)|2)>1;aa;bb;cc",
-        "G;Target:6,EntryPoint:0-100;0<3&1;aa;bb",
-        "H;Target:0,NumberOfSections:1-3;0;aa",
+        "A;Target:0;0&1;aaaa;bbbb",
+        "B;Target:1;0|1;aaaa;bbbb",
+        "C;Target:0;0>2;aaaa",
+        "D;Target:0,FileSize:10-20;0&1=0;aaaa;bbbb",
+        "E;Target:0;(0|1|2)=2,2;aaaa;bbbb;cccc",
+        "F;Target:0;((0&1)|2)>1;aaaa;bbbb;cccc",
+        "G;Target:6,EntryPoint:0-100;0<3&1;aaaa;bbbb",
+        "H;Target:0,NumberOfSections:1-3;0;aaaa",
     };
     if (logical_fixture == null) {
         var fba: std.heap.FixedBufferAllocator = .init(&logical_mem);

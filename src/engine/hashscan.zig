@@ -44,6 +44,7 @@ pub const Verdict = union(enum) {
 /// Hash a whole-file source and look it up. `block` is caller scratch (64 KiB is plenty).
 pub fn scanSource(io: Io, index: *const HashIndex, src: source_mod.Source, tracker: *limits_mod.Tracker, block: []u8) !Verdict {
     const size = src.len() orelse return error.UnknownSize;
+    if (size < limits_mod.min_scan_size) return .clean;
     tracker.checkFileSize(size) catch return .{ .limited = .file_size };
     const need = if (index.need[@backingInt(ir.HashScope.file)]) |map| map.mask(size) else 0;
     if (need == 0) return .clean;

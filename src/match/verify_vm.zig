@@ -155,7 +155,6 @@ const Vm = struct {
                 vm.part_first[part] = @intCast(i + 1);
                 vm.part_fixed[part] = true;
             },
-            .bound => vm.part_fixed[part] = false,
             .alt => if (o.b & 0xffff != o.b >> 16) {
                 vm.part_fixed[part] = false;
             },
@@ -228,81 +227,18 @@ const Vm = struct {
         return std.ascii.isAlphanumeric(b);
     }
 
-    /// Byte counts a character class can consume at `pos` (reading forwards); zero-width at the
-    /// data's edges. Returns how many options were written into `out`.
-    fn boundForward(vm: *const Vm, class: ir.Bound, pos: usize, out: *[3]usize) usize {
-        const d = vm.data;
-        var n: usize = 0;
-        const edge = pos == 0 or pos == d.len;
-        switch (class) {
-            .nonalnum => if (pos < d.len and !isAlnum(d[pos])) {
-                out[n] = 1;
-                n += 1;
-            },
-            .word => {
-                if (pos < d.len and !isAlnum(d[pos])) {
-                    out[n] = 1;
-                    n += 1;
-                }
-                if (edge) {
-                    out[n] = 0;
-                    n += 1;
-                }
-            },
-            .line => {
-                if (pos + 1 < d.len and d[pos] == '\r' and d[pos + 1] == '\n') {
-                    out[n] = 2;
-                    n += 1;
-                }
-                if (pos < d.len and (d[pos] == '\n' or d[pos] == '\r')) {
-                    out[n] = 1;
-                    n += 1;
-                }
-                if (edge) {
-                    out[n] = 0;
-                    n += 1;
-                }
-            },
+    /// Bytes boundary anchor op `i` consumes ending (backwards) or starting (forwards) at `pos`,
+    /// or null when it does not hold. Edge anchors are zero-width lookarounds.
+    fn boundAt(vm: *const Vm, i: usize, pos: usize, backwards: bool) ?usize {
+        const o = vm.pat.ops[i];
+        const class: ir.Bound = @fromBackingInt(o.flags);
+        const where = ir.boundPos(vm.pat.ops, i);
+        if (where != .middle) return if (ir.boundOk(class, where, vm.data, pos)) 0 else null;
+        if (backwards) {
+            if (pos == 0) return null;
+            return if (ir.boundOk(class, .middle, vm.data, pos - 1)) 1 else null;
         }
-        return n;
-    }
-
-    /// The same, for a class that ends at `pos` (reading backwards).
-    fn boundBackward(vm: *const Vm, class: ir.Bound, pos: usize, out: *[3]usize) usize {
-        const d = vm.data;
-        var n: usize = 0;
-        const edge = pos == 0 or pos == d.len;
-        switch (class) {
-            .nonalnum => if (pos > 0 and !isAlnum(d[pos - 1])) {
-                out[n] = 1;
-                n += 1;
-            },
-            .word => {
-                if (pos > 0 and !isAlnum(d[pos - 1])) {
-                    out[n] = 1;
-                    n += 1;
-                }
-                if (edge) {
-                    out[n] = 0;
-                    n += 1;
-                }
-            },
-            .line => {
-                if (pos >= 2 and d[pos - 2] == '\r' and d[pos - 1] == '\n') {
-                    out[n] = 2;
-                    n += 1;
-                }
-                if (pos > 0 and (d[pos - 1] == '\n' or d[pos - 1] == '\r')) {
-                    out[n] = 1;
-                    n += 1;
-                }
-                if (edge) {
-                    out[n] = 0;
-                    n += 1;
-                }
-            },
-        }
-        return n;
+        return if (ir.boundOk(class, .middle, vm.data, pos)) 1 else null;
     }
 
     fn wordBefore(vm: *const Vm, pos: usize) bool {
@@ -350,20 +286,7 @@ const Vm = struct {
                     }
                     return if (later) .later_fail else .here_fail;
                 },
-                .bound => {
-                    var opts: [3]usize = undefined;
-                    const n = vm.boundForward(@fromBackingInt(o.flags), pos, &opts);
-                    var later = false;
-                    for (opts[0..n]) |len| {
-                        try vm.step();
-                        switch (try vm.fwd(k, i + 1, pos + len)) {
-                            .ok => return .ok,
-                            .later_fail => later = true,
-                            .here_fail => {},
-                        }
-                    }
-                    return if (later) .later_fail else .here_fail;
-                },
+                .bound => pos += vm.boundAt(i, pos, false) orelse return .here_fail,
                 else => unreachable,
             }
         }
@@ -382,6 +305,7 @@ const Vm = struct {
     /// Search part k's start in `[from + gap.a, from + gap.b]`.
     fn nextPart(vm: *Vm, k: usize, from: usize, gap: ir.Op) Error!bool {
         const d = vm.data;
+        if (gap.a > gap.b) return false;
         const lo = from +| gap.a;
         if (lo > d.len) return false;
         const hi = if (gap.b == ir.unbounded) d.len else @min(d.len, from +| gap.b);
@@ -453,20 +377,7 @@ const Vm = struct {
                     }
                     return if (later) .later_fail else .here_fail;
                 },
-                .bound => {
-                    var opts: [3]usize = undefined;
-                    const n = vm.boundBackward(@fromBackingInt(o.flags), pos, &opts);
-                    var later = false;
-                    for (opts[0..n]) |len| {
-                        try vm.step();
-                        switch (try vm.bwd(k, i, pos - len)) {
-                            .ok => return .ok,
-                            .later_fail => later = true,
-                            .here_fail => {},
-                        }
-                    }
-                    return if (later) .later_fail else .here_fail;
-                },
+                .bound => pos -= vm.boundAt(i, pos, true) orelse return .here_fail,
                 else => unreachable,
             }
         }
@@ -483,7 +394,7 @@ const Vm = struct {
             return true;
         }
         const gap = vm.pat.ops[vm.partEnd(k - 1)];
-        if (pos < gap.a) return false;
+        if (pos < gap.a or gap.a > gap.b) return false;
         const hi = pos - gap.a; // latest end of part k-1
         const lo = if (gap.b == ir.unbounded or gap.b > pos) 0 else pos - gap.b;
         const last = vm.pat.ops[vm.partEnd(k - 1) - 1];
@@ -712,14 +623,29 @@ test "backtracking over earlier occurrences and alternations" {
 }
 
 test "character classes" {
+    // At the edges anchors are zero-width lookarounds with libclamav's byte sets; the start and
+    // end of the data satisfy them. In the middle they consume one byte.
     try testing.expect(try matches("(B)41424344(B)", "ABCD"));
-    try testing.expect(try matches("(B)41424344(B)", "x ABCD."));
-    try testing.expect(!try matches("(B)41424344(B)", "xABCD."));
-    try testing.expect(try matches("41424344(L)45", "ABCD\r\nE"));
+    try testing.expect(try matches("(B)41424344(B)", "x ABCD>"));
+    try testing.expect(!try matches("(B)41424344(B)", "x ABCD."));
+    try testing.expect(!try matches("(B)41424344(B)", "xABCD>"));
+    try testing.expect(try matches("(B)41424344(B)", "x.ABCD\r"));
+    try testing.expect(!try matches("(B)41424344(B)", "x\rABCD\r"));
+    try testing.expect(try matches("41424344(L)", "ABCD\r\nE"));
+    try testing.expect(!try matches("41424344(L)", "ABCD\rE"));
+    try testing.expect(try matches("(L)41424344", "x\nABCD"));
+    try testing.expect(!try matches("(L)41424344", "x\rABCD"));
     try testing.expect(try matches("41424344(L)45", "ABCD\nE"));
+    try testing.expect(!try matches("41424344(L)45", "ABCD\r\nE"));
     try testing.expect(!try matches("41424344(L)45", "ABCD E"));
     try testing.expect(try matches("41424344(W)45", "ABCD-E"));
     try testing.expect(!try matches("41424344(W)45", "ABCDzE"));
+    try testing.expect(try matches("41424344(B)45", "ABCD.E"));
+    try testing.expect(!try matches("41424344(B)45", "ABCD,E"));
+    // Zero-width at the edges: the match is the bytes between the boundaries.
+    const m = (try firstMatch("(B)41424344(B)", .{}, 0, .{}, .{ .size = 7 }, "x ABCD ")).?;
+    try testing.expectEqual(@as(usize, 2), m.start);
+    try testing.expectEqual(@as(usize, 6), m.end);
 }
 
 test "modifiers: nocase, wide, ascii, fullword" {

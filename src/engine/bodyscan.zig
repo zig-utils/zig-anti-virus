@@ -282,7 +282,7 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
     try c.addFile("test.ldb",
         \\Test.Logical.Pair-1-0;Target:0;0&1;6576616c28;756e6573636170652800::i
         \\Test.Logical.Count-2-0;Target:0;0>2&1=0;414141;5a5a5a
-        \\Test.Logical.Pe-3-0;Target:1,FileSize:10-64;0&1;EP+0:e8;4d5a
+        \\Test.Logical.Pe-3-0;Target:1,FileSize:10-64;0&1;EP+0:e800;4d5a
         \\Test.Logical.Distinct-4-0;Target:7;(0|1|2)>1,2;6f6e65;74776f;746872656565
         \\Test.Logical.Bc-5-0;Target:0;0&1;4c454e3d;0(>>4#de3#>100)
         \\Test.Logical.Pcre-6-0;Target:0;0&1;3c736372697074;0/eval\s*\(\s*unescape/i

@@ -138,6 +138,9 @@ pub const Reason = enum(u8) {
     yara_short_string,
     yara_no_strings,
     yara_xor_range,
+    /// A plain literal .ndb body under three bytes where libclamav uses its Boyer-Moore matcher
+    /// (target type 0, or any offset other than `*`), which refuses it.
+    hex_too_short,
 };
 
 pub const Rejection = struct {
@@ -209,14 +212,81 @@ comptime {
     std.debug.assert(@sizeOf(AltEntry) == 8);
 }
 
+/// Boundary anchors, with libclamav's semantics as measured by the differential suite
+/// (tests/differential/cases/boundary.case; the docs give each one line). At the start of a
+/// signature an anchor is zero-width and looks at the byte before the match; at the end it is
+/// zero-width and looks at the byte after it; the start and end of the data satisfy both. In the
+/// middle of a signature it consumes one byte. Which bytes qualify depends on the position, and
+/// for `(B)` the three sets differ (`boundOk`).
 pub const Bound = enum(u8) {
-    /// `(B)`: one non-alphanumeric byte, or nothing at the start or end of the data.
+    /// `(B)`: a word boundary.
     word = 0,
-    /// `(L)`: CR, LF or CRLF, or nothing at the start or end of the data.
+    /// `(L)`: a line boundary: LF (at the end also CRLF).
     line = 1,
-    /// `(W)`: one non-alphanumeric byte.
+    /// `(W)`: a non-alphanumeric byte.
     nonalnum = 2,
 };
+
+/// Where a boundary anchor sits in its pattern.
+pub const BoundPos = enum { start, middle, end };
+
+/// Anchors before every byte-consuming op are at the start; anchors after every one at the end.
+pub fn boundPos(ops: []const Op, i: usize) BoundPos {
+    for (ops[0..i]) |o| {
+        if (o.code != .bound) break;
+    } else return .start;
+    for (ops[i + 1 ..]) |o| {
+        if (o.code != .bound) break;
+    } else return .end;
+    return .middle;
+}
+
+/// Bytes a boundary anchor consumes: one in the middle of a pattern, none at its edges.
+pub fn boundWidth(ops: []const Op, i: usize) u32 {
+    return if (boundPos(ops, i) == .middle) 1 else 0;
+}
+
+/// `(B)` bytes measured from libclamav 1.5.4: before a match, after it, and inside a pattern.
+const word_before = " -./<@_";
+const word_after = "\n\r \"'-/=>_";
+
+fn inSet(set: []const u8, b: u8) bool {
+    return std.mem.indexOfScalar(u8, set, b) != null;
+}
+
+/// Whether an anchor of `class` at `pos` holds in `data`. At the start, `pos` is where the match
+/// starts; at the end, where it ends; in the middle, the byte at `pos` is the one consumed.
+pub fn boundOk(class: Bound, where: BoundPos, data: []const u8, pos: usize) bool {
+    switch (where) {
+        .start => {
+            if (pos == 0) return true;
+            const b = data[pos - 1];
+            return switch (class) {
+                .word => inSet(word_before, b),
+                .line => b == '\n',
+                .nonalnum => !std.ascii.isAlphanumeric(b),
+            };
+        },
+        .end => {
+            if (pos >= data.len) return true;
+            const b = data[pos];
+            return switch (class) {
+                .word => inSet(word_after, b),
+                .line => b == '\n' or (b == '\r' and pos + 1 < data.len and data[pos + 1] == '\n'),
+                .nonalnum => !std.ascii.isAlphanumeric(b),
+            };
+        },
+        .middle => {
+            if (pos >= data.len) return false;
+            const b = data[pos];
+            return switch (class) {
+                .word => inSet(word_before, b) or inSet(word_after, b),
+                .line => b == '\n',
+                .nonalnum => !std.ascii.isAlphanumeric(b),
+            };
+        },
+    }
+}
 
 /// How a part break was written.
 pub const GapSyntax = enum(u8) {

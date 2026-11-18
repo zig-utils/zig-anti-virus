@@ -42,6 +42,7 @@ pub fn chooseAnchor(p: ir.Pattern, part0_only: bool) Anchor {
             .gapf => d + o.a,
             .nalt => d + (o.b & 0xffff),
             .alt => if (o.b & 0xffff == o.b >> 16) d + (o.b & 0xffff) else null,
+            .bound => d + ir.boundWidth(p.ops, i),
             else => null,
         };
     }
@@ -51,11 +52,12 @@ pub fn chooseAnchor(p: ir.Pattern, part0_only: bool) Anchor {
 /// Shortest possible match length (saturating).
 pub fn minLen(p: ir.Pattern) u32 {
     var n: u32 = 0;
-    for (p.ops) |o| n +|= switch (o.code) {
+    for (p.ops, 0..) |o, i| n +|= switch (o.code) {
         .lit, .masked => o.len,
         .gapf => o.a,
         .alt, .nalt => o.b & 0xffff,
         .part_end => o.a,
+        .bound => ir.boundWidth(p.ops, i),
         else => 0,
     };
     return n;

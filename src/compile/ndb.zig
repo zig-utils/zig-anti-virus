@@ -42,7 +42,7 @@ pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source_name: []co
     }
 }
 
-pub const LineError = error{ FieldCount, EmptyName, BadTarget, BadOffset, OffsetNeedsExecutable, VersionInfoUnsupported, BadFlevel } || hexsig.Error;
+pub const LineError = error{ FieldCount, EmptyName, BadTarget, BadOffset, OffsetNeedsExecutable, VersionInfoUnsupported, BadFlevel, TooShort } || hexsig.Error;
 
 pub fn reasonOf(err: LineError) ir.Reason {
     return switch (err) {
@@ -53,6 +53,7 @@ pub fn reasonOf(err: LineError) ir.Reason {
         error.OffsetNeedsExecutable => .offset_needs_executable,
         error.VersionInfoUnsupported => .version_info_unsupported,
         error.BadFlevel => .bad_flevel,
+        error.TooShort => .hex_too_short,
         else => |e| hexsig.reasonOf(@errorCast(e)),
     };
 }
@@ -88,10 +89,19 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
     if (flevel_max != 0 and flevel_max < flevel_min) return error.BadFlevel;
 
     var diag: hexsig.Diag = .{};
-    const pattern = hexsig.parse(arena, fields[3], &diag) catch |err| {
+    const pattern = hexsig.parseClamav(arena, fields[3], &diag) catch |err| {
         column.* = @intCast(starts[3] + diag.pos);
         return err;
     };
+    // libclamav matches plain literal bodies with Boyer-Moore unless the target type is not 0
+    // and the offset is `*`; that matcher refuses bodies under three bytes.
+    const plain = for (fields[3]) |ch| {
+        if (!std.ascii.isHex(ch)) break false;
+    } else true;
+    if (plain and fields[3].len < 6 and !(target != 0 and offset.kind == .any)) {
+        column.* = @intCast(starts[3]);
+        return error.TooShort;
+    }
     column.* = 0;
     return .{
         .name = name,
@@ -192,7 +202,7 @@ test "ndb lines: fields, targets, flevels" {
     defer arena.deinit();
     var column: u32 = 0;
     const a = arena.allocator();
-    const r = try parseLine(a, "Win.Trojan.Test-1-0:1:EP+0:e8????????5d:60:200", &column);
+    const r = try parseLine(a, "Win.Trojan.Test-1-0:1:EP+0:e8????????5dc3:60:200", &column);
     try testing.expectEqualStrings("Win.Trojan.Test-1-0", r.name);
     try testing.expectEqual(@as(u8, 1), r.target);
     try testing.expectEqual(ir.OffsetKind.entry_point, r.subsig.offset.kind);

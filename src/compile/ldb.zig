@@ -347,7 +347,7 @@ fn parseSubsig(arena: std.mem.Allocator, text: []const u8, index: usize, target:
         body_start = colon + 1;
     }
     var diag: hexsig.Diag = .{};
-    const pattern = hexsig.parse(arena, body[body_start..], &diag) catch |err| {
+    const pattern = hexsig.parseClamav(arena, body[body_start..], &diag) catch |err| {
         column.* += @intCast(body_start + diag.pos);
         return err;
     };
@@ -645,7 +645,7 @@ test "ldb lines: subsignatures with offsets and modifiers, and every rejection" 
     defer arena.deinit();
     const a = arena.allocator();
     var column: u32 = 0;
-    const r = try parseLine(a, "Win.Trojan.L-1-0;Engine:81-255,Target:1;0&1&2;EP+0:e8??;6b65726e656c33322e646c6c::iw;aabb{2-4}ccdd", &column);
+    const r = try parseLine(a, "Win.Trojan.L-1-0;Engine:81-255,Target:1;0&1&2;EP+0:e8??5dc3;6b65726e656c33322e646c6c::iw;aabb{2-4}ccdd", &column);
     try testing.expectEqualStrings("Win.Trojan.L-1-0", r.name);
     try testing.expectEqual(@as(usize, 3), r.subsigs.len);
     try testing.expectEqual(ir.OffsetKind.entry_point, r.subsigs[0].hex.offset.kind);
