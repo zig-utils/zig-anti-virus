@@ -188,6 +188,7 @@ pub fn main(init: std.process.Init) !void {
     try suite.add("logical state, 16 touched, 1k-signature table", logicalFile(0));
     try suite.add("logical state, 16 touched, 100k-signature table", logicalFile(1));
     try normaliserBenchmarks(init.io, init.gpa, &suite);
+    try prefilterBenchmarks(init.io, init.gpa, &suite);
     try decoderBenchmarks(init.io, init.gpa, "");
     suite.setBaseline(out_path);
     try suite.run();
@@ -486,4 +487,79 @@ fn decoderBenchmarks(io: std.Io, gpa: std.mem.Allocator, filter: []const u8) !vo
     try results.appendSlice(gpa, "\n]\n");
     // A filtered run is partial: keep the full results file.
     if (filter.len == 0) try dir.writeFile(io, .{ .sub_path = "zig-results.json", .data = results.items });
+}
+
+// Stage one per tier (P4.05) -----------------------------------------------------------------
+
+const Tiered = struct {
+    name: []const u8,
+    /// Hex bodies of each generated atom: `len` random bytes, `count` of them.
+    len: usize,
+    count: usize,
+};
+
+/// Partitions of random atoms of one length each (11 bytes: tier A, 7: B, 5: C, 3: a 3-gram
+/// tier D), plus one of tiers A and B together, the PE partition's common case.
+var tier_parts: [5]zav.match.prefilter.Partition = undefined;
+var tier_data: []u8 = &.{};
+var tier_ring: [zav.match.prefilter.ring_len]zav.match.prefilter.Candidate = undefined;
+
+fn buildTier(gpa: std.mem.Allocator, random: std.Random, lens: []const usize, count: usize) !zav.match.prefilter.Partition {
+    const zc = zav.compile;
+    // Lives for the whole run: the partition points into it.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    const a = arena.allocator();
+    var inputs: std.ArrayList(zc.prog_build.Input) = .empty;
+    for (0..count) |i| {
+        const len = lens[i % lens.len];
+        const raw = try a.alloc(u8, len);
+        random.bytes(raw);
+        const hex = try a.alloc(u8, 2 * len);
+        _ = std.fmt.bufPrint(hex, "{x}", .{raw}) catch unreachable;
+        var diag: zc.hexsig.Diag = .{};
+        try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i) });
+    }
+    const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), .{}, inputs.items, &.{});
+    var w = zc.prog_build.Writer.init(a, null);
+    for (inputs.items, planned) |*in, pl| {
+        in.atom = pl.atom(in.offset.kind);
+        _ = try w.add(in.*);
+    }
+    const bytes = try w.finish();
+    const image = try a.alignedAlloc(u8, .@"64", bytes.len);
+    @memcpy(image, bytes);
+    const progs = try zav.match.prog.Programs.init(image);
+    const section = (try zc.prefilter_build.buildAll(a, progs, w.atoms.items, .{})).?;
+    return (try zav.match.prefilter.loadAll(section, progs))[0].?;
+}
+
+fn Stage1Bench(comptime k: usize) type {
+    return struct {
+        fn run() void {
+            var pos: usize = 0;
+            var n: usize = 0;
+            while (pos < tier_data.len) {
+                const got, const next = zav.match.prefilter.stage1(&tier_parts[k], tier_data, pos, &tier_ring);
+                n += got;
+                pos = next;
+            }
+            sink +%= n;
+        }
+    };
+}
+
+fn prefilterBenchmarks(io: std.Io, gpa: std.mem.Allocator, suite: *bench.BenchmarkSuite) !void {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    const names = [_][]const u8{ "tier A (stride 8)", "tier B (stride 4)", "tier C (stride 1, gated)", "tier D (3-gram, gated)", "tiers A+B" };
+    const lens = [_][]const usize{ &.{11}, &.{7}, &.{5}, &.{3}, &.{ 11, 11, 11, 7 } };
+    // 100k atoms per partition, about the PE partition's size.
+    for (&tier_parts, lens) |*part, l| part.* = try buildTier(gpa, r, l, if (l[0] == 3) 2000 else 100_000);
+    tier_data = try gpa.alloc(u8, hash_input_len);
+    r.bytes(tier_data);
+    std.debug.print("stage 1: MB/s (10^6 bytes) per core over 1 MiB of random bytes, best of 5\n", .{});
+    inline for (0..5) |k| {
+        std.debug.print("stage 1: {s:<26} {d:>8.0}\n", .{ names[k], mbps(io, Stage1Bench(k).run) });
+        try suite.add("stage 1 " ++ ([_][]const u8{ "A", "B", "C", "D", "A+B" })[k] ++ " 1 MiB", Stage1Bench(k).run);
+    }
 }
