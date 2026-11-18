@@ -686,16 +686,26 @@ test "live: no subprocesses, and a renamed miner in /dev/shm is reported" {
 
 test "no check spawns a process: host and CVE sources never name a process-spawning API" {
     const sources = [_][]const u8{
-        @embedFile("process.zig"), @embedFile("procfs.zig"),     @embedFile("packages.zig"), @embedFile("integrity.zig"),
-        @embedFile("../scan.zig"), @embedFile("../context.zig"), @embedFile("../host.zig"),  @embedFile("../sys.zig"),
+        @embedFile("process.zig"),                  @embedFile("procfs.zig"),                        @embedFile("packages.zig"),
+        @embedFile("integrity.zig"),                @embedFile("network.zig"),                       @embedFile("kernel.zig"),
+        @embedFile("persistence.zig"),              @embedFile("privilege.zig"),                     @embedFile("hardening.zig"),
+        @embedFile("sqlite.zig"),                   @embedFile("rpm.zig"),                           @embedFile("../scan.zig"),
+        @embedFile("../context.zig"),               @embedFile("../host.zig"),                       @embedFile("../sys.zig"),
+        @embedFile("../macos/checks.zig"),          @embedFile("../macos/macho.zig"),                @embedFile("../macos/plist.zig"),
+        @embedFile("../../cve/inventory/root.zig"), @embedFile("../../cve/inventory/lockfiles.zig"), @embedFile("../../cve/inventory/gobuild.zig"),
     };
     const forbidden = [_][]const u8{ "process.spawn", "process.run(", "Child.init", "execve", "posix_spawn", "fork(", "system(" };
     for (sources) |src| {
         // Tests may spawn harness processes; only code before the test section counts.
         const code = if (std.mem.indexOf(u8, src, "\ntest \"")) |i| src[0..i] else src;
-        for (forbidden) |f| if (std.mem.indexOf(u8, code, f) != null) {
-            std.debug.print("forbidden call {s} in host check code\n", .{f});
-            return error.TestUnexpectedResult;
-        };
+        // Whole identifiers only: osEcosystem( is not system(.
+        for (forbidden) |f| {
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, code, from, f)) |at| : (from = at + 1) {
+                if (at > 0 and (std.ascii.isAlphanumeric(code[at - 1]) or code[at - 1] == '_')) continue;
+                std.debug.print("forbidden call {s} in host check code\n", .{f});
+                return error.TestUnexpectedResult;
+            }
+        }
     }
 }

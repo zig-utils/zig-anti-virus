@@ -16,6 +16,7 @@ const targets = [_]Target{
     .{ .name = "macosPlist", .run = macosPlist },
     .{ .name = "cveFeeds", .run = cveFeeds },
     .{ .name = "cveIndex", .run = cveIndex },
+    .{ .name = "cveInventory", .run = cveInventory },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -302,4 +303,38 @@ pub fn cveIndex(gpa: std.mem.Allocator, random: std.Random) !void {
     for (idx.queryPackage("npm", "lodash", "4.17.20", &hits)) |h| _ = idx.info(h.record);
     for (idx.queryCpe("apache", "log4j", "2.14.1", &hits)) |h| _ = idx.info(h.record);
     _ = idx.find("CVE-2021-44228");
+}
+
+/// Lockfiles, dist-info METADATA, Go build info, banners and os-release.
+pub fn cveInventory(gpa: std.mem.Allocator, random: std.Random) !void {
+    const inv = zav.cve.inventory;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var items: std.ArrayList(inv.Item) = .empty;
+    defer items.deinit(gpa);
+    var buf: [1024]u8 = undefined;
+    const seeds = [_][]const u8{
+        "{\n // c\n \"packages\": { \"lodash\": [\"lodash@4.17.20\", \"\", {}, \"x\"], \"@a/b\": [\"@a/b@1.0.0\"], },\n}",
+        "{\"lockfileVersion\":3,\"packages\":{\"node_modules/a\":{\"version\":\"1.0.0\"}},\"dependencies\":{\"b\":{\"version\":\"2.0.0\"}}}",
+        "packages:\n  lodash@4.17.20:\n    resolution: {}\n  '@s/x@1.0.0(r@1)':\n  /old/2.0.0:\n",
+        "[[package]]\nname = \"regex\"\nversion = \"1.5.4\"\nsource = \"registry+x\"\n",
+        "Name: requests\nVersion: 2.31.0\n\n",
+        "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5\r\nID=ubuntu\nVERSION_ID=\"24.04\"\n",
+    };
+    const input = mutateCopy(random, &buf, seeds[random.uintLessThan(usize, seeds.len)]);
+    inv.lockfiles.bunLock(gpa, a, input, "f", &items) catch |e| if (e == error.OutOfMemory) return e;
+    inv.lockfiles.packageLock(gpa, a, input, "f", &items) catch |e| if (e == error.OutOfMemory) return e;
+    inv.lockfiles.pantryLock(gpa, a, input, "f", &items) catch |e| if (e == error.OutOfMemory) return e;
+    try inv.lockfiles.pnpmLock(gpa, input, "f", &items);
+    try inv.lockfiles.cargoLock(gpa, input, "f", &items);
+    try inv.lockfiles.pythonMetadata(gpa, input, "f", &items);
+    _ = inv.bannerItem(input);
+    var eco: [64]u8 = undefined;
+    _ = inv.item.osEcosystem(&eco, input);
+    var bin: [256]u8 = @splat(0);
+    @memcpy(bin[32..][0..inv.gobuild.magic.len], inv.gobuild.magic);
+    bin[32 + 15] = 2;
+    random.bytes(bin[32 + 16 ..][0..random.uintLessThan(usize, 200)]);
+    if (inv.gobuild.find(&bin)) |info| try inv.gobuild.items(gpa, info, "bin", &items);
 }

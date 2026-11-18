@@ -73,6 +73,12 @@ pub const Options = struct {
     cpu_sample_ms: u32 = 500,
     /// The context to use instead of detecting one (tests).
     context: ?context.Context = null,
+    /// The CVE index for vulnerability checks.
+    cve_index: ?*const @import("../cve/index.zig").Index = null,
+    /// Paths `zav audit` walks for lockfiles, Python packages and Go binaries.
+    audit_paths: []const []const u8 = &.{},
+    /// pantry install roots to inventory (project `pantry/` directories).
+    pantry_roots: []const []const u8 = &.{},
 };
 
 pub const Suppressed = struct {
