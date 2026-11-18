@@ -28,6 +28,7 @@ pub const linux = struct {
     pub const kernel = @import("linux/kernel.zig");
     pub const persistence = @import("linux/persistence.zig");
     pub const privilege = @import("linux/privilege.zig");
+    pub const hardening = @import("linux/hardening.zig");
 };
 
 pub const Host = host.Host;
@@ -38,7 +39,7 @@ pub const Severity = finding.Severity;
 pub const Category = finding.Category;
 
 /// Every check this build knows, in run order.
-pub const registry = linux.process.checks ++ linux.network.checks ++ linux.kernel.checks ++ linux.persistence.checks ++ linux.privilege.checks ++ linux.integrity.checks;
+pub const registry = linux.process.checks ++ linux.network.checks ++ linux.kernel.checks ++ linux.persistence.checks ++ linux.privilege.checks ++ linux.hardening.checks ++ linux.integrity.checks;
 
 test {
     _ = finding;
@@ -60,5 +61,6 @@ test {
     _ = linux.kernel;
     _ = linux.persistence;
     _ = linux.privilege;
+    _ = linux.hardening;
     _ = baseline;
 }

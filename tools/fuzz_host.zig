@@ -11,6 +11,8 @@ const targets = [_]Target{
     .{ .name = "hostNetwork", .run = hostNetwork },
     .{ .name = "hostKernel", .run = hostKernel },
     .{ .name = "hostPersistence", .run = hostPersistence },
+    .{ .name = "hostHardening", .run = hostHardening },
+    .{ .name = "cveVersion", .run = cveVersion },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -190,4 +192,35 @@ pub fn hostPersistence(gpa: std.mem.Allocator, random: std.Random) !void {
     var users: std.ArrayList(p.User) = .empty;
     defer users.deinit(gpa);
     try p.parsePasswd(gpa, input, &users);
+}
+
+/// Mount tables, nftables replies and the pending-update computation.
+pub fn hostHardening(gpa: std.mem.Allocator, random: std.Random) !void {
+    const h = zav.host.linux.hardening;
+    var buf: [512]u8 = undefined;
+    const input = mutateCopy(random, &buf, "/dev/mapper/vg-root / ext4 rw 0 0\nPackage: openssl\nStatus: install ok installed\nVersion: 3.0.13-0ubuntu3.1\n");
+    _ = h.mountSource(input, "/");
+    var rules: usize = 0;
+    var done = false;
+    h.countNftRules(input, &rules, &done) catch {};
+    var pending: std.ArrayList(h.Pending) = .empty;
+    defer pending.deinit(gpa);
+    try h.pendingSecurity(gpa, input, &.{input}, &pending);
+}
+
+/// Version comparison must be antisymmetric and reflexive for every scheme, whatever the input.
+pub fn cveVersion(gpa: std.mem.Allocator, random: std.Random) !void {
+    _ = gpa;
+    const version = zav.cve.version;
+    const seeds = [_][]const u8{ "1:9.6p1-3ubuntu13.5", "1.0~rc1", "5.2.26-3.fc40", "1.36.1_rc2-r29", "1.0.0-alpha.1+b", "1!2.0.post1.dev3", "2.14.0-SNAPSHOT", "v0.0.0-2023-abc" };
+    var a_buf: [64]u8 = undefined;
+    var b_buf: [64]u8 = undefined;
+    const a = mutateCopy(random, &a_buf, seeds[random.uintLessThan(usize, seeds.len)]);
+    const b = mutateCopy(random, &b_buf, seeds[random.uintLessThan(usize, seeds.len)]);
+    inline for (comptime std.enums.values(version.Scheme)) |scheme| {
+        const ab = version.compare(scheme, a, b);
+        const ba = version.compare(scheme, b, a);
+        if (ab != ba.invert()) @panic("fuzz: version comparison is not antisymmetric for " ++ @tagName(scheme));
+        if (version.compare(scheme, a, a) != .eq) @panic("fuzz: version comparison is not reflexive for " ++ @tagName(scheme));
+    }
 }
