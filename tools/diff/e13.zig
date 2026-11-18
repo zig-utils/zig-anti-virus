@@ -96,6 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
     var pattern_text: []const u8 = "";
     var flags_text: []const u8 = "";
     var source: []const u8 = "";
+    var dollar_eol = false;
     var pat_arena: std.heap.ArenaAllocator = .init(gpa);
     defer pat_arena.deinit();
 
@@ -118,6 +119,7 @@ pub fn main(init: std.process.Init) !u8 {
             flags_text = it.next() orelse continue;
             pattern_text = try hexDecode(arena, it.next() orelse continue);
             source = it.next() orelse "?";
+            dollar_eol = std.mem.eql(u8, source, "clamav") and std.mem.indexOfAny(u8, flags_text, "Em") == null and std.mem.indexOfScalar(u8, pattern_text, '$') != null;
             counts.patterns += 1;
             const src = try by_source.getOrPut(arena, source);
             if (!src.found_existing) src.value_ptr.* = .{};
@@ -146,7 +148,8 @@ pub fn main(init: std.process.Init) !u8 {
                 'U' => pf |= pcre2.ungreedy,
                 else => {},
             };
-            const zav_ok = if (zav.compile.cdb.compileRegex(pat_arena.allocator(), pattern_text, zf)) |blob| blk: {
+            const zpattern = if (std.mem.indexOfScalar(u8, flags_text, 'U') != null) try std.mem.concat(pat_arena.allocator(), u8, &.{ "(?U)", pattern_text }) else pattern_text;
+            const zav_ok = if (zav.compile.cdb.compileRegexKind(pat_arena.allocator(), zpattern, zf, .leftmost_first)) |blob| blk: {
                 program = regex.Program.load(blob) catch null;
                 break :blk program != null;
             } else |_| false;
@@ -190,11 +193,16 @@ pub fn main(init: std.process.Init) !u8 {
         const src = by_source.getPtr(source).?;
         src.subjects += 1;
 
-        const zres = p.findFrom(&scratch.?, subject, 0) catch {
+        var zres = p.findFrom(&scratch.?, subject, 0) catch {
             counts.limited += 1;
             src.limited += 1;
             continue;
         };
+        // As zav runs PCRE subsigs (match/logical.zig): without E or m, a `$` may also match
+        // before a final newline, by searching the subject without it.
+        if (zres == null and dollar_eol and subject.len > 0 and subject[subject.len - 1] == '\n') {
+            zres = p.findFrom(&scratch.?, subject[0 .. subject.len - 1], 0) catch null;
+        }
         const rc = pcre2.pcre2_match_8(c, subject.ptr, subject.len, 0, 0, md.?, mctx);
         if (rc < 0 and rc != pcre2.error_nomatch) {
             counts.limited += 1;
@@ -213,6 +221,10 @@ pub fn main(init: std.process.Init) !u8 {
             } else {
                 counts.end_only += 1;
                 src.end_only += 1;
+                if (shown < show) {
+                    shown += 1;
+                    try out.print("END /{s}/{s} ({s}) on {x}: zig-regex {any}, pcre2 {any}\n", .{ pattern_text, flags_text, source, subject[0..@min(subject.len, 120)], zres, pmatch });
+                }
             }
         } else {
             counts.disagree += 1;

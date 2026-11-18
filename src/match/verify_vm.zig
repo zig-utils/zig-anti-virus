@@ -315,9 +315,14 @@ const Vm = struct {
         const to_end = hi == d.len;
         if (to_end and lo >= vm.memo.dead_from[k]) return false;
         var any_later = false;
+        const whole = vm.part_first[k] + 1 == vm.partEnd(k) and first.code == .lit and first.flags & ir.op_nocase == 0;
         var q = lo;
         while (q <= hi) : (q += 1) {
-            if (first.code == .lit and first.flags & ir.op_nocase == 0) {
+            if (whole) {
+                // The part is one literal: find it whole, starting in [q, hi].
+                const lit = vm.pat.bytes(first);
+                q = std.mem.indexOfPos(u8, d[0..@min(d.len, hi +| lit.len)], q, lit) orelse break;
+            } else if (first.code == .lit and first.flags & ir.op_nocase == 0) {
                 const byte = vm.pat.bytes(first)[0];
                 q = std.mem.indexOfScalarPos(u8, d[0..@min(d.len, hi + 1)], q, byte) orelse break;
             }
@@ -404,8 +409,18 @@ const Vm = struct {
         if (lo == 0 and dead.* != unknown and hi <= dead.*) return false;
         var any_later = false;
         var e = hi;
+        // A part that is one literal is found whole: one step per occurrence, not per
+        // occurrence of its last byte.
+        const whole = vm.part_first[k - 1] + 1 == vm.partEnd(k - 1) and last.code == .lit and last.flags & ir.op_nocase == 0;
         while (true) {
-            if (last.code == .lit and last.flags & ir.op_nocase == 0) {
+            if (whole) {
+                const lit = vm.pat.bytes(last);
+                // The literal ends in [lo, e], so it starts in [lo - len, e - len].
+                if (e < lit.len) break;
+                const base = if (lo < lit.len) 0 else lo - lit.len;
+                const at = std.mem.lastIndexOf(u8, vm.data[base..e], lit) orelse break;
+                e = base + at + lit.len;
+            } else if (last.code == .lit and last.flags & ir.op_nocase == 0) {
                 // The part ends with a literal: jump to the previous occurrence of its last byte.
                 const byte = vm.pat.bytes(last)[last.len - 1];
                 // Ends lie in [lo, e], so the byte sits in [lo - 1, e - 1]; no part ends at 0.
@@ -444,6 +459,18 @@ pub fn verifyMemo(p: prog.Program, data: []const u8, window: Window, anchor_star
     var vm = Vm.init(p, data, window, budget, memo);
     const a = p.header.anchor_part;
     try vm.step();
+    // The anchor literal itself first: candidates come from its first byte only, and searching
+    // earlier parts backwards before knowing the anchor holds can cost a step per byte of the
+    // file (a part ending in 00 over zero padding).
+    if (p.header.anchor_op != prog.no_anchor) {
+        const o = p.pattern.ops[p.header.anchor_op];
+        const at = anchor_start + p.header.anchor_delta;
+        if (at + o.len > data.len) return null;
+        const want = p.pattern.bytes(o);
+        if (o.flags & ir.op_nocase != 0) {
+            if (!std.ascii.eqlIgnoreCase(want, data[at..][0..o.len])) return null;
+        } else if (!std.mem.eql(u8, want, data[at..][0..o.len])) return null;
+    }
     if (!try vm.atPartStart(a, anchor_start)) return null;
     if (try vm.fwd(a, vm.part_first[a], anchor_start) != .ok) return null;
     return .{ .start = vm.start, .end = vm.end };
@@ -485,10 +512,14 @@ pub const Scanner = struct {
             var anchor_start: usize = undefined;
             if (h.anchor_op != prog.no_anchor) {
                 const o = s.program.pattern.ops[h.anchor_op];
+                // The whole anchor literal, not just its first byte: over zero padding an anchor
+                // starting with 00 would otherwise make every byte a candidate.
+                const lit = s.program.pattern.bytes(o);
+                const hay = d[0..@min(d.len, limit +| lit.len)];
                 const at = if (o.flags & ir.op_nocase == 0)
-                    std.mem.indexOfScalarPos(u8, d[0..@min(d.len, limit + 1)], s.pos, s.program.pattern.bytes(o)[0]) orelse return null
+                    std.mem.indexOfPos(u8, hay, s.pos, lit) orelse return null
                 else
-                    s.pos;
+                    std.ascii.findIgnoreCasePos(hay, s.pos, lit) orelse return null;
                 s.pos = at + 1;
                 if (at < h.anchor_delta) continue;
                 anchor_start = at - h.anchor_delta;

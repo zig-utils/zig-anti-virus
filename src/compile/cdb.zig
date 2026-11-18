@@ -65,7 +65,16 @@ fn range(text: []const u8) error{BadCdbField}!?ir.Range {
 }
 
 /// Compile a regex to a serialised byte-mode program in `arena`.
+/// How a regex reports matches: PCRE subsigs and YARA regex strings are leftmost-first, as PCRE
+/// and yara are (match ends decide /g counts and string offsets); a .cdb filename regex is only
+/// asked whether it matches, where both kinds agree.
+pub const MatchKind = regex.program.MatchKind;
+
 pub fn compileRegex(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
+    return compileRegexKind(arena, pattern_in, flags, .leftmost_longest);
+}
+
+pub fn compileRegexKind(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags, kind: MatchKind) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
     var f = flags;
     f.bytes = true;
     // A leading option setting such as `(?i)` or `(?si)` applies to the whole pattern in PCRE
@@ -87,7 +96,7 @@ pub fn compileRegex(arena: std.mem.Allocator, pattern_in: []const u8, flags: reg
             pattern = pattern[i + 1 ..];
         }
     }
-    const program = regex.Program.compile(arena, pattern, f) catch |err| return switch (err) {
+    const program = regex.Program.compileWithOptions(arena, pattern, f, .{ .match_kind = kind }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.UnsupportedByProgram, error.ProgramTooLarge => error.RegexUnsupported,
         else => error.RegexSyntax,

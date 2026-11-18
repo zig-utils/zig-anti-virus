@@ -7,6 +7,9 @@
       generated from the pattern (strings it should match, near misses, filler).
   realdb.py bytecompare --db DIR... --out FILE
       One case per byte-compare subsignature, with values on both sides of each comparison.
+  realdb.py gate --db DIR... --out DIR [--limit N]
+      Raw-file samples built from the target-0 .ndb and .ldb bodies (the P4.21 gate corpus): scan
+      them with the whole databases on both sides (gate.py).
   realdb.py corpus [--db DIR...] [--yara PATH...] --out FILE
       The E13 corpus (tools/diff/e13.zig): every PCRE subsig and every YARA regex string, each
       with generated subjects.
@@ -353,6 +356,129 @@ def gen_corpus(args):
     print("realdb.py: %d patterns in the E13 corpus" % n)
 
 
+# Samples from hex bodies (the P4.21 gate corpus) ------------------------------------------------
+
+WORD_BEFORE = b" "
+LINE = b"\n"
+
+
+def body_bytes(body):
+    """Bytes a ClamAV hex body matches (minimal choices), or None when it cannot be built."""
+    out = bytearray()
+    i = 0
+    n = len(body)
+    while i < n:
+        c = body[i]
+        if c in "0123456789abcdefABCDEF?" and i + 1 < n:
+            hi, lo = body[i], body[i + 1]
+            v = (int(hi, 16) if hi != "?" else 4) << 4 | (int(lo, 16) if lo != "?" else 1)
+            out.append(v)
+            i += 2
+        elif c == "*":
+            i += 1
+        elif c == "{":
+            j = body.index("}", i)
+            spec = body[i + 1:j]
+            lo = spec.split("-")[0]
+            out += b"x" * (int(lo) if lo else 0)
+            i = j + 1
+        elif c == "[":
+            j = body.index("]", i)
+            out += b"x" * int(body[i + 1:j].split("-")[0])
+            i = j + 1
+        elif body.startswith("!(", i):
+            j = body.index(")", i)
+            alts = [bytes.fromhex(a) for a in body[i + 2:j].split("|")]
+            width = len(alts[0])
+            pick = next(bytes([b] * width) for b in range(256) if bytes([b] * width) not in alts)
+            out += pick
+            i = j + 1
+        elif body.startswith("(B)", i) or body.startswith("(W)", i):
+            out += b" "
+            i += 3
+        elif body.startswith("(L)", i):
+            out += b"\n"
+            i += 3
+        elif c == "(":
+            j = body.index(")", i)
+            first = body[i + 1:j].split("|")[0]
+            sub = body_bytes(first)
+            if sub is None:
+                return None
+            out += sub
+            i = j + 1
+        elif c == "~":
+            v = int(body[i + 1:i + 3].replace("?", "0"), 16)
+            out.append((v + 1) & 0xFF)
+            i += 3
+        else:
+            return None
+    return bytes(out)
+
+
+BIN = b"\xde\xad\xbe\xef\x00\x00\x00\x00"
+
+
+def gen_gate(args):
+    os.makedirs(args.out, exist_ok=True)
+    made = skipped = 0
+    rng = random.Random(1)
+    lines = list(db_lines(args.db, ("ndb", "ndu", "ldb", "ldu")))
+    if args.limit and len(lines) > args.limit:
+        lines = rng.sample(lines, args.limit)
+    for name, line_no, line in lines:
+        if name.endswith(("ndb", "ndu")):
+            f = line.split(":")
+            if len(f) < 4 or f[1] != "0":
+                continue
+            subs = [(f[2], f[3])]
+        else:
+            f = ldb_fields(line)
+            if len(f) < 4 or ",Target:0" not in "," + f[1] and not f[1].startswith("Target:0"):
+                continue
+            subs = []
+            for sub in f[3:]:
+                if is_pcre(sub) or is_byte_compare(sub) or sub.startswith(("${", "fuzzy_img#")):
+                    continue
+                body = sub.split("::")[0]
+                off = "*"
+                if ":" in body:
+                    off, body = body.rsplit(":", 1)
+                subs.append((off, body))
+        data = bytearray(BIN)
+        trailer = bytearray(BIN)
+        ok = True
+        for off, body in subs:
+            b = body_bytes(body)
+            if b is None:
+                ok = False
+                break
+            if off == "*":
+                data += b + b" "
+            elif off.isdigit():
+                at = int(off)
+                if at < len(data):
+                    ok = False
+                    break
+                data += b"\x00" * (at - len(data)) + b
+            elif off.startswith("EOF-") and off[4:].isdigit():
+                k = int(off[4:])
+                if k < len(b):
+                    ok = False
+                    break
+                trailer = bytearray(b + b"\x00" * (k - len(b)))
+            else:
+                ok = False
+                break
+        if not ok or not subs:
+            skipped += 1
+            continue
+        made += 1
+        with open(os.path.join(args.out, "g%06d" % made), "wb") as fh:
+            fh.write(bytes(data) + bytes(trailer))
+    print("realdb.py: %d gate samples, %d signatures skipped (offsets or bodies the generator does not build)" % (made, skipped))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -363,12 +489,16 @@ def main():
     b = sub.add_parser("bytecompare")
     b.add_argument("--db", action="append", required=True)
     b.add_argument("--out", required=True)
+    g = sub.add_parser("gate")
+    g.add_argument("--db", action="append", required=True)
+    g.add_argument("--out", required=True)
+    g.add_argument("--limit", type=int, default=0)
     c = sub.add_parser("corpus")
     c.add_argument("--db", action="append", default=[])
     c.add_argument("--yara", action="append", default=[])
     c.add_argument("--out", required=True)
     args = ap.parse_args()
-    return {"pcre": gen_pcre, "bytecompare": gen_bytecompare, "corpus": gen_corpus}[args.cmd](args)
+    return {"pcre": gen_pcre, "bytecompare": gen_bytecompare, "corpus": gen_corpus, "gate": gen_gate}[args.cmd](args)
 
 
 if __name__ == "__main__":

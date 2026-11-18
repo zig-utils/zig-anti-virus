@@ -549,9 +549,9 @@ test "byte-compare subsignatures: every encoding, width and endianness option" {
 /// true without any hits (sparse evaluation would never run it); the pattern is everything
 /// between the first and the last `/`. Flags: `g` count all matches, `r` rolling search from the
 /// offset, `e` confine the match to offset..offset+maxshift (needs a maxshift), `A` anchored,
-/// and `i s m x` for the regex. `E` (dollar end-only) and `U` (ungreedy) do not change whether
-/// or where a match starts, so they are accepted, except `U` with `g`, whose counts depend on
-/// match ends.
+/// and `i s m x` for the regex. Programs are leftmost-first, as PCRE; `U` (ungreedy) compiles
+/// as a leading `(?U)`, and without `E` or `m` a `$` also matches before a final newline
+/// (`PcreFlags.dollar_eol`, applied at match time).
 pub fn parsePcre(arena: std.mem.Allocator, text: []const u8, first_slash: usize, index: usize, target: u8) LineError!ir.PcreSubsig {
     const last = std.mem.lastIndexOfScalar(u8, text, '/').?;
     if (last == first_slash or last == first_slash + 1) return error.BadPcre;
@@ -572,6 +572,7 @@ pub fn parsePcre(arena: std.mem.Allocator, text: []const u8, first_slash: usize,
 
     var flags: regex_flags = .{ .bytes = true };
     var ungreedy = false;
+    var dollar_end_only = false;
     for (text[last + 1 ..]) |c| switch (c) {
         'g' => pcre.flags.global = true,
         'r' => pcre.flags.rolling = true,
@@ -581,18 +582,34 @@ pub fn parsePcre(arena: std.mem.Allocator, text: []const u8, first_slash: usize,
         's' => flags.dot_all = true,
         'm' => flags.multiline = true,
         'x' => flags.extended = true,
-        'E' => {},
+        'E' => dollar_end_only = true,
         'U' => ungreedy = true,
         else => return error.BadPcre,
     };
+    if (!dollar_end_only and !flags.multiline and hasDollar(pcre.pattern)) pcre.flags.dollar_eol = true;
     // libclamav ignores `e` without a maxshift: the subsig reads as if `e` were absent.
     if (pcre.offset.shift == 0) pcre.flags.encompass = false;
-    if (ungreedy and pcre.flags.global) return error.PcreFlagUnsupported;
-    pcre.program = try cdb.compileRegex(arena, pcre.pattern, flags);
+    // U swaps greedy and lazy repetition; zig-regex reads the same thing from a leading (?U).
+    const pattern = if (ungreedy) try std.mem.concat(arena, u8, &.{ "(?U)", pcre.pattern }) else pcre.pattern;
+    pcre.program = try cdb.compileRegexKind(arena, pattern, flags, .leftmost_first);
     return pcre;
 }
 
 const regex_flags = @import("regex").common.CompileFlags;
+
+/// An unescaped `$` outside a character class.
+fn hasDollar(pattern: []const u8) bool {
+    var i: usize = 0;
+    var class = false;
+    while (i < pattern.len) : (i += 1) switch (pattern[i]) {
+        '\\' => i += 1,
+        '[' => class = true,
+        ']' => class = false,
+        '$' => if (!class) return true,
+        else => {},
+    };
+    return false;
+}
 
 test "pcre subsignatures: offsets, triggers, flags, compile failures" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -621,7 +638,6 @@ test "pcre subsignatures: offsets, triggers, flags, compile failures" {
         .{ "1/abc/", 1, error.BadPcre }, // names itself
         .{ "/abc/", 1, error.BadPcre },
         .{ "0/abc/q", 1, error.BadPcre },
-        .{ "0/abc/gU", 1, error.PcreFlagUnsupported },
         .{ "0=0/abc/", 1, error.ExprTrueWithoutHits },
         .{ "EP+0:0/abc/", 1, error.OffsetNeedsExecutable },
         .{ "0/(ab/", 1, error.RegexSyntax },

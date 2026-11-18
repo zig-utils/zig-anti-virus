@@ -9,9 +9,11 @@ it on every push against the current databases and the public rule set below.
 - Patterns: every PCRE subsignature of ClamAV main 63 and daily 28187 (1223), and every regex string
   of the Yara-Rules public rule set (github.com/Yara-Rules/rules, 366). Nothing derived from either is
   committed.
-- zav side: each pattern compiled exactly as zav compiles it (`compile.cdb.compileRegex`: zig-regex
-  0.3.1 byte mode, flags `i s m x` mapped, a leading `(?i)`-style option group taken as the compile
-  flag), searched with `Program.findFrom` from offset 0.
+- zav side: each pattern compiled exactly as zav compiles it (`compile.cdb.compileRegexKind`:
+  zig-regex 0.4.0 byte mode, leftmost-first, flags `i s m x` mapped, `U` as a leading `(?U)`, a
+  leading `(?i)`-style option group taken as the compile flag), searched with `Program.findFrom` from
+  offset 0; for PCRE subsigs without `E` or `m`, a `$` may also match before a final newline, as zav
+  runs them (`PcreFlags.dollar_eol`).
 - PCRE2 10.49 (Linux CI: the distribution's libpcre2), no UTF, the same flags plus `E`
   (DOLLAR_ENDONLY) and `U` (UNGREEDY), match limit 1,000,000.
 - Subjects: for each pattern, strings generated from its parse tree (a minimal match, a longer one,
@@ -22,8 +24,12 @@ it on every push against the current databases and the public rule set below.
 
 | | patterns | compile in both | PCRE2 only | subjects | agree | same start, other end | disagree | limited |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ClamAV PCRE | 1223 | 1159 | 64 | 23,867 | 23,789 | 71 | 6 | 1 |
-| YARA regex | 366 | 366 | 0 | 7,273 | 7,223 | 8 | 42 | 0 |
+| ClamAV PCRE | 1223 | 1159 | 64 | 23,867 | 23,866 | 0 | 0 | 1 |
+| YARA regex | 366 | 366 | 0 | 7,273 | 7,231 | 0 | 42 | 0 |
+
+With zig-regex 0.3.1 (leftmost-longest only, `$` end-only, `U` ignored) the same corpus gave 79
+subjects with a different match end and 6 ClamAV disagreements; zig-regex 0.4.0's leftmost-first
+programs, `(?U)` for `U` and the final-newline search for `$` remove all of them.
 
 zig-regex never compiles a pattern PCRE2 refuses. Separately, the isolated libclamav differential
 (`realdb.py pcre` with `clamav.py`) runs all 1223 PCRE subsigs through clamscan: the 1159 zav compiles
@@ -37,15 +43,17 @@ agree with libclamav on all 9,867 generated samples (4,140 of them matches).
    inline modifiers (`regex_unsupported`). **Unsupported, with a reason:** these need a backtracking
    matcher, and zav runs only allocation-free byte-mode programs with step budgets. Each refusal is a
    named reason in the coverage report; the signatures are counted, never silently dropped.
-2. **79 subjects with the same match start and a different end.** zig-regex's Thompson programs
-   report leftmost-longest ends; PCRE is leftmost-first. Starts and the match/no-match decision agree,
-   so a signature's verdict is the same except for PCRE `/g` counts of patterns like `a|aba`
-   (`pcre-global` in tests/differential/cases/pcre.case, listed in known.txt). **Pending upstream:**
-   a leftmost-first mode is being added to zig-regex; zav adopts it with the release that ships it.
-3. **6 ClamAV subjects: `$` before a final newline.** PCRE's `$` (without `E` or `m`) also matches
-   before a newline that ends the subject; zig-regex's matches only at the end. Affects
-   `/<\/svg>$/`-style subsigs on data ending in LF. **Unsupported for now, listed:** known.txt
-   `pcre-basic s8`; zig-regex needs an opt-in PCRE-dollar flag (zig-utils/zig-regex#51).
+2. **Match ends** (79 subjects under 0.3.1). zig-regex's Thompson programs reported
+   leftmost-longest ends; PCRE and yara are leftmost-first. **Fixed upstream:** zig-regex 0.4.0's
+   `MatchKind.leftmost_first`, which zav uses for PCRE subsigs and YARA regex strings (`.cdb` filename
+   regexes are only asked whether they match and keep the default). PCRE's `U` flag, accepted but
+   ignored before, now compiles as a leading `(?U)`, so ungreedy ends agree too; `U` with `g` is no
+   longer refused. `pcre-global` in tests/differential/cases/pcre.case now agrees with libclamav.
+3. **`$` before a final newline** (6 ClamAV subjects under 0.3.1). PCRE's `$` without `E` or `m` also
+   matches before a newline that ends the subject; zig-regex's `$` is end-only, as yara's is.
+   **Fixed in zav:** a PCRE subsig with such a `$` is searched a second time without the final
+   newline when the first search finds nothing (or, with `g`, the larger count wins), which gives
+   `$` exactly PCRE's extra position. `pcre-basic` agrees with libclamav.
 4. **42 YARA subjects.** Two causes:
    - `{,n}` (empty lower bound): yara and PCRE2 10.43+ read `{0,n}`, zig-regex reads it literally,
      so `/\/gate.php\?token=.{,10}&host=/` and similar never match. **Upstream:** zig-regex needs
@@ -60,6 +68,5 @@ agree with libclamav on all 9,867 generated samples (4,140 of them matches).
 
 - zav keeps zig-regex byte mode for PCRE subsigs and YARA regexes; every pattern it cannot run
   exactly is refused with a reason rather than approximated.
-- The one semantic difference that changes verdicts on real signatures today is the `$`-before-LF
-  case (six generated subjects across 1223 subsigs); the `/g` count difference needs alternations
-  whose alternatives overlap, which no generated subject of the real subsigs exposed.
+- Every PCRE subsig zav compiles now agrees with PCRE2 on every generated subject; what is left are
+  the 64 refusals (backtracking constructs, item 1) and yara's `{,n}` (item 4, zig-utils/zig-regex#51).

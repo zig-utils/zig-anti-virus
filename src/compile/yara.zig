@@ -529,7 +529,7 @@ fn parseRegex(p: *Parser) ParseError!StringDef {
         if (pattern[j] == '\\' and j + 1 < pattern.len and pattern[j + 1] == '/') continue;
         try unescaped.append(p.arena, pattern[j]);
     }
-    const program = cdb.compileRegex(p.arena, unescaped.items, flags) catch |err| return p.failAt(at, err);
+    const program = cdb.compileRegexKind(p.arena, unescaped.items, flags, .leftmost_first) catch |err| return p.failAt(at, err);
     return .{ .regex = program };
 }
 

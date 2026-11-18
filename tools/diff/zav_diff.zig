@@ -1090,7 +1090,18 @@ fn scanCmd(app: App, args: []const []const u8) !u8 {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (in_targets) {
-            try targets.append(app.arena, a);
+            // A directory stands for the files in it, in name order.
+            var dir = Io.Dir.cwd().openDir(app.io, a, .{ .iterate = true }) catch {
+                try targets.append(app.arena, a);
+                continue;
+            };
+            defer dir.close(app.io);
+            const first = targets.items.len;
+            var it = dir.iterate();
+            while (try it.next(app.io)) |entry| {
+                if (entry.kind == .file) try targets.append(app.arena, try std.fs.path.join(app.arena, &.{ a, entry.name }));
+            }
+            std.mem.sort([]const u8, targets.items[first..], {}, lessString);
         } else if (std.mem.eql(u8, a, "--")) {
             in_targets = true;
         } else if (std.mem.eql(u8, a, "--tmp") and i + 1 < args.len) {
@@ -1114,6 +1125,15 @@ fn scanCmd(app: App, args: []const []const u8) !u8 {
     // Every signature as a (file name, line) pair; whole files when not per-sig.
     const Unit = struct { name: []const u8, text: []const u8 };
     var units: std.ArrayList(Unit) = .empty;
+    // Ignore lists first: the compiler takes them before the signatures they name.
+    std.mem.sort([]const u8, sig_files.items, {}, struct {
+        fn ign(p: []const u8) bool {
+            return std.mem.endsWith(u8, p, ".ign2") or std.mem.endsWith(u8, p, ".ign");
+        }
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return ign(a) and !ign(b);
+        }
+    }.less);
     for (sig_files.items) |path| {
         const text = try cwd.readFileAlloc(app.io, path, app.arena, .limited(1 << 30));
         const base = std.fs.path.basename(path);

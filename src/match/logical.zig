@@ -329,16 +329,29 @@ pub const State = struct {
             }
         }
         if (pr.flags.anchored) start_hi = lo;
+        var hits = s.searchPcre(program, scratch, input, lo, start_hi, pr.flags.global) orelse return 0;
+        // PCRE's default `$` also matches before a final newline; zig-regex's only at the end.
+        // Searching without that newline gives `$` the position PCRE allows it.
+        if (pr.flags.dollar_eol and input.len > 0 and input[input.len - 1] == '\n' and (hits == 0 or pr.flags.global)) {
+            const again = s.searchPcre(program, scratch, input[0 .. input.len - 1], lo, start_hi, pr.flags.global) orelse return hits;
+            hits = @max(hits, again);
+        }
+        return hits;
+    }
+
+    /// Matches of a PCRE program starting in [lo, start_hi]: the first, or with `global` every
+    /// non-overlapping one. Null (and `regex_limited`) when the step budget ran out first.
+    fn searchPcre(s: *State, program: anytype, scratch: anytype, input: []const u8, lo: usize, start_hi: usize, global: bool) ?u32 {
         var hits: u32 = 0;
         var pos = lo;
         while (pos <= input.len) {
             const m = (program.findFrom(scratch, input, pos) catch {
                 s.regex_limited = true;
-                return hits;
+                return if (hits == 0) null else hits;
             }) orelse break;
             if (m.start > start_hi) break;
             hits +|= 1;
-            if (!pr.flags.global) break;
+            if (!global) break;
             pos = if (m.end > m.start) m.end else m.start + 1;
         }
         return hits;

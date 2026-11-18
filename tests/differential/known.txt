@@ -11,13 +11,6 @@ hex-bracket-before-far s5 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.F
 # ~aa and ~a? are documented for functionality level 240; libclamav 1.5 does not parse them yet.
 hex-negated-nibble sig1 zav=LOADS
 hex-negated-nibble sig2 zav=LOADS
-# PCRE through zig-regex byte mode (E13, #36). zig-regex reports leftmost-longest match ends where
-# PCRE is leftmost-first, which changes /g counts for patterns like a|aba.
-pcre-global s7 zav=OK
-pcre-global s8 zav=OK
-pcre-global s9 zav=Diff.Pcre.GlobalAlt
-# zig-regex's $ matches only at the end; PCRE's default (no E flag) also matches before a final LF.
-pcre-basic s8 zav=OK
 # Backreferences and lookaround need a backtracker; zav compiles only allocation-free byte-mode
 # programs and refuses them (regex_unsupported), so these signatures never load.
 pcre-syntax sig5 zav=REJECTS

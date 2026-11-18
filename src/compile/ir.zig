@@ -499,7 +499,10 @@ pub const PcreFlags = packed struct(u8) {
     encompass: bool = false,
     /// `A`: the match starts exactly where the search starts.
     anchored: bool = false,
-    _: u4 = 0,
+    /// The pattern has a `$` that, without `E` or `m`, PCRE also lets match before a final
+    /// newline.
+    dollar_eol: bool = false,
+    _: u3 = 0,
 };
 
 /// `[Offset:]Trigger/Pattern/[Flags]`: runs only when `trigger` (over earlier subsigs) is true.

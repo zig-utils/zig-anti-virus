@@ -335,7 +335,7 @@ pub const LdbTable = struct {
                 const trig = table.rpn[pr.trigger_off..][0..pr.trigger_len];
                 if (!checkRpn(trig, pr.subsig)) return error.BadLdbTable;
                 if (pr.regex >= nregex) return error.BadLdbTable;
-                if (@as(u8, @bitCast(pr.flags)) & 0xf0 != 0) return error.BadLdbTable;
+                if (@as(u8, @bitCast(pr.flags)) & 0xe0 != 0) return error.BadLdbTable;
                 if (@backingInt(pr.off_kind) > @backingInt(ir.OffsetKind.last_section)) return error.BadLdbTable;
                 counts_needed = counts_needed or usesCounts(trig);
             }
