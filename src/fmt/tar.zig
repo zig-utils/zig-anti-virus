@@ -160,6 +160,7 @@ pub fn walk(w: *Walker, cursor: *archive.Cursor) Error!void {
             else => true,
         };
         if (has_data and size > 0) {
+            cursor.container_type = if (std.mem.eql(u8, h.field(257, 5), "ustar")) .posix_tar else .old_tar;
             if (!try cursor.member(name, size, .member)) return;
             cursor.skip(padded - size) catch return;
         } else {

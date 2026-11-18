@@ -32,8 +32,11 @@ pub const CdbHook = struct {
     /// Check one member and report a match (or an undecidable regex) as a notice at the
     /// member's path. Callers push the member name first.
     pub fn check(hook: *const CdbHook, w: *Walker, member: cdb_match.Member) void {
-        const sig = hook.table.check(member, hook.scratch) catch {
-            w.limit(.regex_steps);
+        const sig = hook.table.check(member, hook.scratch) catch |err| {
+            w.limit(switch (err) {
+                error.RegexBudget => .regex_steps,
+                error.UnknownContainerSize => .container_size_unknown,
+            });
             return;
         } orelse return;
         w.notice(.{ .container_signature = sig }, "cdb");

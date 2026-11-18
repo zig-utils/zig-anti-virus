@@ -75,6 +75,11 @@ pub fn walk(w: *Walker, cursor: *archive.Cursor) container.Error!void {
         if (std.mem.eql(u8, name, "TRAILER!!!")) return;
         const is_regular = (mode & 0o170000) == 0o100000;
         if (is_regular and file_size > 0) {
+            cursor.container_type = switch (variant) {
+                .newc => if (std.mem.eql(u8, &magic, "070702")) .cpio_crc else .cpio_newc,
+                .odc => .cpio_odc,
+                .bin_le, .bin_be => .cpio_old,
+            };
             if (!try cursor.member(name, file_size, .member)) return;
         } else {
             cursor.skip(file_size) catch |e| return end(w, e, false);

@@ -87,7 +87,8 @@ comptime {
 /// What the container layer knows about one member.
 pub const Member = struct {
     container_type: types.ClType,
-    container_size: u64,
+    /// Null when the container arrives as a stream of unknown length.
+    container_size: ?u64,
     name: []const u8,
     /// Stored (usually compressed) size; equal to `size_real` for mail, tar and cpio.
     size_in_container: u64,
@@ -122,11 +123,20 @@ pub const CdbTable = struct {
     }
 
     /// The first signature matching this member, or null. Called once per member. `scratch`
-    /// must fit `regexes.capacity` when any record has a filename regex; a regex search that
-    /// runs out of its step budget is reported (`error.RegexBudget`), never taken as no match.
-    pub fn check(t: CdbTable, m: Member, scratch: ?*regex.Scratch) error{RegexBudget}!?u32 {
+    /// must fit `regexes.capacity` when any record has a filename regex. A record that cannot
+    /// be decided is reported, never taken as no match: `error.RegexBudget` when a regex search
+    /// ran out of steps (or there is no scratch), `error.UnknownContainerSize` when a record
+    /// constrains the container size and the container is a stream of unknown length.
+    pub fn check(t: CdbTable, m: Member, scratch: ?*regex.Scratch) error{ RegexBudget, UnknownContainerSize }!?u32 {
         var limited = false;
+        var unknown_size = false;
         for (t.records) |rec| {
+            if (rec.flags & has_container_size != 0 and m.container_size == null) {
+                var known = rec;
+                known.flags &= ~has_container_size;
+                if (matches(known, m)) unknown_size = true;
+                continue;
+            }
             if (!matches(rec, m)) continue;
             if (rec.flags & has_regex != 0) {
                 const s = scratch orelse {
@@ -143,6 +153,7 @@ pub const CdbTable = struct {
             return rec.sig;
         }
         if (limited) return error.RegexBudget;
+        if (unknown_size) return error.UnknownContainerSize;
         return null;
     }
 };
@@ -154,7 +165,10 @@ fn within(r: [2]u64, v: u64) bool {
 pub fn matches(rec: CdbRecord, m: Member) bool {
     const f = rec.flags;
     if (f & has_container != 0 and rec.container != @backingInt(m.container_type)) return false;
-    if (f & has_container_size != 0 and !within(rec.container_size, m.container_size)) return false;
+    if (f & has_container_size != 0) {
+        const size = m.container_size orelse return false;
+        if (!within(rec.container_size, size)) return false;
+    }
     if (f & has_size_in_container != 0 and !within(rec.size_in_container, m.size_in_container)) return false;
     if (f & has_size_real != 0 and !within(rec.size_real, m.size_real)) return false;
     if (f & has_encrypted != 0 and m.encrypted != (f & encrypted_value != 0)) return false;
@@ -245,6 +259,11 @@ test "member checks: every field, wildcards, the ZIP/RAR CRC rule and filename r
     scratch.step_budget = 1;
     try std.testing.expectError(error.RegexBudget, t.check(m, &scratch));
     scratch.step_budget = null;
+
+    // A container size the record needs but a stream does not tell: undecided, reported.
+    m = zip;
+    m.container_size = null;
+    try std.testing.expectError(error.UnknownContainerSize, t.check(m, &scratch));
 
     // A corrupted table is refused or still only ever reads its own records.
     for (0..image.len) |i| {

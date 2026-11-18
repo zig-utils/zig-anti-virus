@@ -7,6 +7,7 @@ const Io = std.Io;
 const container = @import("../engine/container.zig");
 const Source = @import("../engine/source.zig").Source;
 const Walker = container.Walker;
+const ClType = @import("types.zig").ClType;
 
 pub const Cursor = struct {
     w: *Walker,
@@ -14,6 +15,11 @@ pub const Cursor = struct {
     positional: ?Source = null,
     reader: ?*Io.Reader = null,
     off: u64 = 0,
+    /// For `.cdb` checks: the archive's type (set by the format walker as it learns it), its
+    /// size when known, and the 1-based position of the last member handed out.
+    container_type: ClType = .any,
+    container_size: ?u64 = null,
+    position: u32 = 0,
 
     pub const ReadError = error{ EndOfStream, ReadFailed };
 
@@ -49,6 +55,21 @@ pub const Cursor = struct {
     /// past the end of a positional archive is scanned as far as it goes and reported malformed;
     /// false then tells the caller nothing follows.
     pub fn member(c: *Cursor, name: []const u8, size: u64, kind: container.Kind) container.Error!bool {
+        c.position +|= 1;
+        if (c.w.options.cdb) |hook| {
+            // tar and cpio store members as they are: one size, no encryption, no CRC kept.
+            c.w.path.push(name);
+            defer c.w.path.pop();
+            hook.check(c.w, .{
+                .container_type = c.container_type,
+                .container_size = if (c.positional) |src| src.len().? else c.container_size,
+                .name = name,
+                .size_in_container = size,
+                .size_real = size,
+                .encrypted = false,
+                .position = c.position,
+            });
+        }
         if (c.positional) |src| {
             const avail = @min(size, src.len().? -| c.off);
             if (avail < size) c.w.notice(.malformed, "member runs past the end of the archive");

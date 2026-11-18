@@ -97,11 +97,11 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     switch (obj.format) {
         .gzip, .bzip2, .xz, .zstd => try decompress(w, obj, &tee.interface, &tee.pulled),
         .tar => {
-            var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
+            var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface, .container_size = st.len_hint };
             try tar.walk(w, &cursor);
         },
         .cpio => {
-            var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
+            var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface, .container_size = st.len_hint };
             try cpio.walk(w, &cursor);
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
@@ -639,12 +639,17 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
         // The third member, stored: 68 bytes in and out, its CRC, not encrypted.
         try cdb.parseLine(arena, "Zip.Eicar.Meta-1-0:CL_TYPE_ZIP:*:eicar\\.com$:68:68:0:3:6851cf3c:*", &column),
         try cdb.parseLine(arena, "Zip.Encrypted-2-0:CL_TYPE_ZIP:*:^secret:*:*:1:*:*:*", &column),
+        // tar and cpio: the third file, by type and position; the cpio CRC variant is its own type.
+        try cdb.parseLine(arena, "Tar.Eicar-3-0:CL_TYPE_POSIX_TAR:*:eicar\\.com$:68:68:0:3:*:*", &column),
+        try cdb.parseLine(arena, "Cpio.Bin-4-0:CL_TYPE_CPIO_NEWC:*:^b\\.bin$:3000:*:*:2:*:*", &column),
+        // Needs the container's size, which a stream does not carry: decided on positional scans.
+        try cdb.parseLine(arena, "Cpio.Sized-5-0:CL_TYPE_CPIO_CRC:1-100000:*:68:*:*:*:*:*", &column),
     };
-    const pool_bytes = try regex_pool.build(arena, &.{ rules[0].filename_program.?, rules[1].filename_program.? });
+    const pool_bytes = try regex_pool.build(arena, &.{ rules[0].filename_program.?, rules[1].filename_program.?, rules[2].filename_program.?, rules[3].filename_program.? });
     const pool_image = try arena.alignedAlloc(u8, .@"8", pool_bytes.len);
     @memcpy(pool_image, pool_bytes);
     const pool = try regex_pool.RegexPool.init(pool_image);
-    const table_bytes = try cdb_match.build(arena, &rules, &.{ 1, 2 }, &.{ 0, 1 });
+    const table_bytes = try cdb_match.build(arena, &rules, &.{ 1, 2, 3, 4, 5 }, &.{ 0, 1, 2, 3, null });
     const table_image = try arena.alignedAlloc(u8, .@"8", table_bytes.len);
     @memcpy(table_image, table_bytes);
     const capacity = pool.capacity(64);
@@ -657,6 +662,9 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
         .{ "stored.zip", 1, "stored.zip/eicar.com" },
         .{ "deflate.zip", null, "" }, // compressed: the stored size differs
         .{ "encrypted.zip", 2, "encrypted.zip/secret.bin" },
+        .{ "ustar.tar", 3, "ustar.tar/eicar.com" },
+        .{ "newc.cpio", 4, "newc.cpio/b.bin" },
+        .{ "crc.cpio", 5, "crc.cpio/eicar.com" },
     }) |c| {
         const a = for (fixtures.archives) |x| {
             if (std.mem.eql(u8, x.name, c[0])) break x;
@@ -672,5 +680,7 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
             try std.testing.expectEqualStrings(c[2], n.path);
         };
         try std.testing.expectEqual(c[1], hit);
+        // The streamed pass cannot tell the cpio's size: that record is reported undecided.
+        if (std.mem.eql(u8, c[0], "crc.cpio")) try std.testing.expect(rig.rec.hasLimit(.container_size_unknown));
     }
 }
