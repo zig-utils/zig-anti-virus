@@ -14,6 +14,7 @@ const targets = [_]Target{
     .{ .name = "hostHardening", .run = hostHardening },
     .{ .name = "cveVersion", .run = cveVersion },
     .{ .name = "macosPlist", .run = macosPlist },
+    .{ .name = "cveFeeds", .run = cveFeeds },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -244,5 +245,36 @@ pub fn macosPlist(gpa: std.mem.Allocator, random: std.Random) !void {
         const fixture = macho.buildFixture(&m, if (random.boolean()) .signed else .adhoc);
         var bytes: []const u8 = mutateCopy(random, &buf, fixture);
         _ = macho.classify(.fromSlice(&bytes));
+    }
+}
+
+/// KEV, NVD 2.0 and OSV JSON, CPE strings and OSV export zips.
+pub fn cveFeeds(gpa: std.mem.Allocator, random: std.Random) !void {
+    const feeds = zav.cve.feeds;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [16 * 1024]u8 = undefined;
+    switch (random.uintLessThan(u8, 5)) {
+        0 => _ = feeds.parseKev(a, mutateCopy(random, &buf, feeds.fixtures.kev)) catch {},
+        1 => if (feeds.parseNvdPage(a, mutateCopy(random, &buf, feeds.fixtures.nvd_log4shell))) |page| {
+            for (page.vulnerabilities) |v| {
+                _ = v.cve.cvss();
+                for (v.cve.configurations) |c| for (c.nodes) |n| for (n.cpeMatch) |m| {
+                    _ = feeds.Cpe.parse(m.criteria);
+                };
+            }
+        } else |_| {},
+        2 => if (feeds.parseOsv(a, mutateCopy(random, &buf, feeds.fixtures.osv_lodash))) |v| {
+            var ids: [8][]const u8 = undefined;
+            _ = v.cves(&ids);
+        } else |_| {},
+        3 => _ = feeds.Cpe.parse(mutateCopy(random, &buf, "cpe:2.3:a:apache:log4j:2.0:beta9:*:*:*:*:*:*")),
+        else => {
+            const Sink = struct {
+                fn each(_: void, _: []const u8) !void {}
+            };
+            _ = feeds.osvZipRecords(gpa, mutateCopy(random, &buf, feeds.fixtures.osv_zip), {}, Sink.each) catch {};
+        },
     }
 }

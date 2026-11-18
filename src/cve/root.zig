@@ -2,7 +2,9 @@
 //! See docs/DESIGN.md section 4.4.
 
 pub const version = @import("version.zig");
+pub const feeds = @import("feeds.zig");
 
 test {
     _ = version;
+    _ = feeds;
 }
