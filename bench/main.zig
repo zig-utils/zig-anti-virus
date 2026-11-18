@@ -322,9 +322,13 @@ fn normDiscard(_: *anyopaque, bytes: []const u8) error{Stop}!void {
 
 fn htmlNormalize() void {
     var ctx: u8 = 0;
-    var n = zav.fmt.html_norm.Normalizer.init(.normalized, .{ .ctx = &ctx, .write = normDiscard });
-    n.feed(norm_html) catch unreachable;
-    n.finish() catch unreachable;
+    const out: zav.fmt.html_norm.Output = .{ .ctx = &ctx, .write = normDiscard };
+    const S = struct {
+        var n: zav.fmt.html_norm.Normalizer = undefined;
+    };
+    S.n = .init(.{ .nocomment = out, .notags = out });
+    S.n.feed(norm_html) catch unreachable;
+    S.n.finish() catch unreachable;
 }
 
 fn textNormalize() void {

@@ -94,7 +94,13 @@ pub const Normalizer = struct {
     }
 
     pub fn finish(n: *Normalizer) Error!void {
-        try n.byte(' ');
+        // A space ends a pending word or number. Not inside a regex body: a script out of HTML
+        // ends with its end tag, whose `/script>` lexes as an unterminated regex that must not
+        // grow a space (libclamav's file then ends exactly with `</script>`).
+        switch (n.lex) {
+            .regex, .regex_class => {},
+            else => try n.byte(' '),
+        }
         switch (n.lex) {
             .string => try n.endString(),
             .regex, .regex_class, .regex_flags => try n.emitRegexEnd(),
@@ -746,10 +752,14 @@ test "scripts in HTML and PDF reach the normaliser as js children" {
     var crc = std.hash.Crc32.init();
     crc.update(want);
     var seen: usize = 0;
-    for (rig.rec.objects.items) |e| if (std.mem.eql(u8, e.path, "p.html/js/0")) {
+    // libclamav's `javascript` layout: the script between <script> and its own end tag.
+    const want_file = "<script>" ++ want ++ "</script>";
+    crc = std.hash.Crc32.init();
+    crc.update(want_file);
+    for (rig.rec.objects.items) |e| if (std.mem.eql(u8, e.path, "p.html/js")) {
         seen += 1;
         try std.testing.expectEqual(@import("../engine/container.zig").Kind.normalized_js, e.kind);
-        try std.testing.expectEqual(@as(u64, want.len), e.bytes);
+        try std.testing.expectEqual(@as(u64, want_file.len), e.bytes);
         try std.testing.expectEqual(crc.final(), e.crc);
     };
     try std.testing.expectEqual(@as(usize, 2), seen);

@@ -79,6 +79,9 @@ pub const Object = struct {
     /// Exact size for positional sources; a hint (untrusted header value) or null for streams.
     size: ?u64,
     entered: bool = false,
+    /// libclamav does not match the raw bytes of this object, only its derived streams: HTML
+    /// (DOCUMENT HTMLSKIPRAW). Matchers skip its data; its bytes still count as scanned.
+    skip_raw: bool = false,
 };
 
 /// A reportable condition found while walking. Limits are the clamd-equivalent events; the other

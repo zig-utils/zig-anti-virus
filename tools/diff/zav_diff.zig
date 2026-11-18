@@ -980,8 +980,9 @@ fn equalLoose(a: []const u8, b: []const u8) bool {
     }
 }
 
-/// `normalize text|html FILE`: zav's target-7 or target-3 normalised form of FILE on stdout,
-/// for comparison with libclamav's (tools/diff/norm.py).
+/// `normalize text|html|notags|js FILE`: zav's target-7 normalised text, or the target-3 forms
+/// of an HTML file (libclamav's nocomment.html, notags.html and `javascript`), on stdout, for
+/// comparison with libclamav's (tools/diff/norm.py).
 fn normalizeCmd(app: App, args: []const []const u8) !u8 {
     if (args.len != 2) return usage(app);
     const data = try Io.Dir.cwd().readFileAlloc(app.io, args[1], app.arena, .limited(1 << 30));
@@ -991,17 +992,46 @@ fn normalizeCmd(app: App, args: []const []const u8) !u8 {
         try app.out.writeAll(out[0..n.feed(data, out)]);
         return 0;
     }
-    if (!std.mem.eql(u8, args[0], "html")) return usage(app);
     const Sink = struct {
         list: std.ArrayList(u8) = .empty,
         arena: std.mem.Allocator,
+        js: zav.fmt.js_norm.Normalizer = undefined,
+        start: usize = 0,
         fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.list.appendSlice(self.arena, bytes) catch return error.Stop;
         }
+        // libclamav's `javascript` file: each script as <script>...</script>, newline separated.
+        fn begin(ctx: *anyopaque) error{Stop}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.list.items.len > 0) try write(ctx, "\n");
+            self.start = self.list.items.len;
+            try write(ctx, "<script>");
+            self.js = .init(.{ .ctx = ctx, .write = write });
+        }
+        fn piece(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.js.feed(bytes);
+        }
+        fn end(ctx: *anyopaque) error{Stop}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.js.finish();
+            const out = self.list.items[self.start..];
+            if (out.len < 9 or !std.mem.endsWith(u8, out, "</script>")) try write(ctx, "</script>");
+        }
     };
     var sink: Sink = .{ .arena = app.arena };
-    var norm = zav.fmt.html_norm.Normalizer.init(.normalized, .{ .ctx = &sink, .write = Sink.write });
+    const writer: zav.fmt.html_norm.Output = .{ .ctx = &sink, .write = Sink.write };
+    var outputs: zav.fmt.html_norm.Outputs = .{};
+    if (std.mem.eql(u8, args[0], "html")) {
+        outputs.nocomment = writer;
+    } else if (std.mem.eql(u8, args[0], "notags")) {
+        outputs.notags = writer;
+    } else if (std.mem.eql(u8, args[0], "js")) {
+        outputs.scripts = .{ .ctx = &sink, .begin = Sink.begin, .data = Sink.piece, .end = Sink.end };
+    } else return usage(app);
+    const norm = try app.arena.create(zav.fmt.html_norm.Normalizer);
+    norm.* = .init(outputs);
     norm.feed(data) catch {};
     norm.finish() catch {};
     try app.out.writeAll(sink.list.items);

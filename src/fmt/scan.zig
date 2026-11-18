@@ -311,23 +311,54 @@ fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
     }
 }
 
-/// The target type 3 stream of an HTML object (derived child "html"), then each script body as
-/// a derived child "script/<n>", then each script's normalised JavaScript as "js/<n>". Three
-/// passes over a positional source, bounded state, no whole-document buffer; input past
-/// MaxHTMLNormalize is reported and left unnormalised.
+/// libclamav's normalised forms of an HTML object (htmlnorm.c, scanned by cli_scanhtml), as
+/// derived children: "html" (nocomment.html) and "notags" (notags.html), both matched with target
+/// type 3; each script element's raw bytes as "script/<n>"; and "js", the normalised JavaScript
+/// laid out as libclamav's `javascript` file (each script as `<script>...</script>`, newline
+/// separated), which libclamav matches with target types 3 and 7. libclamav does not match the
+/// raw bytes of an HTML object at all (DOCUMENT HTMLSKIPRAW): `Object.skip_raw` says so.
+///
+/// One pass per output over a positional source, since derived children cannot interleave;
+/// bounded state, no whole-document buffer. Input past MaxHTMLNormalize is reported and left
+/// unnormalised, and notags is reported and skipped past MaxHTMLNoTags, as libclamav skips it.
 fn normalizeHtml(w: *Walker, src: Source) Error!void {
     const buf = w.alloc(u8, container.block_len) orelse return;
-    const Pass = enum { normalized, scripts, js };
-    inline for (.{ Pass.normalized, Pass.scripts, Pass.js }) |pass| {
-        const mode: html_norm.Mode = if (pass == .normalized) .normalized else .scripts;
-        var sink: HtmlSink = .{ .w = w, .mode = mode };
+    const norm = w.alloc(html_norm.Normalizer, 1) orelse return;
+    const total = src.len().?;
+    const Pass = enum { nocomment, notags, scripts, js };
+    inline for (.{ Pass.nocomment, Pass.notags, Pass.scripts, Pass.js }) |pass| pass: {
+        if (pass == .notags and total > w.tracker.limits.max_html_notags) {
+            w.limit(.html_notags);
+            break :pass;
+        }
+        var sink: HtmlSink = .{ .w = w };
         defer sink.close();
-        if (pass == .js) sink.js = w.scratch.allocator().create(js_norm.Normalizer) catch return w.limit(.memory);
-        if (pass == .normalized) try w.beginDerived(&sink.obj, "html", .normalized_html);
-        sink.open = pass == .normalized;
-        var n = html_norm.Normalizer.init(mode, .{ .ctx = &sink, .write = HtmlSink.write, .boundary = HtmlSink.boundary });
+        var outputs: html_norm.Outputs = .{};
+        const writer: html_norm.Output = .{ .ctx = &sink, .write = HtmlSink.write };
+        const pieces: html_norm.Pieces = .{ .ctx = &sink, .begin = HtmlSink.begin, .data = HtmlSink.data, .end = HtmlSink.end };
+        switch (pass) {
+            .nocomment => {
+                try w.beginDerived(&sink.obj, "html", .normalized_html);
+                sink.open = true;
+                outputs.nocomment = writer;
+            },
+            .notags => {
+                try w.beginDerived(&sink.obj, "notags", .normalized_html);
+                sink.open = true;
+                outputs.notags = writer;
+            },
+            .scripts => {
+                sink.mode = .scripts;
+                outputs.scripts = pieces;
+            },
+            .js => {
+                sink.mode = .js;
+                sink.js = w.scratch.allocator().create(js_norm.Normalizer) catch return w.limit(.memory);
+                outputs.scripts = pieces;
+            },
+        }
+        norm[0] = .init(outputs);
         var off: u64 = 0;
-        const total = src.len().?;
         const max = w.tracker.limits.max_html_normalize;
         var limited = false;
         while (off < total) {
@@ -338,65 +369,99 @@ fn normalizeHtml(w: *Walker, src: Source) Error!void {
             const want: usize = @intCast(@min(buf.len, max - off));
             const got = src.readAt(w.io, off, buf[0..want]) catch break;
             if (got == 0) break;
-            n.feed(buf[0..got]) catch return sink.failure();
+            norm[0].feed(buf[0..got]) catch return error.Halted;
             off += got;
         }
-        n.finish() catch return sink.failure();
-        if (limited and pass == .normalized) w.limit(.html_normalize);
-        if (pass == .scripts) {
-            sink.close();
-            reportScript(w, &sink.markers);
-        }
-        if (pass == .js) sink.close();
+        norm[0].finish() catch return error.Halted;
+        if (limited and pass == .nocomment) w.limit(.html_normalize);
+        if (pass == .scripts) reportScript(w, &sink.markers);
     }
 }
 
 const HtmlSink = struct {
     w: *Walker,
-    mode: html_norm.Mode,
+    mode: enum { stream, scripts, js } = .stream,
     obj: Object = undefined,
     open: bool = false,
     scripts: u32 = 0,
     name_buf: [24]u8 = undefined,
     markers: heuristics.ScriptScanner = .{},
-    /// The JavaScript pass: script bodies go through this normaliser into "js/<n>".
+    /// The JavaScript pass: script bodies go through this normaliser into "js".
     js: ?*js_norm.Normalizer = null,
+    /// The last bytes written to "js": libclamav adds `</script>` unless the script ends with it.
+    tail: [9]u8 = @splat(0),
+    tail_len: usize = 0,
 
     fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
         const s: *HtmlSink = @ptrCast(@alignCast(ctx));
         if (!s.open) return;
-        if (s.js) |j| return j.feed(bytes);
-        if (s.mode == .scripts) s.markers.update(bytes);
         s.w.feed(&s.obj, bytes) catch return error.Stop;
     }
 
-    fn boundary(ctx: *anyopaque, begin: bool) error{Stop}!void {
+    fn begin(ctx: *anyopaque) error{Stop}!void {
         const s: *HtmlSink = @ptrCast(@alignCast(ctx));
-        if (begin) {
-            const name = std.fmt.bufPrint(&s.name_buf, "{s}/{d}", .{ if (s.js != null) "js" else "script", s.scripts }) catch "script";
-            s.scripts += 1;
-            s.w.beginDerived(&s.obj, name, if (s.js != null) .normalized_js else .script) catch return error.Stop;
-            s.open = true;
-            if (s.js) |j| j.* = .init(.{ .ctx = s, .write = jsWrite });
-        } else s.close();
+        switch (s.mode) {
+            .stream => {},
+            .scripts => {
+                const name = std.fmt.bufPrint(&s.name_buf, "script/{d}", .{s.scripts}) catch "script";
+                s.scripts += 1;
+                s.w.beginDerived(&s.obj, name, .script) catch return error.Stop;
+                s.open = true;
+            },
+            .js => {
+                if (!s.open) {
+                    s.w.beginDerived(&s.obj, "js", .normalized_js) catch return error.Stop;
+                    s.open = true;
+                } else try s.jsOut("\n");
+                try s.jsOut("<script>");
+                s.js.?.* = .init(.{ .ctx = s, .write = jsWrite });
+            },
+        }
+    }
+
+    fn data(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        switch (s.mode) {
+            .stream => {},
+            .scripts => {
+                s.markers.update(bytes);
+                s.w.feed(&s.obj, bytes) catch return error.Stop;
+            },
+            .js => try s.js.?.feed(bytes),
+        }
+    }
+
+    fn end(ctx: *anyopaque) error{Stop}!void {
+        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        switch (s.mode) {
+            .stream => {},
+            .scripts => s.close(),
+            .js => {
+                try s.js.?.finish();
+                if (s.tail_len < 9 or !std.mem.eql(u8, &s.tail, "</script>")) try s.jsOut("</script>");
+            },
+        }
     }
 
     /// Normalised JavaScript out of the JS pass's normaliser.
     fn jsWrite(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
         const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        try s.jsOut(bytes);
+    }
+
+    fn jsOut(s: *HtmlSink, bytes: []const u8) error{Stop}!void {
         s.w.feed(&s.obj, bytes) catch return error.Stop;
+        for (bytes) |b| {
+            std.mem.copyForwards(u8, s.tail[0..8], s.tail[1..9]);
+            s.tail[8] = b;
+            s.tail_len +|= 1;
+        }
     }
 
     fn close(s: *HtmlSink) void {
         if (!s.open) return;
-        if (s.js) |j| j.finish() catch {};
         s.w.endDerived(&s.obj);
         s.open = false;
-    }
-
-    fn failure(s: *HtmlSink) Error {
-        _ = s;
-        return error.Halted;
     }
 };
 
@@ -681,7 +746,8 @@ test "HTML yields its normalised stream and scripts; text yields its normalised 
         }
         if (std.mem.eql(u8, e.path, "p.html/script/0")) {
             seen += 1;
-            try std.testing.expectEqual(@as(u64, "Alert(1)".len), e.bytes);
+            // The script runs to the end of its end tag, as libclamav hands it to the JS parser.
+            try std.testing.expectEqual(@as(u64, "Alert(1)</script>".len), e.bytes);
         }
     }
     try std.testing.expectEqual(@as(usize, 4), seen);

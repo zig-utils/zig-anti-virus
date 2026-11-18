@@ -184,5 +184,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/text"
           find "$py" -name '*.py' -size -256k | head -1500 | while read -r f; do cp "$f" "$RUNNER_TEMP/text/$(echo "$f" | tr '/' '_')"; done
           find /usr/share/doc "$py" -name '*.html' -size -256k 2>/dev/null | head -500 | while read -r f; do cp "$f" "$RUNNER_TEMP/text/$(echo "$f" | tr '/' '_')"; done
-          # HTML parity is incomplete (#45): counted, not enforced.
-          python3 tools/diff/norm.py --html-report-only --work "$RUNNER_TEMP/nwork" "$RUNNER_TEMP/text"
+          # Stress documents reaching every state of libclamav's HTML normaliser, chunk cuts included.
+          python3 tools/diff/gen_html.py "$RUNNER_TEMP/text/gen" --count 600
+          # nocomment.html and notags.html must be byte-identical; the JavaScript form (P5.13) is counted.
+          python3 tools/diff/norm.py --work "$RUNNER_TEMP/nwork" "$RUNNER_TEMP/text"
