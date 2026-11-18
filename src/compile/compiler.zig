@@ -12,6 +12,9 @@ const hexsig = @import("hexsig.zig");
 const ndb = @import("ndb.zig");
 const prog_build = @import("prog_build.zig");
 const anchored_build = @import("anchored_build.zig");
+const ldb = @import("ldb.zig");
+const ldb_build = @import("ldb_build.zig");
+const ldb_table = @import("../match/ldb_table.zig");
 const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
@@ -36,6 +39,7 @@ pub const Compiler = struct {
     arena: std.heap.ArenaAllocator,
     rules: std.ArrayList(ir.HashRule) = .empty,
     bodies: std.ArrayList(ir.BodyRule) = .empty,
+    logicals: std.ArrayList(ir.LogicalRule) = .empty,
     allow: std.ArrayList(ir.HashRule) = .empty,
     ignore_entries: std.ArrayList(filters.IgnoreEntry) = .empty,
     rejected: std.ArrayList(ir.Rejection) = .empty,
@@ -49,6 +53,7 @@ pub const Compiler = struct {
     pub fn deinit(c: *Compiler) void {
         c.rules.deinit(c.gpa);
         c.bodies.deinit(c.gpa);
+        c.logicals.deinit(c.gpa);
         c.allow.deinit(c.gpa);
         c.ignore_entries.deinit(c.gpa);
         c.rejected.deinit(c.gpa);
@@ -67,6 +72,8 @@ pub const Compiler = struct {
             try hashsig.parse(c.gpa, fmt, owned_name, owned, .{ .rules = &c.rules, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "ndb") or std.mem.eql(u8, ext, "ndu")) {
             try ndb.parse(c.gpa, arena, owned_name, owned, ext[2] == 'u', .{ .rules = &c.bodies, .rejected = &c.rejected });
+        } else if (std.mem.eql(u8, ext, "ldb") or std.mem.eql(u8, ext, "ldu")) {
+            try ldb.parse(c.gpa, arena, owned_name, owned, ext[2] == 'u', .{ .rules = &c.logicals, .rejected = &c.rejected });
         } else if (filters.allowlistFormat(ext)) |fmt| {
             try hashsig.parse(c.gpa, fmt, owned_name, owned, .{ .rules = &c.allow, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "ign2")) {
@@ -143,6 +150,8 @@ pub const Compiler = struct {
         hash_rules: u64,
         /// Body signatures compiled into verify programs.
         body_rules: u64,
+        /// Logical signatures in LDB_TABLE.
+        logical_rules: u64,
         /// Verify programs: one per variant after modifier expansion.
         programs: u64,
         allowlist_rules: u64,
@@ -191,12 +200,35 @@ pub const Compiler = struct {
             try c.coverage.include(c.gpa, @tagName(rule.source), 1);
         }
 
+        // Logical signatures: the same filters; every subsig must expand or the rule is dropped.
+        var kept_logicals: std.ArrayList(*const ir.LogicalRule) = .empty;
+        defer kept_logicals.deinit(c.gpa);
+        var logical_variants: std.ArrayList([]const []hexsig.Variant) = .empty;
+        defer logical_variants.deinit(c.gpa);
+        logical: for (c.logicals.items) |*rule| {
+            if (filters.skipReasonFor(rule.name, rule.line, rule.flevel_min, rule.flevel_max, &ignore, filters.engine_flevel)) |reason| {
+                try c.coverage.skip(c.gpa, @tagName(rule.source), reason);
+                continue;
+            }
+            const per_subsig = try arena.alloc([]hexsig.Variant, rule.subsigs.len);
+            for (rule.subsigs, per_subsig) |sub, *out| switch (sub) {
+                .hex => |h| out.* = hexsig.expand(arena, h.pattern, h.mods) catch |err| {
+                    try c.coverage.skip(c.gpa, @tagName(rule.source), hexsig.reasonOf(err));
+                    continue :logical;
+                },
+            };
+            try kept_logicals.append(c.gpa, rule);
+            try logical_variants.append(c.gpa, per_subsig);
+            try names.append(c.gpa, .{ .name = rule.name, .flags = rule.flags, .source = rule.source });
+            try c.coverage.include(c.gpa, @tagName(rule.source), 1);
+        }
+
         var built = try hash_build.buildWithNames(c.gpa, kept.items, names.items);
         defer built.deinit();
 
         var inputs: std.ArrayList(prog_build.Input) = .empty;
         defer inputs.deinit(c.gpa);
-        for (kept_bodies.items, body_variants.items, built.extra_sigs) |rule, variants, sig| {
+        for (kept_bodies.items, body_variants.items, built.extra_sigs[0..kept_bodies.items.len]) |rule, variants, sig| {
             for (variants) |v| {
                 var flags: u8 = 0;
                 if (v.folded) flags |= prog.flag_folded;
@@ -205,6 +237,26 @@ pub const Compiler = struct {
                 try inputs.append(c.gpa, .{ .pattern = v.pattern, .offset = rule.subsig.offset, .target = rule.target, .sig = sig, .flags = flags });
             }
         }
+        var ldb_entries: std.ArrayList(ldb_build.Entry) = .empty;
+        defer ldb_entries.deinit(c.gpa);
+        const logical_sigs = built.extra_sigs[kept_bodies.items.len..];
+        for (kept_logicals.items, logical_variants.items, logical_sigs, 0..) |rule, per_subsig, sig, record| {
+            const first: u32 = @intCast(inputs.items.len);
+            for (rule.subsigs, per_subsig, 0..) |sub, variants, i| {
+                const h = sub.hex;
+                for (variants) |v| {
+                    var flags: u8 = prog.flag_ldb;
+                    if (v.folded) flags |= prog.flag_folded;
+                    if (v.wide) flags |= prog.flag_wide;
+                    if (h.mods.fullword) flags |= prog.flag_fullword;
+                    try inputs.append(c.gpa, .{ .pattern = v.pattern, .offset = h.offset, .target = rule.tdb.target, .sig = @intCast(record), .subsig = @intCast(i), .flags = flags });
+                }
+            }
+            try ldb_entries.append(c.gpa, .{ .rule = rule, .sig = sig, .prog_first = first, .prog_count = @intCast(inputs.items.len - first) });
+        }
+        const ldb_raw = try ldb_build.build(c.gpa, ldb_entries.items);
+        defer c.gpa.free(ldb_raw);
+
         const programs_raw = try prog_build.build(c.gpa, inputs.items);
         defer c.gpa.free(programs_raw);
         const programs = try c.gpa.alignedAlloc(u8, .@"4", programs_raw.len);
@@ -234,6 +286,7 @@ pub const Compiler = struct {
             try sections.append(c.gpa, .{ .kind = .fp_tables, .variant = fp_cold_variant_offset + @as(u16, @intCast(t)), .bytes = allow.cold[t].? });
         };
         if (inputs.items.len > 0) try sections.append(c.gpa, .{ .kind = .subsig_prog, .bytes = programs });
+        if (ldb_entries.items.len > 0) try sections.append(c.gpa, .{ .kind = .ldb_table, .align_log2 = 12, .bytes = ldb_raw });
         for (anchored_sections, 0..) |a, p| if (a) |bytes| {
             try sections.append(c.gpa, .{ .kind = .anchored_index, .variant = @intCast(p), .partition = @intCast(p), .hot = true, .bytes = bytes });
         };
@@ -247,6 +300,7 @@ pub const Compiler = struct {
             .signatures = built.signature_count,
             .hash_rules = kept.items.len,
             .body_rules = kept_bodies.items.len,
+            .logical_rules = ldb_entries.items.len,
             .programs = inputs.items.len,
             .allowlist_rules = c.allow.items.len,
             .duplicates = built.duplicates,
@@ -280,11 +334,13 @@ test "compile files and a container, filter, and write a database" {
     try c.addFile("local.fp", "44d88612fea8a8f36de82e1278abb02f:68:Allow.Eicar\n");
     try c.addFile("main.ndb", "Eicar:0:*:58354f\nBroken:0:*:58(35\n");
     try c.addFile("main.pdb", "R:example.com\n");
+    try c.addFile("main.ldb", "Logical.Test-1-0;Target:0;0&1;4142;4344::i\nLogical.Bad-2-0;Target:0;0=0;4142\n");
     const summary = try c.write(io, tmp.dir, "out.zavdb", .{ .db_version = 1 });
     try std.testing.expectEqual(@as(u64, 2), summary.hash_rules); // two from the container
     try std.testing.expectEqual(@as(u64, 1), summary.allowlist_rules);
     try std.testing.expectEqual(@as(u64, 1), summary.body_rules);
-    try std.testing.expectEqual(@as(u64, 1), summary.programs);
+    try std.testing.expectEqual(@as(u64, 1), summary.logical_rules);
+    try std.testing.expectEqual(@as(u64, 1 + 1 + 4), summary.programs); // ndb, then 1 + 4 nocase variants
 
     const opened = try db.reader.open(io, tmp.dir, "out.zavdb", .{ .allow_unsigned = true });
     defer opened.close();
@@ -294,8 +350,13 @@ test "compile files and a container, filter, and write a database" {
     try std.testing.expect(std.mem.indexOf(u8, report, "ndb: 1 included") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.ndb: 1 skipped (hex_bad_alternation)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.pdb: 1 skipped (unsupported_database)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "main.ldb: 1 skipped (expr_true_without_hits)") != null);
     const progs = try prog.Programs.init(opened.section(.subsig_prog, 0).?);
-    try std.testing.expectEqual(@as(usize, 1), progs.count());
+    try std.testing.expectEqual(@as(usize, 6), progs.count());
+    const logical = try ldb_table.LdbTable.init(opened.section(.ldb_table, 0).?, progs);
+    try std.testing.expectEqual(@as(usize, 1), logical.records.len);
+    try std.testing.expectEqual(@as(u32, 1), logical.records[0].prog_first);
+    try std.testing.expectEqual(@as(u32, 5), logical.records[0].prog_count);
 
     // The ignored signature is not in the database; the container's EICAR is.
     const t = hashidx.tableVariant(.md5, .file);

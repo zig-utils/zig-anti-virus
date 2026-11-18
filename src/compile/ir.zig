@@ -106,6 +106,18 @@ pub const Reason = enum(u8) {
     bad_offset,
     offset_needs_executable,
     version_info_unsupported,
+    // Logical (.ldb) signatures.
+    bad_tdb,
+    bad_expression,
+    expr_true_without_hits,
+    too_many_subsigs,
+    unknown_file_type,
+    pcre_needs_byte_mode,
+    macro_unsupported,
+    fuzzy_image_unsupported,
+    icon_unsupported,
+    handler_type_unsupported,
+    byte_compare_unsupported,
 };
 
 pub const Rejection = struct {
@@ -288,6 +300,78 @@ pub const BodyRule = struct {
     flevel_min: u16 = 0,
     flevel_max: u16 = 0,
     source: Source,
+    flags: Flags = .{},
+    line: []const u8 = "",
+};
+
+// ---------------------------------------------------------------------------------------------
+// Logical signatures (docs/DESIGN.md section 3.4, LDB_TABLE).
+// ---------------------------------------------------------------------------------------------
+
+/// An inclusive range from a target description block (`FileSize:100-200`).
+pub const Range = struct { lo: u64, hi: u64 };
+
+pub const max_intermediates = 16;
+
+/// The target description block: predicates checked once per file before any subsig counts.
+pub const Tdb = struct {
+    target: u8 = 0,
+    file_size: ?Range = null,
+    entry_point: ?Range = null,
+    sections: ?Range = null,
+    /// `Container:CL_TYPE_*` as a `fmt.types.ClType` value.
+    container: ?u16 = null,
+    /// `Intermediates:A>B>C`, outermost first.
+    intermediates: [max_intermediates]u16 = @splat(0),
+    intermediate_count: u8 = 0,
+};
+
+pub const RpnCode = enum(u8) {
+    /// Push subsig `index`: its match count, its bit in the distinct mask, count > 0.
+    sub = 1,
+    /// Pop two, push the conjunction; counts add, masks join.
+    @"and" = 2,
+    /// Pop two, push the disjunction; counts add, masks join.
+    @"or" = 3,
+    /// Pop one; true when count == k (and, with `distinct`, at least that many subsigs matched).
+    eq = 4,
+    /// count > k
+    gt = 5,
+    /// count < k
+    lt = 6,
+    _,
+};
+
+pub const RpnOp = extern struct {
+    code: RpnCode,
+    /// For eq, gt and lt: required distinct matched subsigs (`A=X,Y`), 0 for none.
+    distinct: u8 = 0,
+    index: u16 = 0,
+    k: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(RpnOp) == 8);
+}
+
+/// ClamAV allows at most 64 subsignatures per logical signature.
+pub const max_subsigs = 64;
+/// Deepest evaluation stack an expression may need.
+pub const max_rpn_depth = 64;
+
+pub const LogicalSubsig = union(enum) {
+    hex: Subsig,
+};
+
+/// An `.ldb` logical signature.
+pub const LogicalRule = struct {
+    name: []const u8,
+    tdb: Tdb,
+    expr: []const RpnOp,
+    subsigs: []const LogicalSubsig,
+    flevel_min: u16 = 0,
+    flevel_max: u16 = 0,
+    source: Source = .ldb,
     flags: Flags = .{},
     line: []const u8 = "",
 };

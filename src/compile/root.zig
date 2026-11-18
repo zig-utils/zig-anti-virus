@@ -8,6 +8,8 @@ pub const hexsig = @import("hexsig.zig");
 pub const ndb = @import("ndb.zig");
 pub const prog_build = @import("prog_build.zig");
 pub const anchored_build = @import("anchored_build.zig");
+pub const ldb = @import("ldb.zig");
+pub const ldb_build = @import("ldb_build.zig");
 pub const hash_build = @import("hash_build.zig");
 pub const filters = @import("filters.zig");
 pub const coverage = @import("coverage.zig");
@@ -23,6 +25,8 @@ test {
     _ = ndb;
     _ = prog_build;
     _ = anchored_build;
+    _ = ldb;
+    _ = ldb_build;
     _ = hash_build;
     _ = filters;
     _ = coverage;

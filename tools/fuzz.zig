@@ -50,6 +50,18 @@ pub fn main(init: std.process.Init) !void {
             anchoredSection(random);
             cases += 1;
         }
+        if (selected(only, "ldbLine")) {
+            ldbLine(random);
+            cases += 1;
+        }
+        if (selected(only, "ldbExpr")) {
+            ldbExpr(random);
+            cases += 1;
+        }
+        if (selected(only, "ldbSection")) {
+            ldbSection(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
     }
@@ -451,6 +463,75 @@ fn anchoredSection(random: std.Random) void {
     };
     var n: usize = 0;
     match.anchored.scan(index, programs, &data, info, &budget, &n, Sink.take) catch {};
+}
+
+/// `.ldb` lines: target description blocks, expressions and every subsig form.
+fn ldbLine(random: std.Random) void {
+    const ldb = zav.compile.ldb;
+    const seeds = [_][]const u8{
+        "Win.Trojan.L-1-0;Engine:81-255,Target:1;0&1&2;EP+0:e8??;6b65726e656c::iw;aabb{2-4}ccdd",
+        "Doc.Mal.M-2-0;Target:2,FileSize:100-2000,Container:CL_TYPE_ZIP;(0|1)>2,2&2=0;aabb;ccdd;eeff",
+        "Pdf.N-3-0;Target:10,Intermediates:CL_TYPE_ANY>CL_TYPE_ZIP;0&1;2f4a53;0/eval\\(/si",
+        "Elf.O-4-0;Target:6,NumberOfSections:1-9,EntryPoint:0-4096;0&1;S0+4:7f454c46;0(>>4#ib2#=0x10)",
+    };
+    var mem: [96 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var buf: [256]u8 = undefined;
+    const seed = seeds[random.uintLessThan(usize, seeds.len)];
+    @memcpy(buf[0..seed.len], seed);
+    const line = mutate(random, &buf, seed.len, "0123456789abcdef;:,&|()=<>-+*?{}/#$EPSLCL_TYPE_");
+    var column: u32 = 0;
+    if (ldb.parseLine(fba.allocator(), line, &column)) |rule| {
+        if (rule.subsigs.len == 0 or rule.subsigs.len > zav.compile.ir.max_subsigs) @panic("fuzz: ldb subsig count");
+        if (!zav.match.ldb_table.checkRpn(rule.expr, rule.subsigs.len)) @panic("fuzz: ldb parser emitted a bad expression");
+    } else |_| {
+        if (column > line.len) @panic("fuzz: ldb column out of range");
+    }
+}
+
+/// The expression parser alone, then evaluation over random counts.
+fn ldbExpr(random: std.Random) void {
+    const ldb = zav.compile.ldb;
+    const lt = zav.match.ldb_table;
+    var mem: [64 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    const alphabet = "0123456789&|()=<>,";
+    const len = random.uintAtMost(usize, buf.len);
+    while (n < len) : (n += 1) buf[n] = alphabet[random.uintLessThan(usize, alphabet.len)];
+    const nsub = 1 + random.uintLessThan(usize, zav.compile.ir.max_subsigs);
+    const ops = ldb.parseExpression(fba.allocator(), buf[0..n], nsub, nsub) catch return;
+    if (!lt.checkRpn(ops, nsub)) @panic("fuzz: parsed expression fails its own check");
+    var counts: [zav.compile.ir.max_subsigs]u32 = undefined;
+    for (counts[0..nsub]) |*c| c.* = if (random.boolean()) 0 else random.uintAtMost(u32, 5);
+    _ = lt.evalRpn(ops, counts[0..nsub]);
+}
+
+/// LDB_TABLE validation against its programs.
+fn ldbSection(random: std.Random) void {
+    const zc = zav.compile;
+    const match = zav.match;
+    var mem: [96 * 1024]u8 align(8) = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    const arena = fba.allocator();
+    var column: u32 = 0;
+    const rule = zc.ldb.parseLine(arena, "L-1-0;Target:1,FileSize:10-99;(0|1)>1,2&2=0;aabb;ccdd;EP+0:eeff", &column) catch unreachable;
+    var inputs: [3]zc.prog_build.Input = undefined;
+    for (rule.subsigs, &inputs, 0..) |sub, *in, i| in.* = .{ .pattern = sub.hex.pattern, .offset = sub.hex.offset, .target = 1, .sig = 0, .subsig = @intCast(i), .flags = match.prog.flag_ldb };
+    const pbytes = zc.prog_build.build(arena, &inputs) catch return;
+    const pimage = arena.alignedAlloc(u8, .@"4", pbytes.len) catch return;
+    @memcpy(pimage, pbytes);
+    const programs = match.prog.Programs.init(pimage) catch unreachable;
+    const entries = [_]zc.ldb_build.Entry{.{ .rule = &rule, .sig = 0, .prog_first = 0, .prog_count = 3 }};
+    const bytes = zc.ldb_build.build(arena, &entries) catch return;
+    const image = arena.alignedAlloc(u8, .@"8", bytes.len) catch return;
+    @memcpy(image, bytes);
+    _ = match.ldb_table.LdbTable.init(image, programs) catch unreachable;
+    for (0..1 + random.uintLessThan(usize, 6)) |_| image[random.uintLessThan(usize, image.len)] = random.int(u8);
+    const table = match.ldb_table.LdbTable.init(image[0 .. random.uintAtMost(usize, image.len) & ~@as(usize, 7)], programs) catch return;
+    var counts: [zc.ir.max_subsigs]u32 = @splat(1);
+    for (table.records) |rec| _ = match.ldb_table.evalRpn(table.expr(rec), counts[0..rec.nsub]);
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.

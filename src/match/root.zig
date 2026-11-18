@@ -5,10 +5,12 @@ pub const hashidx = @import("hashidx.zig");
 pub const prog = @import("prog.zig");
 pub const verify_vm = @import("verify_vm.zig");
 pub const anchored = @import("anchored.zig");
+pub const ldb_table = @import("ldb_table.zig");
 
 test {
     _ = hashidx;
     _ = prog;
     _ = verify_vm;
     _ = anchored;
+    _ = ldb_table;
 }
