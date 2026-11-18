@@ -21,4 +21,19 @@ pub const cli = @import("cli/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = db;
+    _ = compile;
+    _ = match;
+    _ = hash;
+    _ = simd;
+    _ = fmt;
+    _ = engine;
+    _ = rt;
+    _ = daemon;
+    _ = watch;
+    _ = host;
+    _ = cve;
+    _ = update;
+    _ = capi;
+    _ = cli;
 }
