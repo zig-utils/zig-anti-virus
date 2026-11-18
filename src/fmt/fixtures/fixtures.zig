@@ -393,4 +393,21 @@ pub const exes = [_]Exe{
     .{ .name = "nsis-truncated.exe", .bytes = @embedFile("exe-nsis-truncated.exe.bin")[exe_prefix.len..], .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = true, .members = &.{
         .{ .path = "overlay", .len = 13293, .crc = 0xfe053251 },
     } },
+    .{ .name = "upx-amd64-elf", .bytes = @embedFile("exe-upx-amd64-elf.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 19832, .crc = 0xf90d0596 },
+    } },
+    .{ .name = "upx-i386-elf", .bytes = @embedFile("exe-upx-i386-elf.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 18868, .crc = 0x66bfd33d },
+    } },
+    .{ .name = "upx-arm64-elf", .bytes = @embedFile("exe-upx-arm64-elf.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 24952, .crc = 0xbcdb38a8 },
+    } },
+    .{ .name = "upx-amd64-elf-lzma", .bytes = @embedFile("exe-upx-amd64-elf-lzma.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 19832, .crc = 0xf90d0596 },
+    } },
+    .{ .name = "upx-amd64-macho", .bytes = @embedFile("exe-upx-amd64-macho.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 16749, .crc = 0xba340d07 },
+    } },
+    .{ .name = "upx-amd64-pe", .bytes = @embedFile("exe-upx-amd64-pe.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "upx-amd64-pe-d", .bytes = @embedFile("exe-upx-amd64-pe-d.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
 };

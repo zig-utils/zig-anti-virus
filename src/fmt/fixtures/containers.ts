@@ -2,6 +2,9 @@
 // Called from make-fixtures.ts, which owns the output list; every builder here works from the
 // format's public specification, byte by byte, so malformed and adversarial variants are exact.
 
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import zlib from 'node:zlib'
 
 export interface Member { path: string, data: Uint8Array }
@@ -1137,6 +1140,46 @@ export function chmFile(h: Helpers, plainFiles: Member[], compressedFiles: Membe
   return h.concat(itsf, hs0, dir, ...sec0Parts)
 }
 
+// ---------------------------------------------------------------------------------------------
+// UPX-packed executables (P5.19): a small C program built with `zig cc` for each target, packed
+// with `upx --best` (NRV2B) and `upx --lzma`, and unpacked again with `upx -d`, whose output is
+// what the unpacker must reproduce. Tools: ZIG and UPX_BIN from the environment (upx itself reads UPX as options), else on PATH.
+
+const helloC = `#include <stdio.h>
+static const char eicar[] = "X5O!P%@AP[4\\\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+int table[4096];
+int main(int argc, char **argv) { for (int i = 0; i < 4096; i++) table[i] = i * argc; printf("%s %d\\n", argc > 5 ? eicar : "hi", table[argc]); return 0; }
+`
+
+export function upxSamples(h: Helpers): { name: string, packed: Uint8Array, unpacked: Uint8Array }[] {
+  const zig = process.env.ZIG ?? 'zig'
+  const upx = process.env.UPX_BIN ?? 'upx'
+  const work = mkdtempSync(join(tmpdir(), 'zav-upx-'))
+  writeFileSync(join(work, 'hello.c'), helloC)
+  const out: { name: string, packed: Uint8Array, unpacked: Uint8Array }[] = []
+  const targets: [string, string, string[]][] = [
+    ['amd64-elf', 'x86_64-linux-musl', ['--best']],
+    ['i386-elf', 'x86-linux-musl', ['--best']],
+    ['arm64-elf', 'aarch64-linux-musl', ['--best']],
+    ['amd64-elf-lzma', 'x86_64-linux-musl', ['--lzma']],
+    ['amd64-macho', 'x86_64-macos', ['--best', '--force-macos']],
+    ['amd64-pe', 'x86_64-windows-gnu', ['--best']],
+  ]
+  for (const [name, target, opts] of targets) {
+    const exe = join(work, `${name}.bin`)
+    h.run(zig, ['cc', '-target', target, '-Os', ...(target.includes('macos') ? [] : ['-s']), '-o', exe, join(work, 'hello.c')], new Uint8Array(0))
+    const packed = join(work, `${name}.upx`)
+    writeFileSync(packed, readFileSync(exe))
+    chmodSync(packed, 0o755)
+    h.run(upx, ['-q', ...opts, packed], new Uint8Array(0))
+    const unpacked = join(work, `${name}.d`)
+    writeFileSync(unpacked, readFileSync(packed))
+    h.run(upx, ['-q', '-d', unpacked], new Uint8Array(0))
+    out.push({ name, packed: new Uint8Array(readFileSync(packed)), unpacked: new Uint8Array(readFileSync(unpacked)) })
+  }
+  return out
+}
+
 /** Apple's LZFSE encoder (macOS compression_tool): the reference for the lzfse vectors. */
 export function lzfse(h: Helpers, data: Uint8Array): Uint8Array {
   return h.run('compression_tool', ['-encode', '-a', 'lzfse'], data)
@@ -1269,5 +1312,12 @@ export function build(h: Helpers): void {
   archive('lzx.chm', chmFile(h, chmPlain, chmPacked), chmMembers)
   archive('window21.chm', chmFile(h, chmPlain, chmPacked.slice(0, 1), { windowBits: 21, resetFrames: 4 }), chmMembers.slice(0, 3))
   archive('dupes.chm', chmFile(h, chmPlain, chmPacked, { dupes: 30 }), chmMembers)
+  // UPX: ELF and Mach-O rebuild to exactly what upx -d writes; for PE the unpacked image is
+  // checked against upx -d's sections in upx.zig, so its upx -d output is a fixture too.
+  for (const u of upxSamples(h)) {
+    const isPe = u.name.endsWith('-pe')
+    h.exe(`upx-${u.name}`, u.packed, { entry: null, sections: 0, members: isPe ? [] : [{ path: 'upx', data: u.unpacked }] })
+    if (isPe) h.exe(`upx-${u.name}-d`, u.unpacked, { entry: null, sections: 0 })
+  }
   archive('dag-bomb.iso', isoImage([{ path: 'x.txt', data: fileA }], { joliet: true, dagDepth: 24 }), [])
 }

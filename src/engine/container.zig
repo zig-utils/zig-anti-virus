@@ -62,6 +62,8 @@ pub const Kind = enum(u8) {
     normalized_text,
     /// A script extracted from HTML.
     script,
+    /// An executable's unpacked image (UPX).
+    unpacked,
 };
 
 /// What a visitor is told about one object. `path` stays valid until the object's `leave`.

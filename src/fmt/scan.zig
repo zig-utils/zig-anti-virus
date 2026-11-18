@@ -32,6 +32,7 @@ const cab = @import("cab.zig");
 const dmg = @import("dmg.zig");
 const nsis = @import("nsis.zig");
 const chm = @import("chm.zig");
+const upx = @import("unpack/upx.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
@@ -66,9 +67,18 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
             try cpio.walk(w, &cursor);
         },
         .zip => try zip.walk(w, src),
-        .pe => try pe.walk(w, src),
-        .elf => try elf.walk(w, src),
-        .macho => try macho.walk(w, src),
+        .pe => {
+            try pe.walk(w, src);
+            try upx.walk(w, src, .pe);
+        },
+        .elf => {
+            try elf.walk(w, src);
+            try upx.walk(w, src, .elf);
+        },
+        .macho => {
+            try macho.walk(w, src);
+            try upx.walk(w, src, .macho);
+        },
         .macho_fat => try macho.walkFat(w, src),
         .ole2 => try ole2.walk(w, src),
         .iso9660 => try iso9660.walk(w, src),
@@ -180,9 +190,18 @@ fn reportScript(w: *Walker, s: *const heuristics.ScriptScanner) void {
 fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
     switch (format) {
         .zip => try zip.walk(w, src),
-        .pe => try pe.walk(w, src),
-        .elf => try elf.walk(w, src),
-        .macho => try macho.walk(w, src),
+        .pe => {
+            try pe.walk(w, src);
+            try upx.walk(w, src, .pe);
+        },
+        .elf => {
+            try elf.walk(w, src);
+            try upx.walk(w, src, .elf);
+        },
+        .macho => {
+            try macho.walk(w, src);
+            try upx.walk(w, src, .macho);
+        },
         .macho_fat => try macho.walkFat(w, src),
         .ole2 => try ole2.walk(w, src),
         .iso9660 => try iso9660.walk(w, src),
