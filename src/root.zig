@@ -18,6 +18,8 @@ pub const cve = @import("cve/root.zig");
 pub const update = @import("update/root.zig");
 pub const capi = @import("capi/root.zig");
 pub const cli = @import("cli/root.zig");
+/// zig-regex, re-exported so tools and embedders use the exact version the engine was built with.
+pub const regex = @import("regex");
 
 test {
     std.testing.refAllDecls(@This());

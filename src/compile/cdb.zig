@@ -5,14 +5,15 @@
 //!
 //! `*` means any value; sizes and the position take an exact value or `x-y`; the position counts
 //! from 1; IsEncrypted is 1, 0 or `*`; Res1 is the member's CRC (hex) for ZIP and RAR; Res2 is
-//! unused. A filename regex other than `*` needs zig-regex, which is not yet a dependency: such
-//! lines are rejected with their own reason (`cdb_regex_needs_zig_regex`), so the loss is
-//! counted, and their regex text is kept for when it is.
+//! unused. A filename regex other than `*` is compiled to a zig-regex byte-mode program
+//! (searched anywhere in the member name, as POSIX regexec does); a regex zig-regex cannot parse
+//! is rejected as `regex_syntax`, one that needs its backtracker as `regex_unsupported`.
 const std = @import("std");
 const ir = @import("ir.zig");
 const types = @import("../fmt/types.zig");
+const regex = @import("regex");
 
-pub const LineError = error{ FieldCount, EmptyName, BadCdbField, UnknownFileType, BadFlevel, RegexNeedsZigRegex };
+pub const LineError = error{ FieldCount, EmptyName, BadCdbField, UnknownFileType, BadFlevel, RegexSyntax, RegexUnsupported, OutOfMemory };
 
 pub fn reasonOf(err: LineError) ir.Reason {
     return switch (err) {
@@ -21,7 +22,9 @@ pub fn reasonOf(err: LineError) ir.Reason {
         error.BadCdbField => .bad_cdb_field,
         error.UnknownFileType => .unknown_file_type,
         error.BadFlevel => .bad_flevel,
-        error.RegexNeedsZigRegex => .cdb_regex_needs_zig_regex,
+        error.RegexSyntax => .regex_syntax,
+        error.RegexUnsupported => .regex_unsupported,
+        error.OutOfMemory => .hex_too_complex,
     };
 }
 
@@ -30,7 +33,7 @@ pub const Output = struct {
     rejected: *std.ArrayList(ir.Rejection),
 };
 
-pub fn parse(gpa: std.mem.Allocator, source_name: []const u8, text: []const u8, pua: bool, out: Output) !void {
+pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source_name: []const u8, text: []const u8, pua: bool, out: Output) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_number: u32 = 0;
     while (lines.next()) |raw| {
@@ -38,11 +41,12 @@ pub fn parse(gpa: std.mem.Allocator, source_name: []const u8, text: []const u8, 
         const line = std.mem.trimEnd(u8, raw, "\r \t");
         if (line.len == 0 or line[0] == '#') continue;
         var column: u32 = 0;
-        if (parseLine(line, &column)) |rule| {
+        if (parseLine(arena, line, &column)) |rule| {
             var r = rule;
             r.flags.pua = pua;
             try out.rules.append(gpa, r);
         } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             try out.rejected.append(gpa, .{ .source_name = source_name, .line_number = line_number, .reason = reasonOf(err), .column = column });
         }
     }
@@ -60,8 +64,20 @@ fn range(text: []const u8) error{BadCdbField}!?ir.Range {
     return .{ .lo = v, .hi = v };
 }
 
-/// Parse one line. Rules borrow `line`.
-pub fn parseLine(line: []const u8, column: *u32) LineError!ir.CdbRule {
+/// Compile a regex to a serialised byte-mode program in `arena`.
+pub fn compileRegex(arena: std.mem.Allocator, pattern: []const u8, flags: regex.common.CompileFlags) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
+    var f = flags;
+    f.bytes = true;
+    const program = regex.Program.compile(arena, pattern, f) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsupportedByProgram, error.ProgramTooLarge => error.RegexUnsupported,
+        else => error.RegexSyntax,
+    };
+    return program.bytes();
+}
+
+/// Parse one line. Rules borrow `line`; a compiled filename program lives in `arena`.
+pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineError!ir.CdbRule {
     var fields: [12][]const u8 = undefined;
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, line, ':');
@@ -109,7 +125,7 @@ pub fn parseLine(line: []const u8, column: *u32) LineError!ir.CdbRule {
     if (fields[3].len == 0) return error.BadCdbField;
     if (!std.mem.eql(u8, fields[3], "*")) {
         rule.filename_regex = fields[3];
-        return error.RegexNeedsZigRegex;
+        rule.filename_program = try compileRegex(arena, fields[3], .{});
     }
     column.* = 0;
     return rule;
@@ -118,8 +134,11 @@ pub fn parseLine(line: []const u8, column: *u32) LineError!ir.CdbRule {
 const testing = std.testing;
 
 test "cdb lines: wildcards, exact values, ranges, and rejections" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     var column: u32 = 0;
-    const r = try parseLine("Zip.Exploit.A-1-0:CL_TYPE_ZIP:100-200:*:50:*:1:2-4:8a4f1c2e:*:81:255", &column);
+    const r = try parseLine(arena, "Zip.Exploit.A-1-0:CL_TYPE_ZIP:100-200:*:50:*:1:2-4:8a4f1c2e:*:81:255", &column);
     try testing.expectEqual(@backingInt(types.ClType.zip), r.container.?);
     try testing.expectEqual(ir.Range{ .lo = 100, .hi = 200 }, r.container_size.?);
     try testing.expectEqual(ir.Range{ .lo = 50, .hi = 50 }, r.size_in_container.?);
@@ -128,8 +147,15 @@ test "cdb lines: wildcards, exact values, ranges, and rejections" {
     try testing.expectEqual(ir.Range{ .lo = 2, .hi = 4 }, r.file_pos.?);
     try testing.expectEqual(@as(?u32, 0x8a4f1c2e), r.crc);
     try testing.expectEqual(@as(u16, 81), r.flevel_min);
-    const any = try parseLine("Any.Container-2-0:*:*:*:*:*:*:*:*:*", &column);
+    const any = try parseLine(arena, "Any.Container-2-0:*:*:*:*:*:*:*:*:*", &column);
     try testing.expect(any.container == null and any.encrypted == null and any.crc == null);
+    const named = try parseLine(arena, "Zip.Scr-3-0:CL_TYPE_ZIP:*:.*\\.scr$:*:*:*:*:*:*", &column);
+    try testing.expectEqualStrings(".*\\.scr$", named.filename_regex.?);
+    const program = try regex.Program.load(named.filename_program.?);
+    var scratch = try regex.Scratch.init(testing.allocator, &program);
+    defer scratch.deinit(testing.allocator);
+    try testing.expect(try program.isMatch(&scratch, "invoice.pdf.scr"));
+    try testing.expect(!try program.isMatch(&scratch, "invoice.scr.pdf"));
 
     const Bad = struct { []const u8, LineError, u32 };
     for ([_]Bad{
@@ -143,9 +169,10 @@ test "cdb lines: wildcards, exact values, ranges, and rejections" {
         .{ "X:*:*:*:*:*:*:*:xyz:*", error.BadCdbField, 16 },
         .{ "X:*:*:*:*:*:*:*:*:7", error.BadCdbField, 18 },
         .{ "X:*:*:*:*:*:*:*:*:*:x", error.BadFlevel, 20 },
-        .{ "X:*:*:.*\\.exe:*:*:*:*:*:*", error.RegexNeedsZigRegex, 6 },
+        .{ "X:*:*:(a:*:*:*:*:*:*", error.RegexSyntax, 6 },
+        .{ "X:*:*:(a)\\1:*:*:*:*:*:*", error.RegexUnsupported, 6 },
     }) |c| {
-        try testing.expectError(c[1], parseLine(c[0], &column));
+        try testing.expectError(c[1], parseLine(arena, c[0], &column));
         try testing.expectEqual(c[2], column);
     }
 }

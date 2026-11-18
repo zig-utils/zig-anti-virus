@@ -19,6 +19,7 @@ const ftm = @import("ftm.zig");
 const ftm_build = @import("ftm_build.zig");
 const cdb = @import("cdb.zig");
 const container = @import("../match/container.zig");
+const regex_pool = @import("../match/regex_pool.zig");
 const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
@@ -85,7 +86,7 @@ pub const Compiler = struct {
         } else if (std.mem.eql(u8, ext, "ftm")) {
             try ftm.parse(c.gpa, arena, owned_name, owned, .{ .rules = &c.magics, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "cdb") or std.mem.eql(u8, ext, "cdu")) {
-            try cdb.parse(c.gpa, owned_name, owned, ext[2] == 'u', .{ .rules = &c.containers, .rejected = &c.rejected });
+            try cdb.parse(c.gpa, arena, owned_name, owned, ext[2] == 'u', .{ .rules = &c.containers, .rejected = &c.rejected });
         } else if (filters.allowlistFormat(ext)) |fmt| {
             try hashsig.parse(c.gpa, fmt, owned_name, owned, .{ .rules = &c.allow, .rejected = &c.rejected });
         } else if (std.mem.eql(u8, ext, "ign2")) {
@@ -282,8 +283,21 @@ pub const Compiler = struct {
         defer ldb_entries.deinit(c.gpa);
         const logical_sigs = built.extra_sigs[kept_bodies.items.len..][0..kept_logicals.items.len];
         const container_sigs = built.extra_sigs[kept_bodies.items.len + kept_logicals.items.len ..];
-        const cdb_raw = try container.build(c.gpa, kept_containers.items, container_sigs);
+        // Every compiled regex goes into one REGEX_POOL; records refer to it by index.
+        var regex_blobs: std.ArrayList([]const u8) = .empty;
+        defer regex_blobs.deinit(c.gpa);
+        const cdb_regex = try arena.alloc(?u32, kept_containers.items.len);
+        for (kept_containers.items, cdb_regex) |rule, *slot| {
+            slot.* = null;
+            if (rule.filename_program) |blob| {
+                slot.* = @intCast(regex_blobs.items.len);
+                try regex_blobs.append(c.gpa, blob);
+            }
+        }
+        const cdb_raw = try container.build(c.gpa, kept_containers.items, container_sigs, cdb_regex);
         defer c.gpa.free(cdb_raw);
+        const pool_raw = try regex_pool.build(c.gpa, regex_blobs.items);
+        defer c.gpa.free(pool_raw);
         const magic = try ftm_build.build(arena, kept_magics.items);
         const magic_programs = try prog_build.build(arena, magic.programs);
         for (kept_logicals.items, logical_variants.items, logical_sigs, 0..) |rule, per_subsig, sig, record| {
@@ -335,6 +349,7 @@ pub const Compiler = struct {
         if (inputs.items.len > 0) try sections.append(c.gpa, .{ .kind = .subsig_prog, .bytes = programs });
         if (ldb_entries.items.len > 0) try sections.append(c.gpa, .{ .kind = .ldb_table, .align_log2 = 12, .bytes = ldb_raw });
         if (kept_containers.items.len > 0) try sections.append(c.gpa, .{ .kind = .cdb_table, .bytes = cdb_raw });
+        if (regex_blobs.items.len > 0) try sections.append(c.gpa, .{ .kind = .regex_pool, .bytes = pool_raw });
         if (kept_magics.items.len > 0) {
             try sections.append(c.gpa, .{ .kind = .ftm_trie, .hot = true, .bytes = magic.trie });
             if (magic.programs.len > 0) try sections.append(c.gpa, .{ .kind = .subsig_prog, .variant = 1, .bytes = magic_programs });
@@ -389,7 +404,7 @@ test "compile files and a container, filter, and write a database" {
     try c.addFile("main.ndb", "Eicar:0:*:58354f\nBroken:0:*:58(35\n");
     try c.addFile("main.pdb", "R:example.com\n");
     try c.addFile("daily.ftm", "0:0:4d5a:DOS executable:CL_TYPE_ANY:CL_TYPE_MSEXE\n1:*:504b0304:ZIP-SFX:CL_TYPE_MSEXE:CL_TYPE_ZIPSFX\n7:0:00:Bad:CL_TYPE_ANY:CL_TYPE_ZIP\n");
-    try c.addFile("daily.cdb", "Zip.Meta-1-0:CL_TYPE_ZIP:*:*:*:1000:*:1:*:*\nZip.Regex-2-0:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:*:*\n");
+    try c.addFile("daily.cdb", "Zip.Meta-1-0:CL_TYPE_ZIP:*:*:*:1000:*:1:*:*\nZip.Regex-2-0:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:*:*\nZip.Backref-3-0:*:*:(a)\\1:*:*:*:*:*:*\n");
     try c.addFile("main.ldb", "Logical.Test-1-0;Target:0;0&1;4142;4344::i\nLogical.Bad-2-0;Target:0;0=0;4142\n");
     const summary = try c.write(io, tmp.dir, "out.zavdb", .{ .db_version = 1 });
     try std.testing.expectEqual(@as(u64, 2), summary.hash_rules); // two from the container
@@ -397,7 +412,7 @@ test "compile files and a container, filter, and write a database" {
     try std.testing.expectEqual(@as(u64, 1), summary.body_rules);
     try std.testing.expectEqual(@as(u64, 1), summary.logical_rules);
     try std.testing.expectEqual(@as(u64, 2), summary.magic_rules);
-    try std.testing.expectEqual(@as(u64, 1), summary.container_rules);
+    try std.testing.expectEqual(@as(u64, 2), summary.container_rules);
     try std.testing.expectEqual(@as(u64, 1 + 1 + 4), summary.programs); // ndb, then 1 + 4 nocase variants
 
     const opened = try db.reader.open(io, tmp.dir, "out.zavdb", .{ .allow_unsigned = true });
@@ -410,9 +425,11 @@ test "compile files and a container, filter, and write a database" {
     try std.testing.expect(std.mem.indexOf(u8, report, "main.pdb: 1 skipped (unsupported_database)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.ldb: 1 skipped (expr_true_without_hits)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "daily.ftm: 1 skipped (bad_magic_type)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (cdb_regex_needs_zig_regex)") != null);
-    const cdbt = try container.CdbTable.init(opened.section(.cdb_table, 0).?);
-    try std.testing.expectEqual(@as(usize, 1), cdbt.records.len);
+    try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (regex_unsupported)") != null);
+    const pool = try regex_pool.RegexPool.init(opened.section(.regex_pool, 0).?);
+    const cdbt = try container.CdbTable.init(opened.section(.cdb_table, 0).?, pool);
+    try std.testing.expectEqual(@as(usize, 2), cdbt.records.len);
+    try std.testing.expectEqual(@as(usize, 1), pool.count());
     const magic_progs = try prog.Programs.init(opened.section(.subsig_prog, 1).?);
     _ = try @import("../fmt/ftm.zig").Ftm.init(opened.section(.ftm_trie, 0).?, magic_progs);
     const progs = try prog.Programs.init(opened.section(.subsig_prog, 0).?);

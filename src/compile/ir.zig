@@ -122,7 +122,11 @@ pub const Reason = enum(u8) {
     bad_magic_type,
     bad_magic,
     bad_cdb_field,
-    cdb_regex_needs_zig_regex,
+    /// A regex zig-regex cannot parse.
+    regex_syntax,
+    /// A regex that needs the backtracking engine (backreferences, lookaround, lazy repeats,
+    /// a repeated group holding an alternation, ...), so no allocation-free program exists.
+    regex_unsupported,
 };
 
 pub const Rejection = struct {
@@ -458,6 +462,8 @@ pub const CdbRule = struct {
     container: ?u16 = null,
     container_size: ?Range = null,
     filename_regex: ?[]const u8 = null,
+    /// The regex compiled to a serialised zig-regex byte-mode program.
+    filename_program: ?[]const u8 = null,
     size_in_container: ?Range = null,
     size_real: ?Range = null,
     encrypted: ?bool = null,

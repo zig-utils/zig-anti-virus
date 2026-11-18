@@ -20,6 +20,25 @@ const limits = @import("limits.zig");
 const Budget = @import("budget.zig").Budget;
 const detect = @import("../fmt/detect.zig");
 pub const Format = detect.Format;
+const cdb_match = @import("../match/container.zig");
+const regex = @import("regex");
+
+/// What the archive parsers need to check `.cdb` signatures: the table and a zig-regex scratch
+/// sized for its filename regexes (`RegexPool.capacity`), owned by the worker.
+pub const CdbHook = struct {
+    table: cdb_match.CdbTable,
+    scratch: ?*regex.Scratch = null,
+
+    /// Check one member and report a match (or an undecidable regex) as a notice at the
+    /// member's path. Callers push the member name first.
+    pub fn check(hook: *const CdbHook, w: *Walker, member: cdb_match.Member) void {
+        const sig = hook.table.check(member, hook.scratch) catch {
+            w.limit(.regex_steps);
+            return;
+        } orelse return;
+        w.notice(.{ .container_signature = sig }, "cdb");
+    }
+};
 
 /// Block size for raw-byte feeding and stream buffers.
 pub const block_len: usize = 64 * 1024;
@@ -82,6 +101,8 @@ pub const Notice = struct {
         external,
         /// An embedded object or package declared by the document.
         embedded,
+        /// A container metadata (.cdb) signature matched this member: its signature id.
+        container_signature: u32,
     };
 };
 
@@ -129,6 +150,8 @@ pub const Walker = struct {
         memory_child_max: u64 = memory_child_max,
         /// Heuristic detections (engine/heuristics.zig); null turns them off.
         heuristics: ?*const @import("heuristics.zig").Config = null,
+        /// Container metadata signatures, checked once per member by the archive parsers.
+        cdb: ?*const CdbHook = null,
     };
 
     /// Scan a top-level object. Limit events are reported as notices; error.Halted means the walk

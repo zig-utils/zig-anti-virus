@@ -8,6 +8,7 @@ pub const anchored = @import("anchored.zig");
 pub const ldb_table = @import("ldb_table.zig");
 pub const logical = @import("logical.zig");
 pub const container = @import("container.zig");
+pub const regex_pool = @import("regex_pool.zig");
 
 test {
     _ = hashidx;
@@ -17,4 +18,5 @@ test {
     _ = ldb_table;
     _ = logical;
     _ = container;
+    _ = regex_pool;
 }

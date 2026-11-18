@@ -744,8 +744,11 @@ fn cdbLine(random: std.Random) void {
     @memcpy(buf[0..seed.len], seed);
     const line = mutate(random, &buf, seed.len, "0123456789abcdef:*-CL_TYPE_ZIP");
     var column: u32 = 0;
-    if (zav.compile.cdb.parseLine(line, &column)) |rule| {
-        if (rule.filename_regex != null) @panic("fuzz: cdb accepted a regex it cannot evaluate");
+    var mem: [256 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    if (zav.compile.cdb.parseLine(fba.allocator(), line, &column)) |rule| {
+        if ((rule.filename_regex != null) != (rule.filename_program != null)) @panic("fuzz: cdb regex without a program");
+        if (rule.filename_program) |blob| _ = zav.regex.Program.load(blob) catch @panic("fuzz: cdb regex program does not load");
         if (rule.file_pos) |p| if (p.lo == 0) @panic("fuzz: cdb position 0");
     } else |_| {
         if (column > line.len) @panic("fuzz: cdb column out of range");

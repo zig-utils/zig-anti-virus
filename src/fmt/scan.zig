@@ -623,3 +623,54 @@ test "heuristics: each one fires on its positive fixture, and only when enabled"
         try std.testing.expect(!rig.rec.has(.heuristic));
     }
 }
+
+test "container metadata (.cdb) signatures fire on zip members, filename regex included" {
+    const gpa = std.testing.allocator;
+    const ir = @import("../compile/ir.zig");
+    const cdb = @import("../compile/cdb.zig");
+    const cdb_match = @import("../match/container.zig");
+    const regex_pool = @import("../match/regex_pool.zig");
+    const regex = @import("regex");
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var column: u32 = 0;
+    const rules = [_]ir.CdbRule{
+        // The third member, stored: 68 bytes in and out, its CRC, not encrypted.
+        try cdb.parseLine(arena, "Zip.Eicar.Meta-1-0:CL_TYPE_ZIP:*:eicar\\.com$:68:68:0:3:6851cf3c:*", &column),
+        try cdb.parseLine(arena, "Zip.Encrypted-2-0:CL_TYPE_ZIP:*:^secret:*:*:1:*:*:*", &column),
+    };
+    const pool_bytes = try regex_pool.build(arena, &.{ rules[0].filename_program.?, rules[1].filename_program.? });
+    const pool_image = try arena.alignedAlloc(u8, .@"8", pool_bytes.len);
+    @memcpy(pool_image, pool_bytes);
+    const pool = try regex_pool.RegexPool.init(pool_image);
+    const table_bytes = try cdb_match.build(arena, &rules, &.{ 1, 2 }, &.{ 0, 1 });
+    const table_image = try arena.alignedAlloc(u8, .@"8", table_bytes.len);
+    @memcpy(table_image, table_bytes);
+    const capacity = pool.capacity(64);
+    const mem = try arena.alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
+    var scratch = try regex.Scratch.initBuffer(mem, capacity);
+    const hook: container.CdbHook = .{ .table = try cdb_match.CdbTable.init(table_image, pool), .scratch = &scratch };
+
+    const Case = struct { []const u8, ?u32, []const u8 };
+    for ([_]Case{
+        .{ "stored.zip", 1, "stored.zip/eicar.com" },
+        .{ "deflate.zip", null, "" }, // compressed: the stored size differs
+        .{ "encrypted.zip", 2, "encrypted.zip/secret.bin" },
+    }) |c| {
+        const a = for (fixtures.archives) |x| {
+            if (std.mem.eql(u8, x.name, c[0])) break x;
+        } else unreachable;
+        var rig: TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        rig.walker.options.cdb = &hook;
+        try rig.scanBoth(a.bytes, a.name);
+        var hit: ?u32 = null;
+        for (rig.rec.notices.items) |n| if (n.what == .container_signature) {
+            hit = n.what.container_signature;
+            try std.testing.expectEqualStrings(c[2], n.path);
+        };
+        try std.testing.expectEqual(c[1], hit);
+    }
+}

@@ -44,6 +44,7 @@ const Entry = struct {
     method: u16,
     flags: u16,
     name_len: u16,
+    crc: u32 = 0,
     skip: bool = false,
 };
 
@@ -189,6 +190,7 @@ fn readDirectory(w: *Walker, src: Source, d: Directory, total: u64, extra: []u8)
             .cd_off = off,
             .flags = Le.u16at(&rec, 8),
             .method = Le.u16at(&rec, 10),
+            .crc = Le.u32at(&rec, 16),
             .csize = Le.u32at(&rec, 20),
             .usize = Le.u32at(&rec, 24),
             .local_off = Le.u32at(&rec, 42),
@@ -234,6 +236,7 @@ fn applyZip64(extra: []const u8, usize_v: *u64, csize: *u64, local_off: *u64) vo
 const Local = struct {
     flags: u16,
     method: u16,
+    crc: u32,
     csize: u64,
     usize: u64,
     name_len: u16,
@@ -249,6 +252,7 @@ fn readLocal(w: *Walker, src: Source, off: u64, extra: []u8) ?Local {
     var l: Local = .{
         .flags = Le.u16at(&h, 6),
         .method = Le.u16at(&h, 8),
+        .crc = Le.u32at(&h, 14),
         .csize = Le.u32at(&h, 18),
         .usize = Le.u32at(&h, 22),
         .name_len = Le.u16at(&h, 26),
@@ -279,15 +283,17 @@ fn scanListed(w: *Walker, src: Source, entries: []Entry, buf: []u8) Error!void {
     }
     markOverlaps(w, entries);
     var name_buf: [max_name]u8 = undefined;
+    var position: u32 = 0;
     for (entries) |*e| {
         if (w.halt != null) return error.Halted;
         const name = name_buf[0..@min(e.name_len, max_name)];
         src.readAllAt(w.io, e.cd_off +| 46, name) catch continue;
+        if (!isDirectory(name, e.csize)) position +|= 1;
         if (e.skip) {
             if (e.data_off > total or e.data_off == 0) w.notice(.malformed, "zip: entry has no readable local header");
             continue;
         }
-        try member(w, src, name, e.data_off, e.csize, e.usize, e.method, e.flags);
+        try member(w, src, name, e.data_off, e.csize, e.usize, e.method, e.flags, .{ .crc = e.crc, .position = position });
     }
 }
 
@@ -324,6 +330,7 @@ fn walkLocal(w: *Walker, src: Source, listed: []const Entry, total: u64, base: u
     var off: u64 = base;
     var name_buf: [max_name]u8 = undefined;
     var unlisted_reported = false;
+    var unlisted: usize = 0;
     var steps: usize = 0;
     while (off +| 30 <= total) : (steps += 1) {
         if (w.halt != null) return error.Halted;
@@ -355,7 +362,8 @@ fn walkLocal(w: *Walker, src: Source, listed: []const Entry, total: u64, base: u
             }
             const name = name_buf[0..@min(l.name_len, max_name)];
             src.readAllAt(w.io, off +| 30, name) catch return;
-            try member(w, src, name, l.data_off, @min(csize, total -| l.data_off), if (known) l.usize else 0, l.method, l.flags);
+            if (!isDirectory(name, l.csize)) unlisted += 1;
+            try member(w, src, name, l.data_off, @min(csize, total -| l.data_off), if (known) l.usize else 0, l.method, l.flags, .{ .crc = l.crc, .position = @intCast(@min(listed.len + unlisted, std.math.maxInt(u32))) });
         }
         off = l.data_off +| csize;
         if (l.flags & 8 != 0) off +|= descriptorLen(w, src, off);
@@ -395,8 +403,34 @@ fn findSig(w: *Walker, src: Source, from: u64, total: u64) ?u64 {
     return null;
 }
 
-fn member(w: *Walker, src: Source, name: []const u8, data_off: u64, csize: u64, usize_v: u64, method: u16, flags: u16) Error!void {
-    if (name.len > 0 and name[name.len - 1] == '/' and csize == 0) return; // a directory
+/// What a member contributes to `.cdb` checks beyond its sizes and flags.
+const Meta = struct {
+    crc: u32,
+    /// 1-based among the files (directories do not count), in central directory order;
+    /// local entries the directory does not list follow.
+    position: u32,
+};
+
+fn isDirectory(name: []const u8, csize: u64) bool {
+    return name.len > 0 and name[name.len - 1] == '/' and csize == 0;
+}
+
+fn member(w: *Walker, src: Source, name: []const u8, data_off: u64, csize: u64, usize_v: u64, method: u16, flags: u16, meta: Meta) Error!void {
+    if (isDirectory(name, csize)) return;
+    if (w.options.cdb) |hook| {
+        w.path.push(name);
+        defer w.path.pop();
+        hook.check(w, .{
+            .container_type = .zip,
+            .container_size = src.len().?,
+            .name = name,
+            .size_in_container = csize,
+            .size_real = usize_v,
+            .encrypted = flags & 1 != 0 or method == 99,
+            .position = meta.position,
+            .crc = meta.crc,
+        });
+    }
     if (flags & 1 != 0 or method == 99) {
         w.path.push(name);
         defer w.path.pop();
