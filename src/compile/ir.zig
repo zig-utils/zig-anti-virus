@@ -112,7 +112,10 @@ pub const Reason = enum(u8) {
     expr_true_without_hits,
     too_many_subsigs,
     unknown_file_type,
-    pcre_needs_byte_mode,
+    /// A malformed PCRE subsig: trigger, delimiters, flags or the e flag without a maxshift.
+    bad_pcre,
+    /// A PCRE flag combination whose results would differ from PCRE's (U with g).
+    pcre_flag_unsupported,
     macro_unsupported,
     fuzzy_image_unsupported,
     icon_unsupported,
@@ -404,9 +407,32 @@ pub const ByteCompare = struct {
 /// Text widths up to this many characters; binary widths are 1, 2, 4 or 8.
 pub const max_text_width: u8 = 20;
 
+pub const PcreFlags = packed struct(u8) {
+    /// `g`: count every match, not just the first.
+    global: bool = false,
+    /// `r`: search from the offset on instead of only at it.
+    rolling: bool = false,
+    /// `e`: the whole match lies between the offset and offset + maxshift.
+    encompass: bool = false,
+    /// `A`: the match starts exactly where the search starts.
+    anchored: bool = false,
+    _: u4 = 0,
+};
+
+/// `[Offset:]Trigger/Pattern/[Flags]`: runs only when `trigger` (over earlier subsigs) is true.
+pub const PcreSubsig = struct {
+    trigger: []const RpnOp,
+    pattern: []const u8,
+    /// The pattern as a serialised zig-regex byte-mode program (flags i, s, m, x applied).
+    program: []const u8,
+    offset: Offset = .{},
+    flags: PcreFlags = .{},
+};
+
 pub const LogicalSubsig = union(enum) {
     hex: Subsig,
     byte_compare: ByteCompare,
+    pcre: PcreSubsig,
 };
 
 /// An `.ldb` logical signature.

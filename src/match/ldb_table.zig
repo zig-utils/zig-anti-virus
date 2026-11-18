@@ -7,6 +7,10 @@
 //!     rpn:     [rpn_count]ir.RpnOp (8 bytes)
 //!     tdbs:    [count]TdbRecord (96 bytes)    record i's target description
 //!     bcs:     [bc_count]BcRecord (32 bytes)  byte-compare subsigs, by record
+//!     pcres:   [pcre_count]PcreRecord (24 bytes)  PCRE subsigs, by record, in subsig order
+//!
+//! PCRE triggers are RPN expressions in the same pool as the main expressions; PCRE programs
+//! are REGEX_POOL entries.
 //!
 //! A record's subsignature programs are a contiguous range of SUBSIG_PROG, each flagged as a
 //! logical subsig and pointing back at the record. `LdbTable.init` checks all of that, and that
@@ -14,6 +18,7 @@
 const std = @import("std");
 const ir = @import("../compile/ir.zig");
 const prog = @import("prog.zig");
+const regex_pool = @import("regex_pool.zig");
 
 pub const LdbHeader = extern struct {
     magic: [4]u8 = "LDBT".*,
@@ -21,7 +26,8 @@ pub const LdbHeader = extern struct {
     count: u32,
     rpn_count: u32,
     bc_count: u32 = 0,
-    _reserved: [12]u8 = @splat(0),
+    pcre_count: u32 = 0,
+    _reserved: [8]u8 = @splat(0),
 };
 
 /// Record flag: the expression compares counts, so per-subsig counters are needed.
@@ -39,8 +45,9 @@ pub const LdbRecord = extern struct {
     /// Byte-compare subsigs (P4.12): range in the byte-compare array.
     bc_first: u32 = 0,
     bc_count: u16 = 0,
-    _pad: u16 = 0,
-    _reserved: u32 = 0,
+    /// PCRE subsigs: range in the PCRE array.
+    pcre_count: u16 = 0,
+    pcre_first: u32 = 0,
 };
 
 pub const tdb_file_size: u8 = 1 << 0;
@@ -132,7 +139,28 @@ pub const BcRecord = extern struct {
     }
 };
 
+/// A PCRE subsig (docs: LogicalSignatures, PCRE subsignatures).
+pub const PcreRecord = extern struct {
+    subsig: u8,
+    flags: ir.PcreFlags,
+    trigger_len: u16,
+    /// The trigger expression's first op in the RPN pool.
+    trigger_off: u32,
+    /// REGEX_POOL index of the program.
+    regex: u32,
+    off_kind: ir.OffsetKind,
+    _pad: u8 = 0,
+    off_section: u16,
+    off_a: i32,
+    off_shift: u32,
+
+    pub fn offset(r: PcreRecord) ir.Offset {
+        return .{ .kind = r.off_kind, .a = r.off_a, .section = r.off_section, .shift = r.off_shift };
+    }
+};
+
 comptime {
+    std.debug.assert(@sizeOf(PcreRecord) == 24);
     std.debug.assert(@sizeOf(BcRecord) == 32);
     std.debug.assert(@sizeOf(LdbHeader) == 32);
     std.debug.assert(@sizeOf(LdbRecord) == 32);
@@ -217,10 +245,17 @@ pub const LdbTable = struct {
     rpn: []const ir.RpnOp,
     tdbs: []const TdbRecord,
     bcs: []const BcRecord,
+    pcres: []const PcreRecord = &.{},
+    regexes: ?regex_pool.RegexPool = null,
 
     pub const Error = error{BadLdbTable};
 
     pub fn init(section: []const u8, programs: ?prog.Programs) Error!LdbTable {
+        return initWith(section, programs, null);
+    }
+
+    /// Validate against the programs and the regex pool the records refer to.
+    pub fn initWith(section: []const u8, programs: ?prog.Programs, regexes: ?regex_pool.RegexPool) Error!LdbTable {
         if (section.len < @sizeOf(LdbHeader) or @intFromPtr(section.ptr) % 8 != 0) return error.BadLdbTable;
         const h: *const LdbHeader = @ptrCast(@alignCast(section.ptr));
         if (!std.mem.eql(u8, &h.magic, "LDBT") or h.version != 1) return error.BadLdbTable;
@@ -228,19 +263,37 @@ pub const LdbTable = struct {
         const rpn_at = records_at + @as(usize, h.count) * @sizeOf(LdbRecord);
         const tdb_at = std.mem.alignForward(usize, rpn_at + @as(usize, h.rpn_count) * @sizeOf(ir.RpnOp), 8);
         const bc_at = tdb_at + @as(usize, h.count) * @sizeOf(TdbRecord);
-        const end = bc_at + @as(usize, h.bc_count) * @sizeOf(BcRecord);
+        const pcre_at = bc_at + @as(usize, h.bc_count) * @sizeOf(BcRecord);
+        const end = pcre_at + @as(usize, h.pcre_count) * @sizeOf(PcreRecord);
         if (end > section.len) return error.BadLdbTable;
+        const pc: [*]const PcreRecord = @ptrCast(@alignCast(section.ptr + pcre_at));
         const b: [*]const BcRecord = @ptrCast(@alignCast(section.ptr + bc_at));
         const r: [*]const LdbRecord = @ptrCast(@alignCast(section.ptr + records_at));
         const o: [*]const ir.RpnOp = @ptrCast(@alignCast(section.ptr + rpn_at));
         const t: [*]const TdbRecord = @ptrCast(@alignCast(section.ptr + tdb_at));
-        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count], .bcs = b[0..h.bc_count] };
+        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count], .bcs = b[0..h.bc_count], .pcres = pc[0..h.pcre_count], .regexes = regexes };
+        const nregex = if (regexes) |pool| pool.count() else 0;
         const nprog = if (programs) |ps| ps.count() else 0;
         for (table.records, table.tdbs, 0..) |rec, tdb, i| {
             if (rec.nsub == 0 or rec.nsub > ir.max_subsigs) return error.BadLdbTable;
             if (@as(u64, rec.expr_off) + rec.expr_len > h.rpn_count) return error.BadLdbTable;
             if (!checkRpn(table.expr(rec), rec.nsub)) return error.BadLdbTable;
-            if ((rec.flags & flag_counts != 0) != usesCounts(table.expr(rec))) return error.BadLdbTable;
+            if (@as(u64, rec.pcre_first) + rec.pcre_count > h.pcre_count) return error.BadLdbTable;
+            var counts_needed = usesCounts(table.expr(rec));
+            var prev_pcre: i16 = -1;
+            for (table.pcres[rec.pcre_first..][0..rec.pcre_count]) |pr| {
+                // In subsig order, each trigger naming only earlier subsigs.
+                if (pr.subsig >= rec.nsub or @as(i16, pr.subsig) <= prev_pcre) return error.BadLdbTable;
+                prev_pcre = pr.subsig;
+                if (@as(u64, pr.trigger_off) + pr.trigger_len > h.rpn_count) return error.BadLdbTable;
+                const trig = table.rpn[pr.trigger_off..][0..pr.trigger_len];
+                if (!checkRpn(trig, pr.subsig)) return error.BadLdbTable;
+                if (pr.regex >= nregex) return error.BadLdbTable;
+                if (@as(u8, @bitCast(pr.flags)) & 0xf0 != 0) return error.BadLdbTable;
+                if (@backingInt(pr.off_kind) > @backingInt(ir.OffsetKind.last_section)) return error.BadLdbTable;
+                counts_needed = counts_needed or usesCounts(trig);
+            }
+            if ((rec.flags & flag_counts != 0) != counts_needed) return error.BadLdbTable;
             if (tdb.target > 14 or tdb.intermediate_count > ir.max_intermediates) return error.BadLdbTable;
             if (@as(u64, rec.prog_first) + rec.prog_count > nprog) return error.BadLdbTable;
             if (@as(u64, rec.bc_first) + rec.bc_count > h.bc_count) return error.BadLdbTable;
@@ -251,6 +304,9 @@ pub const LdbTable = struct {
                 if (ph.flags & prog.flag_ldb == 0 or ph.sig != i or ph.subsig >= rec.nsub) return error.BadLdbTable;
                 with_programs |= @as(u64, 1) << @intCast(ph.subsig);
             };
+            for (table.pcres[rec.pcre_first..][0..rec.pcre_count]) |pr| {
+                if (with_programs & (@as(u64, 1) << @intCast(pr.subsig)) != 0) return error.BadLdbTable;
+            }
             for (table.bcs[rec.bc_first..][0..rec.bc_count]) |bc| {
                 if (!validBc(bc, rec.nsub)) return error.BadLdbTable;
                 const own = @as(u64, 1) << @intCast(bc.subsig);
@@ -267,6 +323,14 @@ pub const LdbTable = struct {
 
     pub fn byteCompares(table: LdbTable, rec: LdbRecord) []const BcRecord {
         return table.bcs[rec.bc_first..][0..rec.bc_count];
+    }
+
+    pub fn pcreSubsigs(table: LdbTable, rec: LdbRecord) []const PcreRecord {
+        return table.pcres[rec.pcre_first..][0..rec.pcre_count];
+    }
+
+    pub fn trigger(table: LdbTable, pr: PcreRecord) []const ir.RpnOp {
+        return table.rpn[pr.trigger_off..][0..pr.trigger_len];
     }
 };
 

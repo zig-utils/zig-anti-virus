@@ -8,7 +8,8 @@
 //! The expression compiles to RPN (`ir.RpnOp`); `&` binds tighter than `|`, parentheses group,
 //! and `=X`, `>X`, `<X` (each with an optional `,Y` distinct count) apply to the subsig or block
 //! before them. Subsignatures are hex bodies with an optional `Offset:` prefix and `::iwfa`
-//! modifiers, or byte compares (`trigger(>>offset#options#comparisons)`); PCRE, macro and
+//! modifiers, byte compares (`trigger(>>offset#options#comparisons)`) or PCRE subsigs
+//! (`[Offset:]Trigger/Pattern/[Flags]`, compiled to zig-regex byte-mode programs); macro and
 //! fuzzy-image subsigs are recognised and rejected with a reason until their matchers land. At
 //! most 64 subsigs. `.ldu` holds PUA signatures.
 const std = @import("std");
@@ -17,6 +18,7 @@ const hexsig = @import("hexsig.zig");
 const ndb = @import("ndb.zig");
 const types = @import("../fmt/types.zig");
 const ldb_table = @import("../match/ldb_table.zig");
+const cdb = @import("cdb.zig");
 
 pub const LineError = error{
     FieldCount,
@@ -33,7 +35,10 @@ pub const LineError = error{
     BadOffset,
     OffsetNeedsExecutable,
     VersionInfoUnsupported,
-    PcreNeedsByteMode,
+    BadPcre,
+    PcreFlagUnsupported,
+    RegexSyntax,
+    RegexUnsupported,
     MacroUnsupported,
     FuzzyImageUnsupported,
     BadByteCompare,
@@ -55,7 +60,10 @@ pub fn reasonOf(err: LineError) ir.Reason {
         error.BadOffset => .bad_offset,
         error.OffsetNeedsExecutable => .offset_needs_executable,
         error.VersionInfoUnsupported => .version_info_unsupported,
-        error.PcreNeedsByteMode => .pcre_needs_byte_mode,
+        error.BadPcre => .bad_pcre,
+        error.PcreFlagUnsupported => .pcre_flag_unsupported,
+        error.RegexSyntax => .regex_syntax,
+        error.RegexUnsupported => .regex_unsupported,
         error.MacroUnsupported => .macro_unsupported,
         error.FuzzyImageUnsupported => .fuzzy_image_unsupported,
         error.BadByteCompare => .bad_byte_compare,
@@ -81,6 +89,7 @@ pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source_name: []co
             r.flags.pua = pua;
             try out.rules.append(gpa, r);
         } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             try out.rejected.append(gpa, .{ .source_name = source_name, .line_number = line_number, .reason = reasonOf(err), .column = column });
         }
     }
@@ -131,7 +140,7 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
             column.* = colOf(line, text);
             return error.BadByteCompare;
         },
-        .hex => {},
+        .hex, .pcre => {},
     };
     column.* = 0;
     return .{
@@ -321,8 +330,7 @@ fn parseSubsig(arena: std.mem.Allocator, text: []const u8, index: usize, target:
     if (std.mem.startsWith(u8, text, "fuzzy_img#")) return error.FuzzyImageUnsupported;
     if (isByteCompare(text)) return .{ .byte_compare = try parseByteCompare(text, index) };
     if (std.mem.indexOfScalar(u8, text, '/')) |slash| {
-        try checkPcre(arena, text, slash, index);
-        return error.PcreNeedsByteMode;
+        return .{ .pcre = try parsePcre(arena, text, slash, index, target) };
     }
 
     var body = text;
@@ -472,19 +480,80 @@ test "byte-compare subsignatures: every encoding, width and endianness option" {
     }) |bad| try testing.expectError(error.BadByteCompare, parseByteCompare(bad, 1));
 }
 
-/// `[Offset:]Trigger/Pattern/[Flags]`: the trigger may name only earlier subsigs, the pattern
-/// is non-empty, the flags are the documented ones.
-fn checkPcre(arena: std.mem.Allocator, text: []const u8, first_slash: usize, index: usize) LineError!void {
+/// `[Offset:]Trigger/Pattern/[Flags]`. The trigger may name only earlier subsigs and must not be
+/// true without any hits (sparse evaluation would never run it); the pattern is everything
+/// between the first and the last `/`. Flags: `g` count all matches, `r` rolling search from the
+/// offset, `e` confine the match to offset..offset+maxshift (needs a maxshift), `A` anchored,
+/// and `i s m x` for the regex. `E` (dollar end-only) and `U` (ungreedy) do not change whether
+/// or where a match starts, so they are accepted, except `U` with `g`, whose counts depend on
+/// match ends.
+pub fn parsePcre(arena: std.mem.Allocator, text: []const u8, first_slash: usize, index: usize, target: u8) LineError!ir.PcreSubsig {
     const last = std.mem.lastIndexOfScalar(u8, text, '/').?;
-    if (last == first_slash or last == first_slash + 1) return error.BadExpression;
-    var trigger = text[0..first_slash];
-    if (std.mem.indexOfScalar(u8, trigger, ':')) |colon| {
-        _ = try ndb.parseOffset(trigger[0..colon]);
-        trigger = trigger[colon + 1 ..];
+    if (last == first_slash or last == first_slash + 1) return error.BadPcre;
+    var trigger_text = text[0..first_slash];
+    var pcre: ir.PcreSubsig = .{ .trigger = &.{}, .pattern = text[first_slash + 1 .. last], .program = &.{} };
+    if (std.mem.indexOfScalar(u8, trigger_text, ':')) |colon| {
+        pcre.offset = ndb.parseOffset(trigger_text[0..colon]) catch |err| return switch (err) {
+            error.VersionInfoUnsupported => error.VersionInfoUnsupported,
+            else => error.BadPcre,
+        };
+        if (ndb.needsExecutable(pcre.offset.kind) and !ndb.isExecutableTarget(target)) return error.OffsetNeedsExecutable;
+        trigger_text = trigger_text[colon + 1 ..];
     }
-    if (index == 0 or trigger.len == 0) return error.BadExpression;
-    _ = try parseExpression(arena, trigger, index, index);
-    for (text[last + 1 ..]) |c| if (std.mem.indexOfScalar(u8, "greismxAEU", c) == null) return error.BadExpression;
+    if (index == 0 or trigger_text.len == 0) return error.BadPcre;
+    pcre.trigger = parseExpression(arena, trigger_text, index, index) catch return error.BadPcre;
+    var zeros: [ir.max_subsigs]u32 = @splat(0);
+    if (ldb_table.evalRpn(pcre.trigger, zeros[0..index])) return error.ExprTrueWithoutHits;
+
+    var flags: regex_flags = .{ .bytes = true };
+    var ungreedy = false;
+    for (text[last + 1 ..]) |c| switch (c) {
+        'g' => pcre.flags.global = true,
+        'r' => pcre.flags.rolling = true,
+        'e' => pcre.flags.encompass = true,
+        'A' => pcre.flags.anchored = true,
+        'i' => flags.case_insensitive = true,
+        's' => flags.dot_all = true,
+        'm' => flags.multiline = true,
+        'x' => flags.extended = true,
+        'E' => {},
+        'U' => ungreedy = true,
+        else => return error.BadPcre,
+    };
+    if (pcre.flags.encompass and pcre.offset.shift == 0) return error.BadPcre;
+    if (ungreedy and pcre.flags.global) return error.PcreFlagUnsupported;
+    pcre.program = try cdb.compileRegex(arena, pcre.pattern, flags);
+    return pcre;
+}
+
+const regex_flags = @import("regex").common.CompileFlags;
+
+test "pcre subsignatures: offsets, triggers, flags, compile failures" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const p = try parsePcre(a, "200,300:0&1/eval\\(unescape/gie", 11, 2, 0);
+    try testing.expectEqual(ir.OffsetKind.absolute, p.offset.kind);
+    try testing.expectEqual(@as(u32, 300), p.offset.shift);
+    try testing.expect(p.flags.global and p.flags.encompass and !p.flags.rolling);
+    try testing.expectEqualStrings("eval\\(unescape", p.pattern);
+    try testing.expectEqual(@as(usize, 3), p.trigger.len);
+    const q = try parsePcre(a, "0/\\x4d\\x5a.{2}\\x50\\x45/sA", 1, 1, 0);
+    try testing.expect(q.flags.anchored);
+    const Bad = struct { []const u8, usize, LineError };
+    for ([_]Bad{
+        .{ "0//", 1, error.BadPcre },
+        .{ "0/abc", 1, error.BadPcre },
+        .{ "1/abc/", 1, error.BadPcre }, // names itself
+        .{ "/abc/", 1, error.BadPcre },
+        .{ "0/abc/q", 1, error.BadPcre },
+        .{ "0/abc/e", 1, error.BadPcre }, // e needs a maxshift
+        .{ "0/abc/gU", 1, error.PcreFlagUnsupported },
+        .{ "0=0/abc/", 1, error.ExprTrueWithoutHits },
+        .{ "EP+0:0/abc/", 1, error.OffsetNeedsExecutable },
+        .{ "0/(ab/", 1, error.RegexSyntax },
+        .{ "0/(a)\\1/", 1, error.RegexUnsupported },
+    }) |c| try testing.expectError(c[2], parsePcre(a, c[0], std.mem.indexOfScalar(u8, c[0], '/').?, c[1], 0));
 }
 
 const testing = std.testing;
@@ -588,10 +657,9 @@ test "ldb lines: subsignatures with offsets and modifiers, and every rejection" 
         .{ "X;Target:0;0;aabb::q", error.BadModifier, 13 },
         .{ "X;Target:0;0;aa(bb", error.BadAlternation, 15 },
         .{ "X;Target:0;0;10:aa(bb", error.BadAlternation, 18 },
-        .{ "X;Target:0;0&1;aabb;0/abc/i", error.PcreNeedsByteMode, 20 },
-        .{ "X;Target:0;0&1;aabb;1/abc/", error.BadExpression, 20 },
-        .{ "X;Target:0;0&1;aabb;0/abc/q", error.BadExpression, 20 },
-        .{ "X;Target:0;0&1;aabb;0//", error.BadExpression, 20 },
+        .{ "X;Target:0;0&1;aabb;1/abc/", error.BadPcre, 20 },
+        .{ "X;Target:0;0&1;aabb;0/abc/q", error.BadPcre, 20 },
+        .{ "X;Target:0;0&1;aabb;0//", error.BadPcre, 20 },
         .{ "X;Target:0;0&1;aabb;${6-7}12$", error.MacroUnsupported, 20 },
         .{ "X;Target:0;0&1;aabb;0(>>4#ib3#=0x10)", error.BadByteCompare, 20 },
         .{ "X;Target:0;0&1;aabb;1(>>4#ib2#=0x10)", error.BadByteCompare, 20 },

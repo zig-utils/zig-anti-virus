@@ -233,8 +233,8 @@ pub const Compiler = struct {
                     try c.coverage.skip(c.gpa, @tagName(rule.source), hexsig.reasonOf(err));
                     continue :logical;
                 },
-                // Byte compares run at evaluation time and have no program.
-                .byte_compare => out.* = &.{},
+                // Byte compares and PCRE run at evaluation time and have no verify program.
+                .byte_compare, .pcre => out.* = &.{},
             };
             try kept_logicals.append(c.gpa, rule);
             try logical_variants.append(c.gpa, per_subsig);
@@ -296,8 +296,6 @@ pub const Compiler = struct {
         }
         const cdb_raw = try container.build(c.gpa, kept_containers.items, container_sigs, cdb_regex);
         defer c.gpa.free(cdb_raw);
-        const pool_raw = try regex_pool.build(c.gpa, regex_blobs.items);
-        defer c.gpa.free(pool_raw);
         const magic = try ftm_build.build(arena, kept_magics.items);
         const magic_programs = try prog_build.build(arena, magic.programs);
         for (kept_logicals.items, logical_variants.items, logical_sigs, 0..) |rule, per_subsig, sig, record| {
@@ -315,6 +313,13 @@ pub const Compiler = struct {
             }
             try ldb_entries.append(c.gpa, .{ .rule = rule, .sig = sig, .prog_first = first, .prog_count = @intCast(inputs.items.len - first) });
         }
+        // PCRE programs follow, rule by rule in subsig order.
+        for (ldb_entries.items) |*e| {
+            e.regex_first = @intCast(regex_blobs.items.len);
+            try ldb_build.pcrePrograms(e.rule, &regex_blobs, c.gpa);
+        }
+        const pool_raw = try regex_pool.build(c.gpa, regex_blobs.items);
+        defer c.gpa.free(pool_raw);
         const ldb_raw = try ldb_build.build(c.gpa, ldb_entries.items);
         defer c.gpa.free(ldb_raw);
 

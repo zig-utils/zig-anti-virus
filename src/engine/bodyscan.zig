@@ -12,6 +12,7 @@ const vm = @import("../match/verify_vm.zig");
 const anchored = @import("../match/anchored.zig");
 const lt = @import("../match/ldb_table.zig");
 const logical = @import("../match/logical.zig");
+const regex_pool = @import("../match/regex_pool.zig");
 const limits_mod = @import("limits.zig");
 
 pub const BodyIndex = struct {
@@ -19,14 +20,19 @@ pub const BodyIndex = struct {
     /// ANCHORED_INDEX per partition (target type).
     anchored: [15]?anchored.Index = @splat(null),
     ldb: ?lt.LdbTable = null,
+    /// Regex programs (PCRE subsigs, .cdb filename regexes). Size each worker's zig-regex
+    /// scratch with `regexes.capacity(..)` and hand it to its logical state.
+    regexes: ?regex_pool.RegexPool = null,
 
     pub fn load(database: db.reader.Database) !BodyIndex {
-        const bytes = database.section(.subsig_prog, 0) orelse return .{};
-        var index: BodyIndex = .{ .programs = try .init(bytes) };
+        var index: BodyIndex = .{};
+        if (database.section(.regex_pool, 0)) |section| index.regexes = try .init(section);
+        const bytes = database.section(.subsig_prog, 0) orelse return index;
+        index.programs = try .init(bytes);
         for (&index.anchored, 0..) |*slot, p| {
             if (database.section(.anchored_index, @intCast(p))) |section| slot.* = try .init(section, index.programs.?);
         }
-        if (database.section(.ldb_table, 0)) |section| index.ldb = try .init(section, index.programs.?);
+        if (database.section(.ldb_table, 0)) |section| index.ldb = try .initWith(section, index.programs.?, index.regexes);
         return index;
     }
 };
@@ -147,8 +153,12 @@ pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget:
     }
     if (state) |st| if (index.ldb) |table| {
         var out: [1]u32 = undefined;
-        const n = st.finalize(table, data, &out);
+        const n = st.finalizeWith(table, data, info, &out);
         if (st.bc_out_of_bounds) tracker.note(.byte_compare_bounds);
+        if (n == 0 and st.regex_limited) {
+            tracker.note(.regex_steps);
+            return .{ .limited = .regex_steps };
+        }
         if (n > 0) return .{ .infected = .{ .sig = table.records[out[0]].sig, .start = c.last.start, .end = c.last.end } };
     };
     if (c.overflow) {
@@ -227,6 +237,8 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         \\Test.Logical.Pe-3-0;Target:1,FileSize:10-64;0&1;EP+0:e8;4d5a
         \\Test.Logical.Distinct-4-0;Target:7;(0|1|2)>1,2;6f6e65;74776f;746872656565
         \\Test.Logical.Bc-5-0;Target:0;0&1;4c454e3d;0(>>4#de3#>100)
+        \\Test.Logical.Pcre-6-0;Target:0;0&1;3c736372697074;0/eval\s*\(\s*unescape/i
+        \\Test.Logical.PcreCount-7-0;Target:0;1>1;46524147;0/frag[0-9]+/g
         \\
     );
     _ = try c.write(io, tmp.dir, "ldb.zavdb", .{ .db_version = 1 });
@@ -236,9 +248,15 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
     const names = try hashscan.HashIndex.load(database);
 
     // Logical state comes from worker scratch; the heap is never used during scans.
-    var scratch: [1024 * 1024]u8 = undefined;
+    var scratch: [2 * 1024 * 1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
     var state = try logical.State.init(fba.allocator());
+    const regex = @import("regex");
+    const capacity = index.regexes.?.capacity(256);
+    const regex_mem = try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity));
+    var regex_scratch = try regex.Scratch.initBuffer(regex_mem, capacity);
+    regex_scratch.step_budget = 1 << 20;
+    state.regex_scratch = &regex_scratch;
     const reserved = fba.end_index;
     var tracker = limits_mod.Tracker.init(.{});
     var name_buf: [64]u8 = undefined;
@@ -259,6 +277,10 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         .{ "x LEN=512;", .{ .info = .{ .size = 10 } }, "Test.Logical.Bc-5-0" },
         .{ "x LEN=099;", .{ .info = .{ .size = 10 } }, null },
         .{ "x LEN=5", .{ .info = .{ .size = 7 } }, null },
+        .{ "<script>EVAL ( Unescape('x')", .{ .info = .{ .size = 1 } }, "Test.Logical.Pcre-6-0" },
+        .{ "<script>evaluate(unescape)", .{ .info = .{ .size = 1 } }, null },
+        .{ "FRAG frag1 frag22", .{ .info = .{ .size = 1 } }, "Test.Logical.PcreCount-7-0" },
+        .{ "FRAG frag1", .{ .info = .{ .size = 1 } }, null },
     }) |case| {
         state.reset();
         var budget: vm.Budget = .{};

@@ -12,6 +12,8 @@
 const std = @import("std");
 const ir = @import("../compile/ir.zig");
 const lt = @import("ldb_table.zig");
+const vm = @import("verify_vm.zig");
+const regex = @import("regex");
 
 pub const slot_count: usize = 8192;
 /// Entries the table takes before new signatures spill (75% load).
@@ -70,6 +72,11 @@ pub const State = struct {
     all_match: bool = false,
     /// A byte compare pointed outside the data during the last finalize.
     bc_out_of_bounds: bool = false,
+    /// zig-regex matching state for PCRE subsigs, sized for the database's REGEX_POOL
+    /// (`RegexPool.capacity`) and owned by the worker. Without it PCRE subsigs cannot run.
+    regex_scratch: ?*regex.Scratch = null,
+    /// A PCRE subsig could not be decided (step budget, or no scratch) during the last finalize.
+    regex_limited: bool = false,
 
     /// Reserve the table, touched list, counter and trigger pools and the spill arena (about
     /// 500 KiB) from `scratch`. They live as long as the worker.
@@ -96,6 +103,7 @@ pub const State = struct {
         s.triggers = .initBuffer(s.trigger_pool);
         s.spill_arena.reset();
         s.bc_out_of_bounds = false;
+        s.regex_limited = false;
     }
 
     fn recordTrigger(s: *State, table: lt.LdbTable, rec: lt.LdbRecord, ldb: u32, subsig: u16, start: u64) !void {
@@ -204,7 +212,7 @@ pub const State = struct {
         return false;
     }
 
-    fn countsOf(s: *State, table: lt.LdbTable, data: []const u8, ldb: u32, rec: lt.LdbRecord, mask: u64, counters: ?[]const u16, out: *[ir.max_subsigs]u32) []const u32 {
+    fn countsOf(s: *State, table: lt.LdbTable, data: []const u8, info: vm.FileInfo, ldb: u32, rec: lt.LdbRecord, mask: u64, counters: ?[]const u16, out: *[ir.max_subsigs]u32) []const u32 {
         const nsub = rec.nsub;
         for (0..nsub) |i| {
             out[i] = if (counters) |c| c[i] else @intFromBool(mask & (@as(u64, 1) << @intCast(i)) != 0);
@@ -222,13 +230,64 @@ pub const State = struct {
             }
             out[bc.subsig] = if (counters != null) hits else @intFromBool(hits > 0);
         }
+        // PCRE subsigs, in subsig order: each runs only when its trigger over the earlier
+        // subsigs holds.
+        for (table.pcreSubsigs(rec)) |pr| {
+            out[pr.subsig] = 0;
+            if (!lt.evalRpn(table.trigger(pr), out[0..pr.subsig])) continue;
+            const hits = s.runPcre(table, pr, data, info);
+            out[pr.subsig] = if (counters != null) hits else @intFromBool(hits > 0);
+        }
         return out[0..nsub];
+    }
+
+    /// How many times a PCRE subsig matches under its offset and flags.
+    fn runPcre(s: *State, table: lt.LdbTable, pr: lt.PcreRecord, data: []const u8, info: vm.FileInfo) u32 {
+        const scratch = s.regex_scratch orelse {
+            s.regex_limited = true;
+            return 0;
+        };
+        const program = table.regexes.?.get(pr.regex);
+        const off = pr.offset();
+        var lo: usize = 0;
+        var start_hi: usize = std.math.maxInt(usize);
+        var input = data;
+        if (off.kind != .any) {
+            const w = vm.startWindow(off, info) orelse return 0;
+            lo = @intCast(@min(w.lo, data.len));
+            // Without `r` (rolling) the match is anchored to the offset window.
+            if (!pr.flags.rolling) start_hi = @intCast(@min(w.hi, data.len));
+            // `e`: the whole match lies inside offset..offset + maxshift.
+            if (pr.flags.encompass) {
+                input = data[0..@intCast(@min(data.len, w.lo +| off.shift))];
+                start_hi = std.math.maxInt(usize);
+            }
+        }
+        if (pr.flags.anchored) start_hi = lo;
+        var hits: u32 = 0;
+        var pos = lo;
+        while (pos <= input.len) {
+            const m = (program.findFrom(scratch, input, pos) catch {
+                s.regex_limited = true;
+                return hits;
+            }) orelse break;
+            if (m.start > start_hi) break;
+            hits +|= 1;
+            if (!pr.flags.global) break;
+            pos = if (m.end > m.start) m.end else m.start + 1;
+        }
+        return hits;
     }
 
     /// Evaluate every touched, live signature over the file's `data` (byte compares read it).
     /// Matching record indices go into `out` (the first only, unless `all_match`); returns how
     /// many.
     pub fn finalize(s: *State, table: lt.LdbTable, data: []const u8, out: []u32) usize {
+        return s.finalizeWith(table, data, .{ .size = data.len }, out);
+    }
+
+    /// `finalize` with the file's entry point and sections, which PCRE offsets resolve against.
+    pub fn finalizeWith(s: *State, table: lt.LdbTable, data: []const u8, info: vm.FileInfo, out: []u32) usize {
         var n: usize = 0;
         var buf: [ir.max_subsigs]u32 = undefined;
         for (s.touched[0..s.touched_len]) |i| {
@@ -236,7 +295,7 @@ pub const State = struct {
             if (slot.dead != 0) continue;
             const rec = table.records[slot.ldb];
             const counters: ?[]const u16 = if (slot.cnt_off != no_counters) s.counts[slot.cnt_off..][0..rec.nsub] else null;
-            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, slot.ldb, rec, slot.mask, counters, &buf))) {
+            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, info, slot.ldb, rec, slot.mask, counters, &buf))) {
                 if (n == out.len) return n;
                 out[n] = slot.ldb;
                 n += 1;
@@ -247,7 +306,7 @@ pub const State = struct {
             if (e.dead) continue;
             const rec = table.records[e.ldb];
             const counters: ?[]const u16 = if (e.counts.len > 0) e.counts else null;
-            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, e.ldb, rec, e.mask, counters, &buf))) {
+            if (lt.evalRpn(table.expr(rec), s.countsOf(table, data, info, e.ldb, rec, e.mask, counters, &buf))) {
                 if (n == out.len) return n;
                 out[n] = e.ldb;
                 n += 1;
@@ -387,4 +446,107 @@ test "byte compares evaluate against recorded trigger starts" {
     n = s.finalize(f.table, data, &out);
     try testing.expectEqual(@as(usize, 0), n);
     try testing.expect(s.bc_out_of_bounds);
+}
+
+test "pcre subsigs: triggers, offsets, rolling, encompass, anchored and global counts" {
+    const regex_pool = @import("regex_pool.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const lines = [_][]const u8{
+        "Exact-1-0;Target:0;0&1;aa;4:0/abc/", // 0: must start at 4
+        "Rolling-2-0;Target:0;0&1;aa;4:0/abc/r", // 1: anywhere from 4 on
+        "Window-3-0;Target:0;0&1;aa;4,4:0/abc/e", // 2: inside 4..8
+        "Anchored-4-0;Target:0;0&1;aa;0/abc/A", // 3: at 0 only
+        "Global-5-0;Target:0;0&1>1;aa;0/abc/g", // 4: more than one
+        "Trigger-6-0;Target:0;0&1&2;aa;bb;1/abc/", // 5: runs only when bb hit
+    };
+    const rules = try a.alloc(ir.LogicalRule, lines.len);
+    const entries = try a.alloc(@import("../compile/ldb_build.zig").Entry, lines.len);
+    var blobs: std.ArrayList([]const u8) = .empty;
+    for (lines, rules, entries, 0..) |line, *r, *e, i| {
+        var column: u32 = 0;
+        r.* = try ldb_parse.parseLine(a, line, &column);
+        e.* = .{ .rule = r, .sig = @intCast(i), .prog_first = 0, .prog_count = 0, .regex_first = @intCast(blobs.items.len) };
+        try @import("../compile/ldb_build.zig").pcrePrograms(r, &blobs, a);
+    }
+    const pool_bytes = try regex_pool.build(a, blobs.items);
+    const pool_image = try a.alignedAlloc(u8, .@"8", pool_bytes.len);
+    @memcpy(pool_image, pool_bytes);
+    const pool = try regex_pool.RegexPool.init(pool_image);
+    const bytes = try @import("../compile/ldb_build.zig").build(a, entries);
+    const image = try a.alignedAlloc(u8, .@"8", bytes.len);
+    @memcpy(image, bytes);
+    const table = try lt.LdbTable.initWith(image, null, pool);
+
+    var mem: [1024 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var s = try State.init(fba.allocator());
+    const capacity = pool.capacity(64);
+    var scratch = try regex.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity)), capacity);
+    s.regex_scratch = &scratch;
+    s.all_match = true;
+
+    const Case = struct { []const u8, []const u32 };
+    for ([_]Case{
+        .{ "abc.abc", &.{ 0, 1, 2, 3, 4 } }, // abc at 0 (anchored) and at 4 (exact, window)
+        .{ "aa..abc...", &.{ 0, 1, 2 } },
+        .{ "aa...abc..", &.{ 1, 2 } },
+        .{ "aa.....abc", &.{1} },
+        .{ "aa bb abc", &.{ 1, 5 } },
+    }) |c| {
+        s.reset();
+        for (0..lines.len) |l| try s.touch(table, .{}, @intCast(l), 0, 0);
+        if (std.mem.indexOf(u8, c[0], "bb") != null) try s.touch(table, .{}, 5, 1, 0);
+        var out: [8]u32 = undefined;
+        const n = s.finalize(table, c[0], &out);
+        std.mem.sortUnstable(u32, out[0..n], {}, std.sort.asc(u32));
+        testing.expectEqualSlices(u32, c[1], out[0..n]) catch |err| {
+            std.debug.print("case {s}\n", .{c[0]});
+            return err;
+        };
+        try testing.expect(!s.regex_limited);
+    }
+    // Without a scratch a triggered PCRE cannot run: a limit, not a miss.
+    s.reset();
+    s.regex_scratch = null;
+    try s.touch(table, .{}, 1, 0, 0);
+    var out: [8]u32 = undefined;
+    try testing.expectEqual(@as(usize, 0), s.finalize(table, "aa..abc", &out));
+    try testing.expect(s.regex_limited);
+}
+
+test "a worst-case PCRE input stops at the step budget and is reported" {
+    const regex_pool = @import("regex_pool.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var column: u32 = 0;
+    const rule = try ldb_parse.parseLine(a, "Slow-1-0;Target:0;0&1;61;0/[ab]*[ab]*[ab]*[ab]*c/g", &column);
+    var blobs: std.ArrayList([]const u8) = .empty;
+    try @import("../compile/ldb_build.zig").pcrePrograms(&rule, &blobs, a);
+    const pool_bytes = try regex_pool.build(a, blobs.items);
+    const pool_image = try a.alignedAlloc(u8, .@"8", pool_bytes.len);
+    @memcpy(pool_image, pool_bytes);
+    const pool = try regex_pool.RegexPool.init(pool_image);
+    const entries = [_]@import("../compile/ldb_build.zig").Entry{.{ .rule = &rule, .sig = 0, .prog_first = 0, .prog_count = 0 }};
+    const bytes = try @import("../compile/ldb_build.zig").build(a, &entries);
+    const image = try a.alignedAlloc(u8, .@"8", bytes.len);
+    @memcpy(image, bytes);
+    const table = try lt.LdbTable.initWith(image, null, pool);
+
+    const data = try a.alloc(u8, 256 * 1024);
+    @memset(data, 'a');
+    var mem: [1024 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var s = try State.init(fba.allocator());
+    const capacity = pool.capacity(16);
+    var scratch = try regex.Scratch.initBuffer(try fba.allocator().alignedAlloc(u8, .@"8", regex.Scratch.bytesNeeded(capacity)), capacity);
+    scratch.step_budget = 10_000;
+    s.regex_scratch = &scratch;
+    try s.touch(table, .{}, 0, 0, 0);
+    var out: [1]u32 = undefined;
+    try testing.expectEqual(@as(usize, 0), s.finalize(table, data, &out));
+    try testing.expect(s.regex_limited);
+    try testing.expect(scratch.steps <= 10_000);
 }
