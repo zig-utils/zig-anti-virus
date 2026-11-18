@@ -95,6 +95,20 @@ pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source_name: []co
     }
 }
 
+/// A PCRE subsig (`[offset:]trigger/regex/flags`) whose regex is not closed yet: it has one
+/// unescaped '/'.
+fn pcreOpen(field: []const u8) bool {
+    if (isByteCompare(field) or std.mem.startsWith(u8, field, "${") or std.mem.startsWith(u8, field, "fuzzy_img#")) return false;
+    var slashes: usize = 0;
+    var i: usize = 0;
+    while (i < field.len) : (i += 1) {
+        if (field[i] == '\\') {
+            i += 1;
+        } else if (field[i] == '/') slashes += 1;
+    }
+    return slashes == 1;
+}
+
 fn colOf(line: []const u8, field: []const u8) u32 {
     return @intCast(@intFromPtr(field.ptr) - @intFromPtr(line.ptr));
 }
@@ -103,10 +117,19 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
     var fields: [3 + ir.max_subsigs + 1][]const u8 = undefined;
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, line, ';');
-    while (it.next()) |f| {
+    while (it.next()) |first| {
         if (count == fields.len) {
-            column.* = colOf(line, f);
+            column.* = colOf(line, first);
             return error.TooManySubsigs;
+        }
+        // A PCRE subsig may hold ';' (libclamav loads them): until its closing '/', the next
+        // fields are part of it.
+        var f = first;
+        if (count >= 3 and pcreOpen(f)) {
+            while (pcreOpen(f)) {
+                const next = it.next() orelse break;
+                f = line[colOf(line, f) .. colOf(line, next) + next.len];
+            }
         }
         fields[count] = f;
         count += 1;
@@ -126,8 +149,10 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineE
     const nsub = count - 3;
     column.* = colOf(line, fields[2]);
     const expr = try parseExpression(arena, fields[2], nsub, nsub);
-    var zeros: [ir.max_subsigs]u32 = @splat(0);
-    if (ldb_table.evalRpn(expr, zeros[0..nsub])) return error.ExprTrueWithoutHits;
+    // libclamav refuses a signature whose last subsig the expression never names.
+    if (maxIndex(expr) + 1 != nsub) return error.BadExpression;
+    // An expression true with no hits (`0=0`, `1<3`) is evaluated for every file, as libclamav
+    // does; LDB_TABLE lists those records.
 
     const subsigs = try arena.alloc(ir.LogicalSubsig, nsub);
     for (fields[3..count], subsigs, 0..) |text, *sub, i| {
@@ -165,6 +190,15 @@ fn parseRange(text: []const u8) error{BadTdb}!ir.Range {
     return .{ .lo = v, .hi = v };
 }
 
+/// FileSize, EntryPoint and NumberOfSections take `x-y` (libclamav refuses a single value); an
+/// empty bound reads as 0, so `10-` is 10 to 0 and never matches, and `-100` is 0 to 100.
+fn parseTdbRange(text: []const u8) error{BadTdb}!ir.Range {
+    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return error.BadTdb;
+    const lo = if (dash == 0) 0 else std.fmt.parseInt(u64, text[0..dash], 10) catch return error.BadTdb;
+    const hi = if (dash + 1 == text.len) 0 else std.fmt.parseInt(u64, text[dash + 1 ..], 10) catch return error.BadTdb;
+    return .{ .lo = lo, .hi = hi };
+}
+
 fn fileType(text: []const u8) error{UnknownFileType}!u16 {
     const t = types.ClType.parse(text) orelse return error.UnknownFileType;
     return @backingInt(t);
@@ -197,9 +231,9 @@ pub fn parseTdb(text: []const u8, flevel_min: *u16, flevel_max: *u16) LineError!
                 if (t > ndb.max_target) return error.BadTarget;
                 tdb.target = t;
             },
-            2 => tdb.file_size = try parseRange(value),
-            3 => tdb.entry_point = try parseRange(value),
-            4 => tdb.sections = try parseRange(value),
+            2 => tdb.file_size = try parseTdbRange(value),
+            3 => tdb.entry_point = try parseTdbRange(value),
+            4 => tdb.sections = try parseTdbRange(value),
             5 => tdb.container = try fileType(value),
             6 => {
                 var layers = std.mem.splitScalar(u8, value, '>');
@@ -215,6 +249,7 @@ pub fn parseTdb(text: []const u8, flevel_min: *u16, flevel_max: *u16) LineError!
         }
     }
     if (seen & 0b110_0000 == 0b110_0000) return error.BadTdb; // Container and Intermediates are alternatives
+    if (seen & 0b10 == 0) return error.BadTdb; // libclamav requires Target
     return tdb;
 }
 
@@ -253,22 +288,18 @@ const ExprParser = struct {
         try p.ops.append(p.arena, op);
     }
 
+    /// libclamav gives `&` and `|` the same precedence and groups to the right: `0&1|2` is
+    /// `0&(1|2)` and `0|1&2` is `0|(1&2)` (tests/differential/cases/ldb.case).
     fn orExpr(p: *ExprParser) LineError!void {
-        try p.andExpr();
-        while (p.peek() == '|') {
-            p.pos += 1;
-            try p.andExpr();
-            try p.emit(.{ .code = .@"or" });
-        }
-    }
-
-    fn andExpr(p: *ExprParser) LineError!void {
         try p.unary();
-        while (p.peek() == '&') {
-            p.pos += 1;
-            try p.unary();
-            try p.emit(.{ .code = .@"and" });
-        }
+        const c = p.peek() orelse return;
+        if (c != '&' and c != '|') return;
+        p.pos += 1;
+        p.depth += 1;
+        if (p.depth > ir.max_rpn_depth) return error.BadExpression;
+        try p.orExpr();
+        p.depth -= 1;
+        try p.emit(.{ .code = if (c == '&') .@"and" else .@"or" });
     }
 
     fn unary(p: *ExprParser) LineError!void {
@@ -285,6 +316,11 @@ const ExprParser = struct {
             const i = try p.number(ir.max_subsigs - 1);
             if (i >= p.limit) return error.BadExpression;
             try p.emit(.{ .code = .sub, .index = @intCast(i) });
+            // `N:M` (official databases have `0:0&...`): libclamav ignores the `:M`.
+            if (p.peek() == ':') {
+                p.pos += 1;
+                _ = try p.number(std.math.maxInt(u32));
+            }
         }
         const op = p.peek() orelse return;
         const code: ir.RpnCode = switch (op) {
@@ -294,23 +330,47 @@ const ExprParser = struct {
             else => return,
         };
         p.pos += 1;
+        // `==` reads as `=`.
+        if (code == .eq and p.peek() == '=') p.pos += 1;
         const k = try p.number(std.math.maxInt(u32));
         var distinct: u64 = 0;
         if (p.peek() == ',') {
             p.pos += 1;
-            distinct = try p.number(ir.max_subsigs);
+            // `=2,` with nothing after the comma has no distinct count.
+            if (p.peek()) |d| if (d >= '0' and d <= '9') {
+                distinct = try p.number(ir.max_subsigs);
+            };
         }
         try p.emit(.{ .code = code, .k = @intCast(k), .distinct = @intCast(distinct) });
     }
 };
 
 /// Compile an expression to RPN. `limit` bounds the subsig indices it may name.
-pub fn parseExpression(arena: std.mem.Allocator, text: []const u8, nsub: usize, limit: usize) LineError![]const ir.RpnOp {
+pub fn parseExpression(arena: std.mem.Allocator, text_in: []const u8, nsub: usize, limit: usize) LineError![]const ir.RpnOp {
+    // libclamav ignores whitespace in expressions (`0 & 1 > 200` is in the official databases).
+    var text = text_in;
+    if (std.mem.indexOfAny(u8, text, " \t") != null) {
+        const squeezed = try arena.alloc(u8, text.len);
+        var n: usize = 0;
+        for (text) |c| if (c != ' ' and c != '\t') {
+            squeezed[n] = c;
+            n += 1;
+        };
+        text = squeezed[0..n];
+    }
     var p: ExprParser = .{ .text = text, .arena = arena, .limit = @min(limit, nsub) };
     try p.orExpr();
     if (p.pos != text.len) return error.BadExpression;
     if (!ldb_table.checkRpn(p.ops.items, nsub)) return error.BadExpression;
     return p.ops.items;
+}
+
+fn maxIndex(ops: []const ir.RpnOp) usize {
+    var m: usize = 0;
+    for (ops) |op| if (op.code == .sub) {
+        m = @max(m, op.index);
+    };
+    return m;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -336,7 +396,8 @@ fn parseSubsig(arena: std.mem.Allocator, text: []const u8, index: usize, target:
     var body = text;
     var mods: ir.Modifiers = .{};
     if (std.mem.lastIndexOf(u8, body, "::")) |m| {
-        mods = hexsig.parseModifiers(body[m + 2 ..]) catch return error.BadModifier;
+        // An empty list (`::` at the end) is accepted, as libclamav does.
+        if (m + 2 < body.len) mods = hexsig.parseModifiers(body[m + 2 ..]) catch return error.BadModifier;
         body = body[0..m];
     }
     var offset: ir.Offset = .{};
@@ -347,7 +408,7 @@ fn parseSubsig(arena: std.mem.Allocator, text: []const u8, index: usize, target:
         body_start = colon + 1;
     }
     var diag: hexsig.Diag = .{};
-    const pattern = hexsig.parseClamav(arena, body[body_start..], &diag) catch |err| {
+    const pattern = hexsig.parseWith(arena, body[body_start..], &diag, hexsig.clamavOptions(mods)) catch |err| {
         column.* += @intCast(body_start + diag.pos);
         return err;
     };
@@ -586,7 +647,7 @@ fn exprText(arena: std.mem.Allocator, ops: []const ir.RpnOp) ![]const u8 {
     return w.written();
 }
 
-test "expressions compile to RPN with & binding tighter than |" {
+test "expressions compile to RPN: & and | group to the right, as libclamav reads them" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -595,12 +656,18 @@ test "expressions compile to RPN with & binding tighter than |" {
         .{ "0", "0 " },
         .{ "0&1", "0 1 & " },
         .{ "0|1&2", "0 1 2 & | " },
+        .{ "0&1|2", "0 1 2 | & " },
         .{ "(0|1)&2", "0 1 | 2 & " },
         .{ "0=0", "0 =0 " },
-        .{ "(0|1|2)>2,2", "0 1 | 2 | >2,2 " },
+        .{ "(0|1|2)>2,2", "0 1 2 | | >2,2 " },
         .{ "((0&1)=2|2<3)&3", "0 1 & =2 2 <3 | 3 & " },
+        // Forms in the official databases: spaces, `==`, an empty distinct count, `:N`.
+        .{ "0 & 1 > 200", "0 1 >200 & " },
+        .{ "(1==2)", "1 =2 " },
+        .{ "0=2,&1", "0 =2 1 & " },
+        .{ "0:0&1", "0 1 & " },
     }) |c| try testing.expectEqualStrings(c[1], try exprText(a, try parseExpression(a, c[0], 4, 4)));
-    for ([_][]const u8{ "", "4", "0&", "(0", "0)", "0>", "0>1,", "a", "0&&1", "0=99999999999", "0>1,65" }) |bad| {
+    for ([_][]const u8{ "", "4", "0&", "(0", "0)", "0>", "a", "0&&1", "0=99999999999", "0>1,65" }) |bad| {
         try testing.expectError(error.BadExpression, parseExpression(a, bad, 4, 4));
     }
     var deep: std.ArrayList(u8) = .empty;
@@ -613,7 +680,7 @@ test "expressions compile to RPN with & binding tighter than |" {
 test "target description blocks" {
     var lo: u16 = 0;
     var hi: u16 = 0;
-    const t = try parseTdb("Engine:81-255,Target:1,FileSize:100-2000,EntryPoint:4096,NumberOfSections:2-5,Container:CL_TYPE_ZIP", &lo, &hi);
+    const t = try parseTdb("Engine:81-255,Target:1,FileSize:100-2000,EntryPoint:4096-4096,NumberOfSections:2-5,Container:CL_TYPE_ZIP", &lo, &hi);
     try testing.expectEqual(@as(u16, 81), lo);
     try testing.expectEqual(@as(u16, 255), hi);
     try testing.expectEqual(@as(u8, 1), t.target);
@@ -630,8 +697,9 @@ test "target description blocks" {
         .{ "Bogus:1", error.BadTdb },
         .{ "Target:1,Target:2", error.BadTdb },
         .{ "Target:15", error.BadTarget },
-        .{ "FileSize:200-100", error.BadTdb },
-        .{ "FileSize:x", error.BadTdb },
+        .{ "Target:0,FileSize:100", error.BadTdb },
+        .{ "Target:0,FileSize:x-1", error.BadTdb },
+        .{ "Engine:51-255", error.BadTdb },
         .{ "Engine:51-99999", error.BadFlevel },
         .{ "Container:CL_TYPE_NOPE", error.UnknownFileType },
         .{ "Container:CL_TYPE_ZIP,Intermediates:CL_TYPE_ZIP", error.BadTdb },
@@ -658,8 +726,7 @@ test "ldb lines: subsignatures with offsets and modifiers, and every rejection" 
         .{ "X;Target:0;0", error.FieldCount, 0 },
         .{ ";Target:0;0;aabb", error.EmptyName, 0 },
         .{ "X;Target:0;0&2;aabb;ccdd", error.BadExpression, 11 },
-        .{ "X;Target:0;0=0;aabb", error.ExprTrueWithoutHits, 11 },
-        .{ "X;Target:0;0|1=0;aabb;ccdd", error.ExprTrueWithoutHits, 11 },
+        .{ "X;Target:0;0&1;aabb;ccdd;eeff", error.BadExpression, 11 },
         .{ "X;Target:0;0;EP+0:aabb", error.OffsetNeedsExecutable, 13 },
         .{ "X;Target:1;0;VI:aabb", error.VersionInfoUnsupported, 13 },
         .{ "X;Target:0;0;aabb::q", error.BadModifier, 13 },
@@ -681,7 +748,7 @@ test "ldb lines: subsignatures with offsets and modifiers, and every rejection" 
 
     // 64 subsigs is the limit.
     var line: std.ArrayList(u8) = .empty;
-    try line.appendSlice(a, "X;Target:0;0");
+    try line.appendSlice(a, "X;Target:0;0|63");
     for (0..ir.max_subsigs) |_| try line.appendSlice(a, ";aabb");
     _ = try parseLine(a, line.items, &column);
     try line.appendSlice(a, ";aabb");

@@ -471,7 +471,7 @@ test "compile files and a container, filter, and write a database" {
     try c.addFile("main.pdb", "R:example.com\n");
     try c.addFile("daily.ftm", "0:0:4d5a:DOS executable:CL_TYPE_ANY:CL_TYPE_MSEXE\n1:*:504b0304:ZIP-SFX:CL_TYPE_MSEXE:CL_TYPE_ZIPSFX\n7:0:00:Bad:CL_TYPE_ANY:CL_TYPE_ZIP\n");
     try c.addFile("daily.cdb", "Zip.Meta-1-0:CL_TYPE_ZIP:*:*:*:1000:*:1:*:*\nZip.Regex-2-0:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:*:*\nZip.Backref-3-0:*:*:(a)\\1:*:*:*:*:*:*\n");
-    try c.addFile("main.ldb", "Logical.Test-1-0;Target:0;0&1;4142;4344::i\nLogical.Bad-2-0;Target:0;0=0;4142\n");
+    try c.addFile("main.ldb", "Logical.Test-1-0;Target:0;0&1;4142;4344::i\nLogical.Bad-2-0;Target:0;0&2;4142;4344\n");
     const summary = try c.write(io, tmp.dir, "out.zavdb", .{ .db_version = 1 });
     try std.testing.expectEqual(@as(u64, 2), summary.hash_rules); // two from the container
     try std.testing.expectEqual(@as(u64, 1), summary.allowlist_rules);
@@ -489,7 +489,7 @@ test "compile files and a container, filter, and write a database" {
     try std.testing.expect(std.mem.indexOf(u8, report, "ndb: 1 included") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.ndb: 1 skipped (hex_bad_alternation)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.pdb: 1 skipped (unsupported_database)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "main.ldb: 1 skipped (expr_true_without_hits)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "main.ldb: 1 skipped (bad_expression)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "daily.ftm: 1 skipped (bad_magic_type)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (regex_unsupported)") != null);
     const pool = try regex_pool.RegexPool.init(opened.section(.regex_pool, 0).?);

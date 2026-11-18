@@ -41,7 +41,15 @@ pub fn build(gpa: std.mem.Allocator, entries: []const Entry) ![]u8 {
             .hex => {},
         };
     }
-    const header: ldb_table.LdbHeader = .{ .count = @intCast(entries.len), .rpn_count = @intCast(rpn_count), .bc_count = @intCast(bc_count), .pcre_count = @intCast(pcre_count) };
+    // Records whose expression holds with no hits are evaluated for every file.
+    var always: std.ArrayList(u32) = .empty;
+    defer always.deinit(gpa);
+    for (entries, 0..) |e, i| {
+        if (e.yara) continue;
+        var zeros: [ir.max_subsigs]u32 = @splat(0);
+        if (ldb_table.evalRpn(e.rule.expr, zeros[0..e.rule.subsigs.len])) try always.append(gpa, @intCast(i));
+    }
+    const header: ldb_table.LdbHeader = .{ .count = @intCast(entries.len), .rpn_count = @intCast(rpn_count), .bc_count = @intCast(bc_count), .pcre_count = @intCast(pcre_count), .always_count = @intCast(always.items.len) };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, std.mem.asBytes(&header));
@@ -119,5 +127,6 @@ pub fn build(gpa: std.mem.Allocator, entries: []const Entry) ![]u8 {
             else => {},
         };
     }
+    try out.appendSlice(gpa, std.mem.sliceAsBytes(always.items));
     return out.toOwnedSlice(gpa);
 }

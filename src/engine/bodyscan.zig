@@ -196,6 +196,10 @@ pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget:
         }
     };
     if (state) |st| if (index.ldb) |table| {
+        // Expressions that hold with no hits are evaluated for every file, as libclamav does.
+        for (table.always) |i| st.ensure(table, c.ctx, i) catch {
+            c.overflow = true;
+        };
         var out: [1]u32 = undefined;
         const n = st.finalizeWith(table, data, info, &out);
         if (st.bc_out_of_bounds) tracker.note(.byte_compare_bounds);

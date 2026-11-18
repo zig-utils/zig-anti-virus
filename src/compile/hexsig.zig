@@ -186,6 +186,7 @@ const Parser = struct {
     run_len: usize = 0,
     /// libclamav's rule: a part needs two literal bytes in a row (`Options.literal_pairs`).
     pairs: bool = false,
+    strict_brackets: bool = true,
     /// What the part after a `[x-y]` gap must be: the single byte, or a part with static bytes.
     bracket_next: enum { none, single, static } = .none,
     parts: usize = 1,
@@ -238,7 +239,7 @@ const Parser = struct {
 
     fn breakPart(p: *Parser, at: usize, min: u32, max: u32, syntax: ir.GapSyntax) Error!void {
         try p.endPart(at);
-        if (syntax == .bracket) {
+        if (syntax == .bracket and p.strict_brackets) {
             // `BYTE[x-y]HEXSIG` or `HEXSIG[x-y]BYTE`: one side is a single literal byte.
             if (p.singleByte()) {
                 p.bracket_next = .static;
@@ -338,12 +339,16 @@ const Parser = struct {
                     }
                 },
                 '[' => {
+                    // `[n-m]`, or `[n]` for exactly n.
                     p.pos += 1;
                     const n = try p.number();
-                    try p.expect('-', error.BadRange);
-                    const m = try p.number();
+                    var m = n;
+                    if (p.peek(0) == '-') {
+                        p.pos += 1;
+                        m = try p.number();
+                    }
                     try p.expect(']', error.BadRange);
-                    if (m < n or m > ir.bracket_limit) return p.fail(start, error.BadRange);
+                    if (m < n or (p.strict_brackets and m > ir.bracket_limit)) return p.fail(start, error.BadRange);
                     try p.breakPart(start, n, m, .bracket);
                 },
                 '(' => {
@@ -357,7 +362,6 @@ const Parser = struct {
                         if (class) |b| {
                             p.pos += 3;
                             p.run_len = 0;
-                            try p.branch(start);
                             try p.emitter.op(.{ .code = .bound, .flags = @backingInt(b) });
                             continue;
                         }
@@ -381,7 +385,8 @@ const Parser = struct {
 
     fn alternation(p: *Parser, start: usize, negated: bool) Error!void {
         p.pos += 1; // '('
-        try p.branch(start);
+        // A negation is checked in place; only alternations are VM branch points.
+        if (!negated) try p.branch(start);
         var subs: std.ArrayList(Emitter) = .empty;
         var all_literal = true;
         var cur: Emitter = .{ .arena = p.emitter.arena, .data = p.emitter.data };
@@ -391,7 +396,9 @@ const Parser = struct {
             switch (c) {
                 '|', ')' => {
                     try cur.flushMasked();
-                    if (cur.ops.items.len == 0) return p.fail(at, error.BadAlternation);
+                    // An empty alternative makes the alternation optional, except first (where
+                    // libclamav refuses it) and in a negation.
+                    if (cur.ops.items.len == 0 and (subs.items.len == 0 or negated)) return p.fail(at, error.BadAlternation);
                     if (subs.items.len == limits.max_alternatives) return p.fail(at, error.TooComplex);
                     try subs.append(p.emitter.arena, cur);
                     cur = .{ .arena = p.emitter.arena, .data = p.emitter.data };
@@ -446,7 +453,17 @@ pub const Options = struct {
     /// libclamav does for .ndb bodies and logical subsignatures; otherwise one static byte (a
     /// literal or an all-literal alternation) is enough.
     literal_pairs: bool = false,
+    /// `[x-y]` needs a single literal byte on one side and y at most 32. libclamav drops both
+    /// rules for `::w` subsignatures, where `[x-y]` is an ordinary gap.
+    strict_brackets: bool = true,
 };
+
+/// libclamav's rules for a body with these modifiers: `::w` alone (not `::wa`) widens every
+/// literal byte into two, so single bytes satisfy the literal-pair rule, and brackets are gaps.
+pub fn clamavOptions(mods: ir.Modifiers) Options {
+    const wide_only = mods.wide and !mods.ascii;
+    return .{ .literal_pairs = !wide_only, .strict_brackets = !wide_only };
+}
 
 /// Parse a hex body. All memory comes from `arena`.
 pub fn parse(arena: Allocator, body: []const u8, diag: *Diag) Error!ir.Pattern {
@@ -463,7 +480,7 @@ pub fn parseWith(arena: Allocator, body: []const u8, diag: *Diag, options: Optio
     if (body.len > limits.max_body_len) return error.TooComplex;
     const data = try arena.create(std.ArrayList(u8));
     data.* = .empty;
-    var p: Parser = .{ .body = body, .diag = diag, .emitter = .{ .arena = arena, .data = data }, .pairs = options.literal_pairs };
+    var p: Parser = .{ .body = body, .diag = diag, .emitter = .{ .arena = arena, .data = data }, .pairs = options.literal_pairs, .strict_brackets = options.strict_brackets };
     try p.run();
     return p.emitter.finish();
 }
@@ -897,7 +914,8 @@ test "rejected constructs report their reason and position" {
     try parseErr("aa[3-1]bbcc", error.BadRange, 2);
     try parseErr("aa{99999999999}bb", error.BadRange, 3);
     try parseErr("aa()bb", error.BadAlternation, 3);
-    try parseErr("aa(bb|)cc", error.BadAlternation, 6);
+    try parseErr("aa(|bb)cc", error.BadAlternation, 3);
+    try parseErr("aa!(bb|)cc", error.BadAlternation, 7);
     try parseErr("aa(bb|(cc))dd", error.BadAlternation, 6);
     try parseErr("aa(bb|cc", error.BadAlternation, 2);
     try parseErr("aabb)", error.BadAlternation, 4);
@@ -920,7 +938,7 @@ test "complexity limits" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var body: std.ArrayList(u8) = .empty;
-    for (0..limits.max_branches + 1) |_| try body.appendSlice(arena.allocator(), "aa(B)");
+    for (0..limits.max_branches + 1) |_| try body.appendSlice(arena.allocator(), "aa(bb|cc)");
     var diag: Diag = .{};
     try testing.expectError(error.TooComplex, parse(arena.allocator(), body.items, &diag));
 }

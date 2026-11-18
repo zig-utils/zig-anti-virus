@@ -509,6 +509,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "check")) return check(app, rest);
     if (std.mem.eql(u8, cmd, "materialize")) return materialize(app, rest);
     if (std.mem.eql(u8, cmd, "scan")) return scanCmd(app, rest);
+    if (std.mem.eql(u8, cmd, "rejects")) return rejects(app, rest);
     return usage(app);
 }
 
@@ -517,6 +518,7 @@ fn usage(app: App) !u8 {
         \\usage: zav-diff check [--tmp DIR] [--known FILE] CASES...
         \\       zav-diff materialize --out DIR CASES...
         \\       zav-diff scan [--tmp DIR] [--per-sig] --sigs FILE... -- PATH...
+        \\       zav-diff rejects FILE...
         \\
     );
     return 2;
@@ -824,6 +826,29 @@ fn materialize(app: App, args: []const []const u8) !u8 {
     try root.writeFile(app.io, .{ .sub_path = "cases", .data = index.items });
     try app.out.print("zav-diff: wrote {d} cases to {s}\n", .{ cases.items.len, root_path });
     return 0;
+}
+
+/// Every line of the given signature files the compiler refuses, with its reason and column:
+/// `FILE:LINE:COLUMN: REASON: TEXT`. Exit 0 when nothing was refused.
+fn rejects(app: App, args: []const []const u8) !u8 {
+    var total: usize = 0;
+    for (args) |path| {
+        const text = try Io.Dir.cwd().readFileAlloc(app.io, path, app.arena, .limited(1 << 30));
+        var c = zav.compile.compiler.Compiler.init(app.gpa);
+        defer c.deinit();
+        try c.addFile(std.fs.path.basename(path), text);
+        if (c.rejected.items.len == 0) continue;
+        var lines: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| try lines.append(app.arena, line);
+        for (c.rejected.items) |r| {
+            const line = if (r.line_number >= 1 and r.line_number <= lines.items.len) lines.items[r.line_number - 1] else "";
+            try app.out.print("{s}:{d}:{d}: {t}: {s}\n", .{ path, r.line_number, r.column, r.reason, line });
+        }
+        total += c.rejected.items.len;
+    }
+    try app.err.print("zav-diff: {d} rejected\n", .{total});
+    return if (total == 0) 0 else 1;
 }
 
 fn scanCmd(app: App, args: []const []const u8) !u8 {

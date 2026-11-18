@@ -44,7 +44,7 @@ pub const Window = struct {
 pub fn startWindow(off: ir.Offset, info: FileInfo) ?Window {
     const size = info.size;
     var base: i64 = 0;
-    var end_limit = size;
+    const end_limit = size;
     switch (off.kind) {
         .any => return .{ .lo = 0, .hi = size, .end_limit = size },
         .absolute => base = off.a,
@@ -54,9 +54,10 @@ pub fn startWindow(off: ir.Offset, info: FileInfo) ?Window {
             if (off.section >= info.sections.len) return null;
             const s = info.sections[off.section];
             if (off.kind == .section_entire) {
+                // libclamav lets a match start anywhere from the section's first byte to one
+                // past its last, and run past its end (tests/differential/cases/ldb.case).
                 if (s.size == 0 or s.offset >= size) return null;
-                end_limit = @min(size, s.offset +| s.size);
-                return .{ .lo = s.offset, .hi = end_limit - 1, .end_limit = end_limit };
+                return .{ .lo = s.offset, .hi = @min(size, s.offset +| s.size), .end_limit = size };
             }
             base = @as(i64, @intCast(s.offset)) + off.a;
         },
@@ -696,8 +697,10 @@ test "offset kinds resolve against the file" {
         .{ "45464748", .{ .kind = .section_start, .section = 2, .a = 0 }, false },
         .{ "45464748", .{ .kind = .last_section, .a = 0 }, true },
         .{ "4344", .{ .kind = .section_entire, .section = 0 }, true },
-        .{ "4546", .{ .kind = .section_entire, .section = 0 }, false },
-        .{ "47482e2e58", .{ .kind = .section_entire, .section = 1 }, false }, // runs past the section
+        // libclamav: a start up to one past the section's last byte, and the match may run on.
+        .{ "4546", .{ .kind = .section_entire, .section = 0 }, true },
+        .{ "4748", .{ .kind = .section_entire, .section = 0 }, false },
+        .{ "47482e2e58", .{ .kind = .section_entire, .section = 1 }, true },
         .{ "4142*4546", .{ .kind = .absolute, .a = 4 }, true },
     }) |c| {
         const got = try firstMatch(c[0], .{}, 0, c[1], info, data);

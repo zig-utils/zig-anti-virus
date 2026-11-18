@@ -8,6 +8,11 @@
 //!     tdbs:    [count]TdbRecord (96 bytes)    record i's target description
 //!     bcs:     [bc_count]BcRecord (32 bytes)  byte-compare subsigs, by record
 //!     pcres:   [pcre_count]PcreRecord (24 bytes)  PCRE subsigs, by record, in subsig order
+//!     always:  [always_count]u32               records evaluated for every file, ascending
+//!
+//! libclamav evaluates a logical signature whose expression holds with no subsig matched
+//! (`0=0`, `1<3`) for every file, so those records are listed and the scan gives them state
+//! even when nothing touched them.
 //!
 //! PCRE triggers are RPN expressions in the same pool as the main expressions; PCRE programs
 //! are REGEX_POOL entries.
@@ -27,7 +32,9 @@ pub const LdbHeader = extern struct {
     rpn_count: u32,
     bc_count: u32 = 0,
     pcre_count: u32 = 0,
-    _reserved: [8]u8 = @splat(0),
+    /// Records whose expression holds with no subsig matched; listed after the PCRE records.
+    always_count: u32 = 0,
+    _reserved: [4]u8 = @splat(0),
 };
 
 /// Record flag: the expression compares counts, so per-subsig counters are needed.
@@ -253,6 +260,8 @@ pub const LdbTable = struct {
     /// YARA conditions for records flagged `flag_yara`; set by the loader after both tables
     /// validate (YaraTable.init needs the records).
     yara: ?@import("yara_cond.zig").YaraTable = null,
+    /// Records evaluated for every file (expressions true with no hits).
+    always: []const u32 = &.{},
 
     pub const Error = error{BadLdbTable};
 
@@ -270,14 +279,17 @@ pub const LdbTable = struct {
         const tdb_at = std.mem.alignForward(usize, rpn_at + @as(usize, h.rpn_count) * @sizeOf(ir.RpnOp), 8);
         const bc_at = tdb_at + @as(usize, h.count) * @sizeOf(TdbRecord);
         const pcre_at = bc_at + @as(usize, h.bc_count) * @sizeOf(BcRecord);
-        const end = pcre_at + @as(usize, h.pcre_count) * @sizeOf(PcreRecord);
+        const always_at = pcre_at + @as(usize, h.pcre_count) * @sizeOf(PcreRecord);
+        const end = always_at + @as(usize, h.always_count) * 4;
         if (end > section.len) return error.BadLdbTable;
+        const al: [*]const u32 = @ptrCast(@alignCast(section.ptr + always_at));
         const pc: [*]const PcreRecord = @ptrCast(@alignCast(section.ptr + pcre_at));
         const b: [*]const BcRecord = @ptrCast(@alignCast(section.ptr + bc_at));
         const r: [*]const LdbRecord = @ptrCast(@alignCast(section.ptr + records_at));
         const o: [*]const ir.RpnOp = @ptrCast(@alignCast(section.ptr + rpn_at));
         const t: [*]const TdbRecord = @ptrCast(@alignCast(section.ptr + tdb_at));
-        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count], .bcs = b[0..h.bc_count], .pcres = pc[0..h.pcre_count], .regexes = regexes };
+        const table: LdbTable = .{ .records = r[0..h.count], .rpn = o[0..h.rpn_count], .tdbs = t[0..h.count], .bcs = b[0..h.bc_count], .pcres = pc[0..h.pcre_count], .regexes = regexes, .always = al[0..h.always_count] };
+        var next_always: usize = 0;
         const nregex = if (regexes) |pool| pool.count() else 0;
         const nprog = if (programs) |ps| ps.count() else 0;
         for (table.records, table.tdbs, 0..) |rec, tdb, i| {
@@ -289,7 +301,14 @@ pub const LdbTable = struct {
                 // Conditions are checked by YaraTable.init; a YARA record counts and has no
                 // RPN, byte compares or PCRE.
                 if (rec.expr_len != 0 or rec.flags & flag_counts == 0 or rec.bc_count != 0 or rec.pcre_count != 0) return error.BadLdbTable;
-            } else if (!checkRpn(table.expr(rec), rec.nsub)) return error.BadLdbTable;
+            } else {
+                if (!checkRpn(table.expr(rec), rec.nsub)) return error.BadLdbTable;
+                // Listed exactly when the expression holds with no hits, in ascending order.
+                var zeros: [ir.max_subsigs]u32 = @splat(0);
+                const listed = next_always < table.always.len and table.always[next_always] == i;
+                if (listed != evalRpn(table.expr(rec), zeros[0..rec.nsub])) return error.BadLdbTable;
+                if (listed) next_always += 1;
+            }
             if (@as(u64, rec.pcre_first) + rec.pcre_count > h.pcre_count) return error.BadLdbTable;
             var counts_needed = usesCounts(table.expr(rec));
             var prev_pcre: i16 = -1;
@@ -326,6 +345,7 @@ pub const LdbTable = struct {
                 if (programs != null and (with_programs & own != 0 or with_programs & trig == 0)) return error.BadLdbTable;
             }
         }
+        if (next_always != table.always.len) return error.BadLdbTable;
         return table;
     }
 

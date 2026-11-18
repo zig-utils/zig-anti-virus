@@ -146,7 +146,7 @@ pub fn validate(p: Program) Programs.Error!void {
                 if (i == 0 or i + 1 == p.pattern.ops.len or p.pattern.ops[i - 1].code == .part_end) return error.BadProgram;
                 parts += 1;
             },
-            .alt, .bound => branches += 1,
+            .alt => branches += 1,
             else => {},
         }
         if (i == h.anchor_op) {
@@ -179,8 +179,11 @@ fn validateOps(p: ir.Pattern, ops: []const ir.Op, inside_alt: bool) Programs.Err
             if (o.a % 4 != 0 or @as(usize, o.a) + @as(usize, o.len) * @sizeOf(ir.AltEntry) > data_len) return error.BadProgram;
             var min_len: u32 = std.math.maxInt(u32);
             var max_len: u32 = 0;
-            for (p.alternatives(o)) |entry| {
-                if (entry.op_count == 0 or entry.ops_off % 4 != 0) return error.BadProgram;
+            for (p.alternatives(o), 0..) |entry, k| {
+                // An empty alternative makes the alternation optional (`(aabb|)`); libclamav
+                // refuses it first, and negations never hold one.
+                const empty_ok = k > 0 and o.code == .alt;
+                if ((entry.op_count == 0 and !empty_ok) or entry.ops_off % 4 != 0) return error.BadProgram;
                 if (@as(usize, entry.ops_off) + @as(usize, entry.op_count) * @sizeOf(ir.Op) > data_len) return error.BadProgram;
                 const inner = p.altOps(entry);
                 try validateOps(p, inner, true);
@@ -193,7 +196,7 @@ fn validateOps(p: ir.Pattern, ops: []const ir.Op, inside_alt: bool) Programs.Err
                     };
                     if (o.code == .nalt and x.code != .lit) return error.BadProgram;
                 }
-                if (len != entry.byte_len or len == 0) return error.BadProgram;
+                if (len != entry.byte_len or (len == 0 and !empty_ok)) return error.BadProgram;
                 min_len = @min(min_len, len);
                 max_len = @max(max_len, len);
             }

@@ -1,0 +1,154 @@
+# Logical signatures: expressions, counts, distinct counts, target descriptions, subsignature
+# offsets and modifiers. Subsigs are 41414141 (AAAA), 42424242 (BBBB) and 43434343 (CCCC).
+
+case ldb-and-or
+ldb Diff.Ldb.And;Engine:51-255,Target:0;0&1;41414141;42424242
+ldb Diff.Ldb.Or;Engine:51-255,Target:0;0|1;41414141;42424242
+ldb Diff.Ldb.Nested;Engine:51-255,Target:0;(0|1)&2;41414141;42424242;43434343
+ldb Diff.Ldb.Precedence;Engine:51-255,Target:0;0&1|2;41414141;42424242;43434343
+ldb Diff.Ldb.PrecedenceRight;Engine:51-255,Target:0;0|1&2;41414141;42424242;43434343
+ldb Diff.Ldb.Single;Engine:51-255,Target:0;0;41414141
+sample bin "AAAA" bin => Diff.Ldb.Or Diff.Ldb.PrecedenceRight Diff.Ldb.Single
+sample bin "BBBB" bin => Diff.Ldb.Or
+sample bin "AAAA BBBB" bin => Diff.Ldb.And Diff.Ldb.Or Diff.Ldb.Precedence Diff.Ldb.PrecedenceRight Diff.Ldb.Single
+sample bin "CCCC" bin => OK
+sample bin "AAAA CCCC" bin => Diff.Ldb.Nested Diff.Ldb.Or Diff.Ldb.Precedence Diff.Ldb.PrecedenceRight Diff.Ldb.Single
+sample bin "BBBB CCCC" bin => Diff.Ldb.Nested Diff.Ldb.Or Diff.Ldb.PrecedenceRight
+sample bin "AAAA BBBB CCCC" bin => Diff.Ldb.And Diff.Ldb.Nested Diff.Ldb.Or Diff.Ldb.Precedence Diff.Ldb.PrecedenceRight Diff.Ldb.Single
+sample bin "xxxx" bin => OK
+
+case ldb-counts
+ldb Diff.Ldb.Eq2;Engine:51-255,Target:0;0=2;41414141
+ldb Diff.Ldb.Gt2;Engine:51-255,Target:0;0>2;41414141
+ldb Diff.Ldb.Lt3;Engine:51-255,Target:0;0<3;41414141
+ldb Diff.Ldb.Eq0;Engine:51-255,Target:0;0&1=0;41414141;42424242
+ldb Diff.Ldb.Lt1;Engine:51-255,Target:0;0&1<1;41414141;42424242
+ldb Diff.Ldb.BlockSum;Engine:51-255,Target:0;(0|1)>2;41414141;42424242
+ldb Diff.Ldb.Overlap;Engine:51-255,Target:0;0>1;41414141
+sample bin "AAAA" bin => Diff.Ldb.Eq0 Diff.Ldb.Lt1 Diff.Ldb.Lt3
+sample bin "AAAA AAAA" bin => Diff.Ldb.Eq0 Diff.Ldb.Eq2 Diff.Ldb.Lt1 Diff.Ldb.Lt3 Diff.Ldb.Overlap
+sample bin "AAAA AAAA AAAA" bin => Diff.Ldb.BlockSum Diff.Ldb.Eq0 Diff.Ldb.Gt2 Diff.Ldb.Lt1 Diff.Ldb.Overlap
+sample bin "AAAA AAAA AAAA AAAA" bin => Diff.Ldb.BlockSum Diff.Ldb.Eq0 Diff.Ldb.Gt2 Diff.Ldb.Lt1 Diff.Ldb.Overlap
+sample bin "AAAA BBBB" bin => Diff.Ldb.Lt3
+sample bin "AAAA AAAA BBBB" bin => Diff.Ldb.BlockSum Diff.Ldb.Eq2 Diff.Ldb.Lt3 Diff.Ldb.Overlap
+sample bin "AAAA BBBB BBBB" bin => Diff.Ldb.BlockSum Diff.Ldb.Lt3
+sample bin "AAAAAAAA" bin => Diff.Ldb.BlockSum Diff.Ldb.Eq0 Diff.Ldb.Gt2 Diff.Ldb.Lt1 Diff.Ldb.Overlap
+sample bin "AAAAA" bin => Diff.Ldb.Eq0 Diff.Ldb.Eq2 Diff.Ldb.Lt1 Diff.Ldb.Lt3 Diff.Ldb.Overlap
+sample bin "AAAAAAA" bin => Diff.Ldb.BlockSum Diff.Ldb.Eq0 Diff.Ldb.Gt2 Diff.Ldb.Lt1 Diff.Ldb.Overlap
+
+case ldb-distinct
+ldb Diff.Ldb.Distinct2;Engine:51-255,Target:0;(0|1|2)>1,2;41414141;42424242;43434343
+ldb Diff.Ldb.DistinctEq;Engine:51-255,Target:0;(0|1|2)=2,2;41414141;42424242;43434343
+ldb Diff.Ldb.DistinctLt;Engine:51-255,Target:0;0&(1|2)<2,2;41414141;42424242;43434343
+sample bin "AAAA BBBB" bin => Diff.Ldb.Distinct2 Diff.Ldb.DistinctEq
+sample bin "AAAA AAAA" bin => OK
+sample bin "AAAA BBBB CCCC" bin => Diff.Ldb.Distinct2
+sample bin "AAAA AAAA BBBB" bin => Diff.Ldb.Distinct2
+sample bin "AAAA BBBB BBBB" bin => Diff.Ldb.Distinct2
+sample bin "AAAA CCCC" bin => Diff.Ldb.Distinct2 Diff.Ldb.DistinctEq
+
+case ldb-expression-leniency
+# Forms that appear in the official databases and that libclamav accepts.
+ldb Diff.Ldb.Spaces;Engine:51-255,Target:0;0 & 1 > 2;41414141;42424242
+ldb Diff.Ldb.DoubleEq;Engine:51-255,Target:0;0&(1==2);41414141;42424242
+ldb Diff.Ldb.EmptyDistinct;Engine:51-255,Target:0;0=2,&1;41414141;42424242
+ldb Diff.Ldb.Colon;Engine:51-255,Target:0;0:0&1;41414141;42424242
+ldb Diff.Ldb.ColonOther;Engine:51-255,Target:0;1:0;41414141;42424242
+ldb! Diff.Ldb.ColonLast;Engine:51-255,Target:0;0:1;41414141;42424242
+ldb! Diff.Ldb.LastUnused;Engine:51-255,Target:0;0&1;41414141;42424242;43434343
+ldb Diff.Ldb.MiddleUnused;Engine:51-255,Target:0;0&2;41414141;42424242;43434343
+ldb! Diff.Ldb.OutOfRange;Engine:51-255,Target:0;0&2;41414141;42424242
+ldb! Diff.Ldb.DoubleEqUnused;Engine:51-255,Target:0;0&(1==2);41414141;42424242;43434343
+ldb! Diff.Ldb.DoubleAnd;Engine:51-255,Target:0;0&&1;41414141;42424242
+sample bin "AAAA" bin => OK
+sample bin "AAAA BBBB" bin => Diff.Ldb.Colon Diff.Ldb.ColonOther
+sample bin "AAAA BBBB BBBB" bin => Diff.Ldb.Colon Diff.Ldb.ColonOther Diff.Ldb.DoubleEq
+sample bin "AAAA BBBB BBBB BBBB" bin => Diff.Ldb.Colon Diff.Ldb.ColonOther Diff.Ldb.Spaces
+sample bin "AAAA AAAA BBBB" bin => Diff.Ldb.Colon Diff.Ldb.ColonOther Diff.Ldb.EmptyDistinct
+sample bin "AAAA CCCC" bin => Diff.Ldb.MiddleUnused
+sample bin "BBBB" bin => Diff.Ldb.ColonOther
+
+case ldb-subsig-offsets
+ldb Diff.Ldb.Abs;Engine:51-255,Target:0;0&1;8:41414141;42424242
+ldb Diff.Ldb.AbsShift;Engine:51-255,Target:0;0&1;8,4:41414141;42424242
+ldb Diff.Ldb.Eof;Engine:51-255,Target:0;0&1;EOF-12:41414141;42424242
+ldb Diff.Ldb.Ep;Engine:51-255,Target:1;0&1;EP+0:41414141;42424242
+ldb Diff.Ldb.Section;Engine:51-255,Target:1;0&1;S1+4:41414141;42424242
+ldb Diff.Ldb.SectionEntire;Engine:51-255,Target:1;0&1;SE0:41414141;42424242
+ldb Diff.Ldb.LastSection;Engine:51-255,Target:1;0&1;SL+0:41414141;42424242
+sample bin "AAAA BBBB" bin => Diff.Ldb.Abs Diff.Ldb.AbsShift
+sample bin "xxAAAA BBBB" bin => Diff.Ldb.AbsShift
+sample bin "xxxxxAAAA BBBB" bin => OK
+sample bin "BBBB AAAA" bin => Diff.Ldb.Eof
+sample pe "AAAA BBBB" pad(0x600) => Diff.Ldb.Ep Diff.Ldb.SectionEntire
+sample pe "xx" "AAAA BBBB" pad(0x600) => Diff.Ldb.SectionEntire
+sample pe "BBBB" pad(0x404) "AAAA" pad(0x600) => Diff.Ldb.Section
+sample pe "BBBB" pad(0x400) "AAAA" pad(0x600) => Diff.Ldb.LastSection Diff.Ldb.SectionEntire
+
+case ldb-tdb
+ldb Diff.Tdb.FileSize;Engine:51-255,Target:0,FileSize:20-30;0;41414141
+ldb! Diff.Tdb.FileSizeOne;Engine:51-255,Target:0,FileSize:28;0;41414141
+ldb Diff.Tdb.PeOnly;Engine:51-255,Target:1;0;41414141
+ldb Diff.Tdb.EntryPoint;Engine:51-255,Target:1,EntryPoint:4096-4096;0;41414141
+ldb Diff.Tdb.EntryPointFile;Engine:51-255,Target:1,EntryPoint:512-512;0;41414141
+ldb! Diff.Tdb.Sections;Engine:51-255,Target:1,NumberOfSections:2;0;41414141
+ldb Diff.Tdb.SectionsMany;Engine:51-255,Target:1,NumberOfSections:3-5;0;41414141
+ldb Diff.Tdb.EngineHigh;Engine:250-255,Target:0;0;41414141
+ldb Diff.Tdb.NoEngine;Target:0;0;41414141
+ldb! Diff.Tdb.NoTarget;Engine:51-255;0;41414141
+ldb Diff.Tdb.Container;Engine:51-255,Target:0,Container:CL_TYPE_ZIP;0;41414141
+sample bin "AAAA" 8*"x" bin => Diff.Tdb.FileSize Diff.Tdb.NoEngine
+sample bin "AAAA" 9*"x" bin => Diff.Tdb.FileSize Diff.Tdb.NoEngine
+sample bin "AAAA" 30*"x" bin => Diff.Tdb.NoEngine
+sample pe "AAAA" pad(0x600) => Diff.Tdb.EntryPointFile Diff.Tdb.NoEngine Diff.Tdb.PeOnly
+sample pe(0x1010) "AAAA" pad(0x600) => Diff.Tdb.NoEngine Diff.Tdb.PeOnly
+
+case ldb-modifiers
+ldb Diff.Mod.Nocase;Engine:81-255,Target:0;0;6576696c636f6465::i
+ldb Diff.Mod.Wide;Engine:81-255,Target:0;0;6576696c636f6465::w
+ldb Diff.Mod.WideAscii;Engine:81-255,Target:0;0;6576696c636f6465::wa
+ldb Diff.Mod.Fullword;Engine:81-255,Target:0;0;6576696c636f6465::f
+ldb Diff.Mod.NocaseWide;Engine:81-255,Target:0;0;6576696c636f6465::iw
+ldb Diff.Mod.FullwordWide;Engine:81-255,Target:0;0;6576696c636f6465::fw
+ldb Diff.Mod.Empty;Engine:81-255,Target:0;0;6576696c636f6465::
+ldb Diff.Mod.WideSingleBytes;Engine:81-255,Target:0;0;2e{0-2}65{0-2}78::w
+ldb! Diff.Mod.NarrowSingleBytes;Engine:81-255,Target:0;0;2e{0-2}65{0-2}78
+ldb! Diff.Mod.NocaseSingleBytes;Engine:81-255,Target:0;0;61{0-2}62{0-2}6363::i
+ldb Diff.Mod.WideBracket;Engine:81-255,Target:0;0;41424344[2-4]45464748::w
+ldb! Diff.Mod.Unknown;Engine:81-255,Target:0;0;6576696c636f6465::z
+sample bin "evilcode" bin => Diff.Mod.Empty Diff.Mod.Fullword Diff.Mod.Nocase Diff.Mod.WideAscii
+sample bin "EvilCode" bin => Diff.Mod.Nocase
+sample bin "e\0v\0i\0l\0c\0o\0d\0e\0" bin => Diff.Mod.FullwordWide Diff.Mod.NocaseWide Diff.Mod.Wide Diff.Mod.WideAscii
+sample bin "E\0v\0I\0l\0c\0o\0D\0e\0" bin => Diff.Mod.NocaseWide
+sample bin "xevilcodex" bin => Diff.Mod.Empty Diff.Mod.Nocase Diff.Mod.WideAscii
+sample bin " evilcode " bin => Diff.Mod.Empty Diff.Mod.Fullword Diff.Mod.Nocase Diff.Mod.WideAscii
+sample bin " e\0v\0i\0l\0c\0o\0d\0e\0 \0" bin => Diff.Mod.FullwordWide Diff.Mod.NocaseWide Diff.Mod.Wide Diff.Mod.WideAscii
+sample bin "xe\0v\0i\0l\0c\0o\0d\0e\0" bin => Diff.Mod.FullwordWide Diff.Mod.NocaseWide Diff.Mod.Wide Diff.Mod.WideAscii
+sample bin ".\0e\0x\0" bin => Diff.Mod.WideSingleBytes
+sample bin ".ex" bin => OK
+sample bin "AxBcc" bin => OK
+sample bin "A\0B\0C\0D\0xxE\0F\0G\0H\0" bin => Diff.Mod.WideBracket
+sample bin "A\0B\0C\0D\0" 64*"x" "E\0F\0G\0H\0" bin => OK
+
+case ldb-alternation-empty
+ldb Diff.Alt.EmptyLast;Engine:51-255,Target:0;0;41424344(4546|)47484950
+ldb! Diff.Alt.EmptyFirst;Engine:51-255,Target:0;0;41424344(|4546)47484950
+ndb Diff.Alt.EmptyLastNdb:0:*:41424344(4546|)47484950
+ldb! Diff.Alt.EmptyOnly;Engine:51-255,Target:0;0;41424344(|)47484950
+sample bin "ABCDEFGHIP" bin => Diff.Alt.EmptyLast Diff.Alt.EmptyLastNdb
+sample bin "ABCDGHIP" bin => Diff.Alt.EmptyLast Diff.Alt.EmptyLastNdb
+sample bin "ABCDEGHIP" bin => OK
+
+case ldb-bracket-single
+ldb Diff.Bracket.Single;Engine:51-255,Target:0;0;41424344[2]45
+ldb Diff.Bracket.SingleNibble;Engine:51-255,Target:0;0;414243440?[2]45
+sample bin "ABCDxxE" bin => Diff.Bracket.Single
+sample bin "ABCD\x05xxE" bin => Diff.Bracket.SingleNibble
+sample bin "ABCDxE" bin => OK
+sample bin "ABCDxxxE" bin => OK
+
+case ldb-negation-many
+# A body with many single-byte negations (as in the official databases).
+ldb Diff.Neg.Many;Engine:51-255,Target:0;0;41424344!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)!(00)4546
+sample bin "ABCD" 70*"x" "EF" bin => Diff.Neg.Many
+sample bin "ABCD" 69*"x" "\0EF" bin => OK

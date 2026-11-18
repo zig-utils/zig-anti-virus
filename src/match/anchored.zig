@@ -58,7 +58,8 @@ comptime {
 
 /// The key a program is filed under, or null if it belongs in its group's list.
 pub fn keyOf(p: prog.Program) ?u32 {
-    if (p.header.off_shift != 0) return null;
+    // A whole-section offset (SEx) is a window, not a position.
+    if (p.header.off_shift != 0 or p.header.off_kind == .section_entire) return null;
     const first = p.pattern.ops[0];
     if (first.code != .lit or first.len < 4 or first.flags & ir.op_nocase != 0) return null;
     return std.mem.readInt(u32, p.pattern.bytes(first)[0..4], .little);
