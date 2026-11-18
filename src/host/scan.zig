@@ -168,6 +168,7 @@ pub const Scan = struct {
 
     pub fn owner(s: *Scan, path: []const u8) ?[]const u8 {
         if (s.options.ownership) |o| return o.owner(path);
+        if (s.host.os == .macos) return @import("macos/checks.zig").systemOwner(path);
         const db = s.packages() orelse return null;
         const p = db.ownerResolved(path) orelse return null;
         return p.name;

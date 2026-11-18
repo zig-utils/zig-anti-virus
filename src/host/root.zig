@@ -30,6 +30,11 @@ pub const linux = struct {
     pub const privilege = @import("linux/privilege.zig");
     pub const hardening = @import("linux/hardening.zig");
 };
+pub const macos = struct {
+    pub const plist = @import("macos/plist.zig");
+    pub const macho = @import("macos/macho.zig");
+    pub const checks = @import("macos/checks.zig");
+};
 
 pub const Host = host.Host;
 pub const Scan = scan.Scan;
@@ -39,7 +44,7 @@ pub const Severity = finding.Severity;
 pub const Category = finding.Category;
 
 /// Every check this build knows, in run order.
-pub const registry = linux.process.checks ++ linux.network.checks ++ linux.kernel.checks ++ linux.persistence.checks ++ linux.privilege.checks ++ linux.hardening.checks ++ linux.integrity.checks;
+pub const registry = linux.process.checks ++ linux.network.checks ++ linux.kernel.checks ++ linux.persistence.checks ++ linux.privilege.checks ++ linux.hardening.checks ++ linux.integrity.checks ++ macos.checks.checks;
 
 test {
     _ = finding;
@@ -62,5 +67,8 @@ test {
     _ = linux.persistence;
     _ = linux.privilege;
     _ = linux.hardening;
+    _ = macos.plist;
+    _ = macos.macho;
+    _ = macos.checks;
     _ = baseline;
 }

@@ -13,6 +13,7 @@ const targets = [_]Target{
     .{ .name = "hostPersistence", .run = hostPersistence },
     .{ .name = "hostHardening", .run = hostHardening },
     .{ .name = "cveVersion", .run = cveVersion },
+    .{ .name = "macosPlist", .run = macosPlist },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -222,5 +223,26 @@ pub fn cveVersion(gpa: std.mem.Allocator, random: std.Random) !void {
         const ba = version.compare(scheme, b, a);
         if (ab != ba.invert()) @panic("fuzz: version comparison is not antisymmetric for " ++ @tagName(scheme));
         if (version.compare(scheme, a, a) != .eq) @panic("fuzz: version comparison is not reflexive for " ++ @tagName(scheme));
+    }
+}
+
+/// XML and binary property lists, and Mach-O signature classification.
+pub fn macosPlist(gpa: std.mem.Allocator, random: std.Random) !void {
+    const plist = zav.host.macos.plist;
+    const macho = zav.host.macos.macho;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var buf: [512]u8 = undefined;
+    const xml = "<plist version=\"1.0\"><dict><key>Label</key><string>a&amp;b</string><key>ProgramArguments</key><array><string>/bin/sh</string><true/><integer>3</integer></array></dict></plist>";
+    const which = random.uintLessThan(u8, 3);
+    if (which == 0) {
+        _ = plist.parse(arena.allocator(), mutateCopy(random, &buf, xml)) catch {};
+    } else if (which == 1) {
+        _ = plist.parse(arena.allocator(), mutateCopy(random, &buf, &plist.fixture_bplist)) catch {};
+    } else {
+        var m: [256]u8 = undefined;
+        const fixture = macho.buildFixture(&m, if (random.boolean()) .signed else .adhoc);
+        var bytes: []const u8 = mutateCopy(random, &buf, fixture);
+        _ = macho.classify(.fromSlice(&bytes));
     }
 }
