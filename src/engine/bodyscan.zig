@@ -1,10 +1,14 @@
 //! The body-signature stage over one in-memory view of a file. Programs pinned to an offset go
-//! through the anchored index of the file's partition and of type 0; every other program of the
-//! file's target type (or type 0) runs through the verify VM's scanner. `.ndb` programs report
+//! through the anchored index of the file's partition and of type 0. Every other program is
+//! searched: with a prefilter in the database (PREFILTER/ATOM_TABLE, match/prefilter.zig) its
+//! atoms are found by stage one and two and only the candidates reach the verify VM, programs
+//! with no atom run through the verify VM's scanner, and deferred logical subsigs run through
+//! it only for signatures the first pass touched (compile/atoms.zig). Without a prefilter, or
+//! in `.reference` mode, every program of the file's target type (or type 0) runs through the
+//! scanner: the reference path the prefiltered one is checked against. `.ndb` programs report
 //! the first detection; logical subsig matches feed the sparse logical state, whose touched
-//! signatures are evaluated at the end. This is the reference path: it needs no prefilter, so it
-//! is what the prefilter stages (atoms, Bloom filters, atom tables) are checked against, and it
-//! is what scans until they land. No heap allocation: logical state lives in worker scratch.
+//! signatures are evaluated at the end. No heap allocation: logical state lives in worker
+//! scratch and the candidate ring on the stack.
 const std = @import("std");
 const db = @import("../db/root.zig");
 const prog = @import("../match/prog.zig");
@@ -14,6 +18,7 @@ const lt = @import("../match/ldb_table.zig");
 const logical = @import("../match/logical.zig");
 const regex_pool = @import("../match/regex_pool.zig");
 const yara_cond = @import("../match/yara_cond.zig");
+const prefilter = @import("../match/prefilter.zig");
 
 /// Matches of one YARA regex string recorded per file before the count is reported as limited.
 pub const max_regex_matches: u32 = 1024;
@@ -27,6 +32,15 @@ pub const BodyIndex = struct {
     /// Regex programs (PCRE subsigs, .cdb filename regexes). Size each worker's zig-regex
     /// scratch with `regexes.capacity(..)` and hand it to its logical state.
     regexes: ?regex_pool.RegexPool = null,
+    /// PREFILTER and ATOM_TABLE per partition; partition 0 serves targets without their own.
+    prefilters: [prefilter.partitions]?prefilter.Partition = @splat(null),
+
+    /// The prefilter a file of `target` is scanned with, or null for the reference path.
+    pub fn partitionFor(index: *const BodyIndex, target: u8) ?*const prefilter.Partition {
+        if (target < index.prefilters.len) if (index.prefilters[target]) |*p| return p;
+        if (index.prefilters[0]) |*p| return p;
+        return null;
+    }
 
     pub fn load(database: db.reader.Database) !BodyIndex {
         var index: BodyIndex = .{};
@@ -38,6 +52,9 @@ pub const BodyIndex = struct {
                 if (database.section(.anchored_index, @intCast(p))) |section| slot.* = try .init(section, index.programs.?);
             }
         }
+        if (index.programs) |progs| if (database.section(.prefilter, 0)) |section| {
+            index.prefilters = try prefilter.loadAll(section, progs);
+        };
         if (database.section(.ldb_table, 0)) |section| index.ldb = try .initWith(section, index.programs, index.regexes);
         if (database.section(.yara_cond, 0)) |section| {
             const table = index.ldb orelse return error.BadYaraTable;
@@ -127,9 +144,290 @@ const Collector = struct {
     }
 };
 
+/// How the searched programs are found.
+pub const Mode = enum {
+    /// Through the prefilter when the database has one.
+    auto,
+    /// Every program through the verify VM's scanner.
+    reference,
+};
+
 /// Scan `data`, the whole file. `budget` is per file. With `state` (reset by the caller between
 /// files) logical signatures are evaluated too.
 pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget: *vm.Budget, tracker: *limits_mod.Tracker, state: ?*logical.State) !Verdict {
+    return scanBufferMode(index, data, file, budget, tracker, state, .auto, null);
+}
+
+/// What searching one program found.
+const Searched = enum { more, detected, stop };
+
+/// Run one program's scanner over the whole buffer (the reference path, programs without an
+/// atom, deferred subsigs).
+fn searchProgram(c: *Collector, p: prog.Program, data: []const u8, info: vm.FileInfo, budget: *vm.Budget) Searched {
+    const is_ldb = p.header.flags & prog.flag_ldb != 0;
+    if (is_ldb and c.settled(p)) return .more;
+    var scanner = vm.Scanner.init(p, data, info, budget);
+    while (true) {
+        const m = scanner.next() catch return .stop;
+        const hit = m orelse return .more;
+        if (!is_ldb) {
+            c.hit = .{ .sig = p.header.sig, .start = hit.start, .end = hit.end };
+            return .detected;
+        }
+        c.touch(p, hit) catch {
+            c.overflow = true;
+            return .stop;
+        };
+        if (c.settled(p)) return .more;
+    }
+}
+
+/// Stage three for prefilter candidates: the verify VM from the anchor part's start.
+const Sink = struct {
+    c: *Collector,
+    data: []const u8,
+    info: vm.FileInfo,
+    budget: *vm.Budget,
+    target: u8,
+    /// The file's verify budget ran out.
+    stopped: bool = false,
+    stats: ?*prefilter.Stats = null,
+    /// What earlier candidates of the same multi-part program learned (verify_vm.Memo), so a
+    /// common anchor part next to an unbounded gap stays linear over the file, as with the
+    /// reference scanner: programs of up to `CompactMemo.parts` parts in a direct-mapped cache
+    /// of compact entries, copied into `working` around each verify; longer ones in a few
+    /// full memos.
+    compact: []CompactMemo,
+    working: *vm.Memo,
+    memos: []vm.Memo,
+    memo_progs: []u32,
+
+    fn bigMemo(s: *Sink, prog_index: u32, part_count: usize) *vm.Memo {
+        const i = prog_index % s.memos.len;
+        if (s.memo_progs[i] != prog_index) {
+            s.memo_progs[i] = prog_index;
+            s.memos[i].prepare(part_count);
+        }
+        return &s.memos[i];
+    }
+
+    pub fn candidate(s: *Sink, prog_index: u32, anchor_start: usize) bool {
+        const p = s.c.programs.get(prog_index);
+        if (p.header.target != 0 and p.header.target != s.target) return true;
+        const is_ldb = p.header.flags & prog.flag_ldb != 0;
+        if (is_ldb and s.c.settled(p)) return true;
+        const window = vm.startWindow(p.offset(), s.info) orelse return true;
+        const parts = p.header.part_count;
+        var memo: *vm.Memo = s.working;
+        var cached: ?*CompactMemo = null;
+        if (parts == 1) {
+            memo.prepare(1);
+        } else if (parts <= CompactMemo.parts and s.compact.len > 0) {
+            const e = &s.compact[prog_index % s.compact.len];
+            if (e.prog != prog_index) {
+                e.prog = prog_index;
+                memo.prepare(parts);
+            } else e.load(memo, parts);
+            cached = e;
+        } else memo = s.bigMemo(prog_index, parts);
+        defer if (cached) |e| e.store(memo, parts);
+        const got = vm.verifyMemo(p, s.data, window, anchor_start, s.budget, memo) catch {
+            // One candidate ran out of its own budget: recorded, and the scan goes on, as the
+            // reference scanner does. The file budget running out ends the search.
+            if (s.budget.used >= s.budget.per_file) {
+                s.stopped = true;
+                return false;
+            }
+            if (s.stats) |st| if (st.per_prog_exhausted) |pp| {
+                pp[prog_index] +|= 1;
+            };
+            return true;
+        };
+        const hit = got orelse return true;
+        if (!is_ldb) {
+            s.c.hit = .{ .sig = p.header.sig, .start = hit.start, .end = hit.end };
+            return false;
+        }
+        s.c.touch(p, hit) catch {
+            s.c.overflow = true;
+            return false;
+        };
+        return true;
+    }
+};
+
+/// Deferred programs searched together: one pass over the buffer tests, at every position, a
+/// bitmap of the first two bytes of every pending atom, and on a hit probes a small table of
+/// the atoms' 4-, 3- and 2-byte keys (case variants of a folded atom are separate keys),
+/// instead of a pass per program. It lives on the stack (about 22 KiB).
+const Pending = struct {
+    const slots = 1024;
+    const max = slots / 2;
+    const empty: u32 = 0xffff_ffff;
+
+    keys: [slots]u32,
+    progs: [slots]u32,
+    backs: [slots]u32,
+    qs: [slots]u8,
+    bits: [65536 / 64]u64,
+    n: usize,
+
+    fn clear(t: *Pending) void {
+        @memset(&t.progs, empty);
+        @memset(&t.bits, 0);
+        t.n = 0;
+    }
+
+    /// A deferred program's key: the first (up to) four bytes of its anchor literal, the
+    /// literal atom selection picked for its rarest window. Programs without a literal of two
+    /// bytes use the scanner.
+    fn keyOf(p: prog.Program) ?[]const u8 {
+        const h = p.header;
+        if (h.anchor_op == prog.no_anchor) return null;
+        const lit = p.pattern.bytes(p.pattern.ops[h.anchor_op]);
+        if (lit.len < 2) return null;
+        return lit[0..@min(lit.len, 4)];
+    }
+
+    /// Room for every case variant of a key.
+    fn fits(t: *const Pending) bool {
+        return t.n + 16 <= max;
+    }
+
+    fn add(t: *Pending, p: prog.Program, index: u32) void {
+        const h = p.header;
+        const op = p.pattern.ops[h.anchor_op];
+        const lit = keyOf(p).?;
+        var key: [4]u8 = @splat(0);
+        @memcpy(key[0..lit.len], lit);
+        const q: u8 = @intCast(lit.len);
+        if (op.flags & @import("../compile/ir.zig").op_nocase == 0) {
+            t.put(std.mem.readInt(u32, &key, .little), q, index, h.anchor_delta);
+            return;
+        }
+        var it = @import("../compile/atoms.zig").Variants.init(&key);
+        while (it.next()) |g| t.put(g, q, index, h.anchor_delta);
+    }
+
+    fn put(t: *Pending, key: u32, q: u8, index: u32, back: u32) void {
+        var s = prefilter.slotOf(key, slots);
+        while (t.progs[s] != empty) s = (s + 1) & (slots - 1);
+        t.keys[s] = key;
+        t.qs[s] = q;
+        t.progs[s] = index;
+        t.backs[s] = back;
+        t.bits[(key & 0xffff) >> 6] |= @as(u64, 1) << @intCast(key & 63);
+        t.n += 1;
+    }
+
+    fn run(t: *const Pending, data: []const u8, sink: *Sink) bool {
+        if (data.len < 2) return true;
+        // Sixteen positions at a time: the bitmap tests append passing positions without a
+        // branch, and only those are probed.
+        var i: usize = 0;
+        while (i + 17 <= data.len) : (i += 16) {
+            var passed: [16]u8 = undefined;
+            var m: usize = 0;
+            inline for (0..16) |j| {
+                const g2: u32 = std.mem.readInt(u16, data[i + j ..][0..2], .little);
+                passed[m] = j;
+                m += @intCast((t.bits[g2 >> 6] >> @intCast(g2 & 63)) & 1);
+            }
+            for (passed[0..m]) |j| if (!t.probe(data, i + j, sink)) return false;
+        }
+        while (i + 2 <= data.len) : (i += 1) {
+            const g2: u32 = std.mem.readInt(u16, data[i..][0..2], .little);
+            if (t.bits[g2 >> 6] & (@as(u64, 1) << @intCast(g2 & 63)) == 0) continue;
+            if (!t.probe(data, i, sink)) return false;
+        }
+        return true;
+    }
+
+    /// The pending atoms whose key sits at `i`.
+    fn probe(t: *const Pending, data: []const u8, i: usize, sink: *Sink) bool {
+        {
+            const g2: u32 = std.mem.readInt(u16, data[i..][0..2], .little);
+            const g3 = if (i + 3 <= data.len) g2 | @as(u32, data[i + 2]) << 16 else null;
+            const g4 = if (i + 4 <= data.len) prefilter.load4(data, i) else null;
+            const keys = [3]?u32{ g4, g3, g2 };
+            for (keys, [3]u8{ 4, 3, 2 }) |maybe, q| {
+                const g = maybe orelse continue;
+                var s = prefilter.slotOf(g, slots);
+                while (t.progs[s] != empty) : (s = (s + 1) & (slots - 1)) {
+                    if (t.keys[s] != g or t.qs[s] != q or t.backs[s] > i) continue;
+                    if (!sink.candidate(t.progs[s], i - t.backs[s])) return false;
+                }
+            }
+        }
+        return true;
+    }
+};
+
+/// A verify memo of a program with few parts, in file positions below 4 GiB (larger ones are
+/// stored as unknown, which only costs a search).
+const CompactMemo = struct {
+    const parts = 16;
+    const none: u32 = std.math.maxInt(u32);
+
+    prog: u32,
+    from: [parts]u32,
+    upto: [parts]u32,
+    stretch: [parts][4]u32,
+
+    fn load(e: *const CompactMemo, m: *vm.Memo, n: usize) void {
+        m.parts = n;
+        for (0..n) |k| {
+            m.dead_from[k] = if (e.from[k] == none) std.math.maxInt(usize) else e.from[k];
+            m.dead_upto[k] = if (e.upto[k] == none) std.math.maxInt(usize) else e.upto[k];
+            m.from_lo[k] = e.stretch[k][0];
+            m.from_hi[k] = e.stretch[k][1];
+            m.upto_lo[k] = e.stretch[k][2];
+            m.upto_hi[k] = e.stretch[k][3];
+        }
+    }
+
+    fn store(e: *CompactMemo, m: *const vm.Memo, n: usize) void {
+        for (0..n) |k| {
+            e.from[k] = std.math.cast(u32, m.dead_from[k]) orelse none;
+            e.upto[k] = std.math.cast(u32, m.dead_upto[k]) orelse none;
+            // A stretch past 4 GiB is dropped (stored empty): that only costs a search.
+            const fits = m.from_hi[k] <= none and m.upto_hi[k] <= none;
+            e.stretch[k] = if (fits) .{ @intCast(m.from_lo[k]), @intCast(m.from_hi[k]), @intCast(m.upto_lo[k]), @intCast(m.upto_hi[k]) } else @splat(0);
+        }
+    }
+};
+
+/// Per-worker memory for the prefiltered search (about 300 KiB): the candidate ring, the
+/// deferred pass's table and the verify memo caches. Workers allocate one from their scratch
+/// and pass it to `scanBufferScratch`; without one a smaller copy lives on the stack.
+pub const Scratch = struct {
+    pub const compact_slots = 1024;
+    pub const memo_slots = 8;
+
+    ring: [prefilter.ring_len]prefilter.Candidate,
+    pending: Pending,
+    compact: [compact_slots]CompactMemo,
+    working: vm.Memo,
+    memos: [memo_slots]vm.Memo,
+    memo_progs: [memo_slots]u32,
+};
+
+/// The stack fallback when the caller has no `Scratch`.
+const SmallScratch = struct {
+    ring: [prefilter.ring_len]prefilter.Candidate,
+    pending: Pending,
+    working: vm.Memo,
+    memos: [2]vm.Memo,
+    memo_progs: [2]u32,
+};
+
+/// `scanBuffer` with the search mode chosen, worker scratch, and prefilter counters for
+/// benchmarks.
+pub fn scanBufferMode(index: *const BodyIndex, data: []const u8, file: File, budget: *vm.Budget, tracker: *limits_mod.Tracker, state: ?*logical.State, mode: Mode, stats: ?*prefilter.Stats) !Verdict {
+    return scanBufferScratch(index, data, file, budget, tracker, state, mode, stats, null);
+}
+
+pub fn scanBufferScratch(index: *const BodyIndex, data: []const u8, file: File, budget: *vm.Budget, tracker: *limits_mod.Tracker, state: ?*logical.State, mode: Mode, stats: ?*prefilter.Stats, worker: ?*Scratch) !Verdict {
     if (index.programs == null and index.ldb == null) return .clean;
     const progs = index.programs orelse prog.Programs.empty;
     const target = file.target;
@@ -143,23 +441,96 @@ pub fn scanBuffer(index: *const BodyIndex, data: []const u8, file: File, budget:
         if (c.hit) |d| return .{ .infected = d };
         if (c.overflow) break;
     }
-    // Everything else is searched for.
-    scan: for (0..progs.count()) |i| {
-        const p = progs.get(i);
-        if (anchored.isAnchored(p)) continue;
-        if (p.header.target != 0 and p.header.target != target) continue;
-        const is_ldb = p.header.flags & prog.flag_ldb != 0;
-        if (is_ldb and c.settled(p)) continue;
-        var scanner = vm.Scanner.init(p, data, info, budget);
-        while (true) {
-            const m = scanner.next() catch break :scan;
-            const hit = m orelse break;
-            if (!is_ldb) return .{ .infected = .{ .sig = p.header.sig, .start = hit.start, .end = hit.end } };
-            c.touch(p, hit) catch {
-                c.overflow = true;
-                break :scan;
-            };
-            if (c.settled(p)) break;
+    const part: ?*const prefilter.Partition = if (mode == .auto) index.partitionFor(target) else null;
+    if (part) |pf| search: {
+        // Stages one and two find candidates, the verify VM confirms them.
+        var small: SmallScratch = undefined;
+        var ring: *[prefilter.ring_len]prefilter.Candidate = &small.ring;
+        var pending: *Pending = &small.pending;
+        var memos: []vm.Memo = &small.memos;
+        var memo_progs: []u32 = &small.memo_progs;
+        var working: *vm.Memo = &small.working;
+        var compact: []CompactMemo = &.{};
+        if (worker) |sc| {
+            ring = &sc.ring;
+            pending = &sc.pending;
+            memos = &sc.memos;
+            memo_progs = &sc.memo_progs;
+            working = &sc.working;
+            compact = &sc.compact;
+        }
+        @memset(memo_progs, std.math.maxInt(u32));
+        for (compact) |*e| e.prog = std.math.maxInt(u32);
+        var sink: Sink = .{ .c = &c, .data = data, .info = info, .budget = budget, .target = target, .stats = stats, .compact = compact, .working = working, .memos = memos, .memo_progs = memo_progs };
+        _ = prefilter.scan(pf, data, ring, &sink, stats);
+        if (c.hit) |d| return .{ .infected = d };
+        if (sink.stopped or c.overflow) break :search;
+        // Programs with no atom.
+        for (pf.short) |i| {
+            const p = progs.get(i);
+            if (p.header.target != 0 and p.header.target != target) continue;
+            if (stats) |s| {
+                s.scans += 1;
+                if (s.per_prog_scans) |pp| pp[i] +|= 1;
+            }
+            switch (searchProgram(&c, p, data, info, budget)) {
+                .more => {},
+                .detected => return .{ .infected = c.hit.? },
+                .stop => break :search,
+            }
+        }
+        // Deferred subsigs of the logical signatures the first pass touched: one of their
+        // cover subsigs matched, so they are searched now, their atoms all in one pass.
+        const st = state orelse break :search;
+        const table = index.ldb orelse break :search;
+        pending.n = 0;
+        var pending_ready = false;
+        var it = st.liveTouched();
+        while (it.next()) |ldb| {
+            if (ldb >= table.records.len) continue;
+            const rec = table.records[ldb];
+            for (rec.prog_first..rec.prog_first + rec.prog_count) |i| {
+                const p = progs.get(i);
+                if (p.header.flags & prog.flag_deferred == 0) continue;
+                if (p.header.target != 0 and p.header.target != target) continue;
+                if (c.settled(p)) continue;
+                if (stats) |s| s.deferred += 1;
+                if (Pending.keyOf(p) != null) {
+                    // The table is cleared on first use: most files touch nothing deferred.
+                    if (!pending_ready) {
+                        pending.clear();
+                        pending_ready = true;
+                    }
+                    if (!pending.fits()) {
+                        if (!pending.run(data, &sink)) break :search;
+                        pending.clear();
+                    }
+                    pending.add(p, @intCast(i));
+                    continue;
+                }
+                if (stats) |s| {
+                    s.scans += 1;
+                    if (s.per_prog_scans) |pp| pp[i] +|= 1;
+                }
+                switch (searchProgram(&c, p, data, info, budget)) {
+                    .more => {},
+                    .detected => return .{ .infected = c.hit.? },
+                    .stop => break :search,
+                }
+            }
+        }
+        if (pending.n > 0 and !pending.run(data, &sink)) break :search;
+    } else {
+        // The reference path: every program of the target is searched.
+        for (0..progs.count()) |i| {
+            const p = progs.get(i);
+            if (anchored.isAnchored(p)) continue;
+            if (p.header.target != 0 and p.header.target != target) continue;
+            switch (searchProgram(&c, p, data, info, budget)) {
+                .more => {},
+                .detected => return .{ .infected = c.hit.? },
+                .stop => break,
+            }
         }
     }
     if (state) |st| if (index.ldb) |table| if (table.yara) |yara| {
@@ -345,6 +716,17 @@ test "logical signatures end to end: counts, target descriptions, anchored subsi
         var file = case[1];
         file.info.size = case[0].len;
         const verdict = try scanBuffer(&index, case[0], file, &budget, &tracker, &state);
+        // The prefiltered search (with deferred subsigs) and the reference search agree.
+        state.reset();
+        var budget_ref: vm.Budget = .{};
+        // (A logical detection's position is its last subsig match, which depends on the
+        // order matches were found in; the verdict and the signature do not.)
+        const ref = try scanBufferMode(&index, case[0], file, &budget_ref, &tracker, &state, .reference, null);
+        const same = std.meta.activeTag(verdict) == std.meta.activeTag(ref) and (verdict != .infected or verdict.infected.sig == ref.infected.sig);
+        if (!same) {
+            std.debug.print("case {s}: prefilter {any}, reference {any}\n", .{ case[0], verdict, ref });
+            return error.TestUnexpectedResult;
+        }
         if (case[2]) |want| {
             try std.testing.expectEqualStrings(want, try names.meta.?.name(verdict.infected.sig, &name_buf));
         } else try std.testing.expectEqual(Verdict.clean, verdict);

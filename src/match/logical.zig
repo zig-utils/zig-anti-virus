@@ -246,6 +246,35 @@ pub const State = struct {
         try s.spill.append(s.spill_arena.allocator(), e);
     }
 
+    /// The live signatures touched so far, as LDB_TABLE record indices, in touch order. New
+    /// touches of these signatures during the walk are fine; signatures touched for the first
+    /// time after `liveTouched` returned are not visited.
+    pub fn liveTouched(s: *State) Touched {
+        return .{ .s = s, .slots = s.touched_len, .spilled = s.spill.items.len };
+    }
+
+    pub const Touched = struct {
+        s: *State,
+        slots: usize,
+        spilled: usize,
+        i: usize = 0,
+
+        pub fn next(t: *Touched) ?u32 {
+            while (t.i < t.slots + t.spilled) {
+                const i = t.i;
+                t.i += 1;
+                if (i < t.slots) {
+                    const slot = t.s.slots[t.s.touched[i]];
+                    if (slot.dead == 0) return slot.ldb;
+                } else {
+                    const e = t.s.spill.items[i - t.slots];
+                    if (!e.dead) return e.ldb;
+                }
+            }
+            return null;
+        }
+    };
+
     /// Whether subsig `subsig` of `ldb` has matched (or the signature is dead): the scan can
     /// skip further matches of it when its expression does not count.
     pub fn settled(s: *State, ldb: u32, subsig: u16) bool {

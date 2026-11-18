@@ -41,6 +41,10 @@ pub fn main(init: std.process.Init) !void {
             hexBody(random);
             cases += 1;
         }
+        if (selected(only, "prefilterSection")) {
+            try prefilterSection(gpa.allocator(), random, &prefilter_seed);
+            cases += 1;
+        }
         if (selected(only, "ndbLine")) {
             ndbLine(random);
             cases += 1;
@@ -136,6 +140,75 @@ fn mutate(random: std.Random, buf: []u8, len: usize, alphabet: []const u8) []u8 
 
 /// Hex bodies: parse in a fixed arena (so allocation is bounded), print, re-parse the printed
 /// form and require the same text (the printer is a fixed point), then expand modifiers.
+/// A PREFILTER section built once, then mutated: loading refuses or accepts it, and a scan of
+/// what loads never reads out of bounds.
+const PrefilterSeed = struct {
+    arena: std.heap.ArenaAllocator,
+    programs: zav.match.prog.Programs,
+    section: []align(64) const u8,
+
+    fn get(seed: *?PrefilterSeed, gpa: std.mem.Allocator) !*PrefilterSeed {
+        if (seed.*) |*s| return s;
+        const zc = zav.compile;
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        const a = arena.allocator();
+        _ = gpa;
+        const hexes = [_][]const u8{ "13a7c95be2f1408d77e3b1aa", "5be2f1408d77e3", "c95be2f1", "ff25a4{3}0000000000000000", "8185??f?ffff{4}81ad", "6576616c28*756e657363617065" };
+        var inputs: std.ArrayList(zc.prog_build.Input) = .empty;
+        for (hexes, 0..) |hex, i| {
+            var diag: zc.hexsig.Diag = .{};
+            try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i), .target = @intCast(i % 2) });
+        }
+        const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), .{}, inputs.items, &.{});
+        var w = zc.prog_build.Writer.init(a, null);
+        for (inputs.items, planned) |*in, p| {
+            in.atom = p.atom(in.offset.kind);
+            _ = try w.add(in.*);
+        }
+        const bytes = try w.finish();
+        const image = try a.alignedAlloc(u8, .@"64", bytes.len);
+        @memcpy(image, bytes);
+        const programs = try zav.match.prog.Programs.init(image);
+        const section = (try zc.prefilter_build.buildAll(a, programs, w.atoms.items, .{})).?;
+        seed.* = .{ .arena = arena, .programs = programs, .section = section };
+        return &seed.*.?;
+    }
+};
+
+var prefilter_seed: ?PrefilterSeed = null;
+
+fn prefilterSection(gpa: std.mem.Allocator, random: std.Random, seed_slot: *?PrefilterSeed) !void {
+    const seed = try PrefilterSeed.get(seed_slot, gpa);
+    const copy = try gpa.alignedAlloc(u8, .@"64", seed.section.len);
+    defer gpa.free(copy);
+    @memcpy(copy, seed.section);
+    for (0..1 + random.uintLessThan(usize, 8)) |_| {
+        const i = random.uintLessThan(usize, copy.len);
+        copy[i] = switch (random.uintLessThan(u8, 3)) {
+            0 => random.int(u8),
+            1 => 0xff,
+            else => 0,
+        };
+    }
+    const parts = zav.match.prefilter.loadAll(copy, seed.programs) catch return;
+    var data: [4096]u8 = undefined;
+    random.bytes(&data);
+    var ring: [zav.match.prefilter.ring_len]zav.match.prefilter.Candidate = undefined;
+    const Sink = struct {
+        n: usize = 0,
+        count: usize,
+        pub fn candidate(s: *@This(), prog_index: u32, anchor_start: usize) bool {
+            if (prog_index >= s.count or anchor_start > 4096) @panic("fuzz: prefilter candidate out of range");
+            s.n += 1;
+            return true;
+        }
+    };
+    for (parts) |maybe| if (maybe) |part| {
+        var sink: Sink = .{ .count = seed.programs.count() };
+        _ = zav.match.prefilter.scan(&part, &data, &ring, &sink, null);
+    };
+}
+
 fn hexBody(random: std.Random) void {
     const hexsig = zav.compile.hexsig;
     const seeds = [_][]const u8{

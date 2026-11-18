@@ -12,7 +12,18 @@ pub const Input = struct {
     sig: u32,
     subsig: u16 = 0,
     flags: u8 = 0,
+    /// The anchor and prefilter atom compile/atoms.zig chose; null picks the longest literal.
+    atom: ?Atom = null,
 };
+
+pub const Atom = struct { anchor: Anchor, spec: AtomSpec = .{} };
+
+/// A program's prefilter atom: `stride + q - 1` bytes of its anchor literal from `off`, whose
+/// `q`-byte grams the filter of that stride and gram length holds (strides 1, 4 and 8 with
+/// 4-byte grams, stride 1 with 3- or 2-byte grams). `q` 0: none (pinned to an offset,
+/// deferred, or no literal of two bytes). Kept beside SUBSIG_PROG, not in it: only the
+/// compiler's prefilter builder reads it.
+pub const AtomSpec = packed struct(u32) { off: u16 = 0, stride: u8 = 0, q: u8 = 0 };
 
 pub const Anchor = struct { part: u8 = 0, op: u16 = prog.no_anchor, delta: u16 = prog.no_anchor };
 
@@ -75,7 +86,7 @@ pub fn build(gpa: std.mem.Allocator, inputs: []const Input) ![]u8 {
 
 /// One program as it is laid out in the section (header, ops, data).
 fn header(in: Input) prog.ProgHeader {
-    const anchor = chooseAnchor(in.pattern, in.offset.kind != .any);
+    const anchor = if (in.atom) |a| a.anchor else chooseAnchor(in.pattern, in.offset.kind != .any);
     return .{
         .sig = in.sig,
         .subsig = in.subsig,
@@ -102,6 +113,8 @@ pub const Writer = struct {
     spill: ?*spill_mod.Spill,
     /// Body offsets relative to the first body byte.
     index: std.ArrayList(u32) = .empty,
+    /// The atom of each program, in program order.
+    atoms: std.ArrayList(AtomSpec) = .empty,
     bodies: spill_mod.Sink,
     section: ?spill_mod.Sink = null,
 
@@ -111,6 +124,7 @@ pub const Writer = struct {
 
     pub fn deinit(w: *Writer) void {
         w.index.deinit(w.gpa);
+        w.atoms.deinit(w.gpa);
         w.bodies.deinit();
         if (w.section) |*s| s.deinit();
         w.* = undefined;
@@ -125,6 +139,7 @@ pub const Writer = struct {
         const n = w.count();
         try w.bodies.alignTo(4);
         try w.index.append(w.gpa, @intCast(w.bodies.len));
+        try w.atoms.append(w.gpa, if (in.atom) |a| a.spec else .{});
         var packed_buf: [@sizeOf(prog.PackedHeader) + @sizeOf(prog.PackedOffset)]u8 = undefined;
         try w.bodies.append(prog.pack(header(in), &packed_buf));
         try w.bodies.append(std.mem.sliceAsBytes(in.pattern.ops));

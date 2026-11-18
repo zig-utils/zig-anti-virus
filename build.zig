@@ -206,6 +206,23 @@ pub fn build(b: *std.Build) void {
     run_e1.addPassthruArgs();
     b.step("e1", "Hash index lookup cost and skipped hashing (pass db, CVD dir and corpus roots after --)").dependOn(&run_e1.step);
 
+    // E2, E3, E4: prefilter census and measurements on a compiled database and the benign
+    // corpora (bench/corpus). Installed with the step, so zig-out/bin/prefilter can be rerun.
+    const prefilter_exe = b.addExecutable(.{
+        .name = "prefilter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/prefilter.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    const run_prefilter = b.addRunArtifact(prefilter_exe);
+    run_prefilter.addPassthruArgs();
+    const prefilter_step = b.step("prefilter", "Prefilter census and measurements (pass a command, db and corpus dirs after --)");
+    prefilter_step.dependOn(&b.addInstallArtifact(prefilter_exe, .{}).step);
+    prefilter_step.dependOn(&run_prefilter.step);
+
     // The 4-gram frequency model atom selection embeds (src/compile/gram_model.bin).
     const gram_model_exe = b.addExecutable(.{
         .name = "gram-model",

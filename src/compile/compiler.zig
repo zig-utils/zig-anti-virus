@@ -33,6 +33,9 @@ const yara_cond = @import("../match/yara_cond.zig");
 const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
+const atoms = @import("atoms.zig");
+const prefilter_build = @import("prefilter_build.zig");
+const gram_model = @import("gram_model.zig");
 const hash_build = @import("hash_build.zig");
 const names_mod = @import("names.zig");
 const spill_mod = @import("spill.zig");
@@ -85,6 +88,12 @@ pub const Compiler = struct {
     signatures_seen: bool = false,
     rejected: std.ArrayList(ir.Rejection) = .empty,
     coverage: coverage_mod.Coverage = .{},
+    /// Benign 4-gram frequencies atom selection scores windows with.
+    model: gram_model.Model,
+    /// Programs by atom tier, for the coverage report.
+    histogram: atoms.Histogram = .{},
+    /// How atom selection weighs candidates against filters (E2 and E3 vary it).
+    atom_costs: atoms.Costs = .{},
     sources: format.Sources = .{},
     hash_rules: u64 = 0,
     body_rules: u64 = 0,
@@ -103,7 +112,21 @@ pub const Compiler = struct {
             .hashes = .init(gpa, options.spill, options.hash_budget),
             .programs = .init(gpa, options.spill),
             .logicals = .init(gpa),
+            .model = .default(),
         };
+    }
+
+    /// Add one program with the atom atom selection gives it (atoms.zig).
+    fn addProgram(c: *Compiler, in: prog_build.Input, planned: atoms.Planned) !void {
+        var x = in;
+        c.histogram.add(x, planned);
+        x.atom = planned.atom(x.offset.kind);
+        if (planned.deferred) x.flags |= prog.flag_deferred;
+        _ = try c.programs.add(x);
+    }
+
+    fn addSearched(c: *Compiler, in: prog_build.Input) !void {
+        try c.addProgram(in, .{ .choice = atoms.chooseFor(c.model, c.atom_costs, in) });
     }
 
     pub fn deinit(c: *Compiler) void {
@@ -245,7 +268,7 @@ pub const Compiler = struct {
                 if (v.folded) flags |= prog.flag_folded;
                 if (v.wide) flags |= prog.flag_wide;
                 if (rule.subsig.mods.fullword) flags |= prog.flag_fullword;
-                _ = try c.programs.add(.{ .pattern = v.pattern, .offset = rule.subsig.offset, .target = rule.target, .sig = sig, .flags = flags });
+                try c.addSearched(.{ .pattern = v.pattern, .offset = rule.subsig.offset, .target = rule.target, .sig = sig, .flags = flags });
             }
             c.body_rules += 1;
             try c.coverage.include(c.gpa, @tagName(rule.source), 1);
@@ -285,6 +308,7 @@ pub const Compiler = struct {
             const sig = try c.names.intern(rule.name, rule.flags, rule.source);
             const record = c.logicals.count();
             const first = c.programs.count();
+            var inputs: std.ArrayList(prog_build.Input) = .empty;
             for (rule.subsigs, per_subsig, 0..) |sub, variants, i| {
                 if (sub != .hex) continue;
                 const h = sub.hex;
@@ -293,9 +317,13 @@ pub const Compiler = struct {
                     if (v.folded) flags |= prog.flag_folded;
                     if (v.wide) flags |= prog.flag_wide;
                     if (h.mods.fullword) flags |= prog.flag_fullword;
-                    _ = try c.programs.add(.{ .pattern = v.pattern, .offset = h.offset, .target = rule.tdb.target, .sig = record, .subsig = @intCast(i), .flags = flags });
+                    try inputs.append(scratch, .{ .pattern = v.pattern, .offset = h.offset, .target = rule.tdb.target, .sig = record, .subsig = @intCast(i), .flags = flags });
                 }
             }
+            // Atoms for every variant, and the subsigs outside the expression's cheapest cover
+            // deferred (atoms.zig).
+            const planned = try atoms.plan(scratch, c.model, c.atom_costs, inputs.items, &.{.{ .rule = &rule, .first = 0, .count = @intCast(inputs.items.len) }});
+            for (inputs.items, planned) |in, pl| try c.addProgram(in, pl);
             const regex_first: u32 = @intCast(c.regex_blobs.items.len);
             for (rule.subsigs) |sub| switch (sub) {
                 .pcre => |p| try c.regex_blobs.append(c.gpa, try c.arena.allocator().dupe(u8, p.program)),
@@ -494,7 +522,7 @@ pub const Compiler = struct {
                     if (v.folded) flags |= prog.flag_folded;
                     if (v.wide) flags |= prog.flag_wide;
                     if (str.fullword) flags |= prog.flag_fullword;
-                    _ = try c.programs.add(.{ .pattern = v.pattern, .sig = record, .subsig = @intCast(i), .flags = flags });
+                    try c.addSearched(.{ .pattern = v.pattern, .sig = record, .subsig = @intCast(i), .flags = flags });
                 }
             }
             const subsigs = try arena.alloc(ir.LogicalSubsig, rule.strings.len);
@@ -520,9 +548,13 @@ pub const Compiler = struct {
         // One anchored-offset index per partition, each proven to reach all of its programs.
         var anchored_sections: [ndb.max_target + 1]?[]u8 = @splat(null);
         defer for (anchored_sections) |a| if (a) |bytes| c.gpa.free(bytes);
+        // The prefilter of every partition (prefilter_build.zig).
+        var prefilter_section: ?[]align(64) u8 = null;
+        defer if (prefilter_section) |b| c.gpa.free(b);
         if (program_count > 0) {
             const progs = try prog.Programs.init(programs);
             for (&anchored_sections, 0..) |*slot, p| slot.* = try anchored_build.build(c.gpa, progs, @intCast(p));
+            prefilter_section = try prefilter_build.buildAll(c.gpa, progs, c.programs.atoms.items, .{});
         }
 
         // Names are complete: no more interning.
@@ -536,6 +568,7 @@ pub const Compiler = struct {
         var report: Io.Writer.Allocating = .init(c.gpa);
         defer report.deinit();
         try c.coverage.render(&report.writer);
+        try c.histogram.render(&report.writer);
 
         var sections: std.ArrayList(writer.Section) = .empty;
         defer sections.deinit(c.gpa);
@@ -559,6 +592,7 @@ pub const Compiler = struct {
         for (anchored_sections, 0..) |a, p| if (a) |bytes| {
             try sections.append(c.gpa, .{ .kind = .anchored_index, .variant = @intCast(p), .partition = @intCast(p), .hot = true, .bytes = bytes });
         };
+        if (prefilter_section) |bytes| try sections.append(c.gpa, .{ .kind = .prefilter, .hot = true, .bytes = bytes });
         try sections.append(c.gpa, .{ .kind = .coverage_report, .bytes = report.written() });
 
         var opts = options;

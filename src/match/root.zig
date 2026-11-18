@@ -4,6 +4,8 @@
 pub const hashidx = @import("hashidx.zig");
 pub const prog = @import("prog.zig");
 pub const verify_vm = @import("verify_vm.zig");
+pub const prefilter = @import("prefilter.zig");
+pub const stage1 = @import("stage1.zig");
 pub const anchored = @import("anchored.zig");
 pub const ldb_table = @import("ldb_table.zig");
 pub const logical = @import("logical.zig");
@@ -15,6 +17,8 @@ test {
     _ = hashidx;
     _ = prog;
     _ = verify_vm;
+    _ = prefilter;
+    _ = stage1;
     _ = anchored;
     _ = ldb_table;
     _ = logical;

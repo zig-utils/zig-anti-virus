@@ -33,7 +33,11 @@ pub const flag_folded: u8 = 1 << 1;
 pub const flag_ldb: u8 = 1 << 2;
 /// A `::w` variant: fullword boundaries are checked on 16-bit units.
 pub const flag_wide: u8 = 1 << 3;
-pub const known_flags: u8 = flag_fullword | flag_folded | flag_ldb | flag_wide;
+/// A logical subsig outside its expression's cheapest cover (compile/atoms.zig): searched only
+/// in the second pass over a file in which its signature was touched, with its anchor literal
+/// (the one holding its rarest window) as the key.
+pub const flag_deferred: u8 = 1 << 4;
+pub const known_flags: u8 = flag_fullword | flag_folded | flag_ldb | flag_wide | flag_deferred;
 
 pub const no_anchor: u16 = 0xffff;
 
@@ -239,6 +243,7 @@ pub fn validate(p: Program) Programs.Error!void {
     if (h.anchor_op != no_anchor) {
         if (h.anchor_op >= h.op_count or anchor_part != h.anchor_part or h.anchor_delta == no_anchor) return error.BadProgram;
     } else if (h.anchor_part >= parts) return error.BadProgram;
+    if (h.flags & flag_deferred != 0 and h.flags & flag_ldb == 0) return error.BadProgram;
 }
 
 fn validateOps(p: ir.Pattern, ops: []const ir.Op, inside_alt: bool) Programs.Error!void {

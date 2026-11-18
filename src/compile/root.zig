@@ -9,6 +9,8 @@ pub const hexsig = @import("hexsig.zig");
 pub const ndb = @import("ndb.zig");
 pub const prog_build = @import("prog_build.zig");
 pub const gram_model = @import("gram_model.zig");
+pub const atoms = @import("atoms.zig");
+pub const prefilter_build = @import("prefilter_build.zig");
 pub const anchored_build = @import("anchored_build.zig");
 pub const ldb = @import("ldb.zig");
 pub const ldb_build = @import("ldb_build.zig");
@@ -36,6 +38,8 @@ test {
     _ = ndb;
     _ = prog_build;
     _ = gram_model;
+    _ = atoms;
+    _ = prefilter_build;
     _ = anchored_build;
     _ = ldb;
     _ = ldb_build;
