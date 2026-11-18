@@ -131,12 +131,8 @@ fn addHashVariants(b: *std.Build, module: *std.Build.Module, target: std.Build.R
             std.debug.panic("hash variant {s}: unknown CPU model {s}", .{ spec.name, spec.model }) };
         query.cpu_features_add = .empty;
         query.cpu_features_sub = .empty;
-        for (spec.features) |feature_name| {
-            const feature = for (arch.allFeaturesList()) |f| {
-                if (std.mem.eql(u8, f.name, feature_name)) break f;
-            } else std.debug.panic("hash variant {s}: unknown CPU feature {s}", .{ spec.name, feature_name });
-            query.cpu_features_add.addFeature(feature.index);
-        }
+        for (spec.features) |name| query.cpu_features_add.addFeature(cpuFeatureIndex(arch, spec.name, name));
+        for (spec.features_sub) |name| query.cpu_features_sub.addFeature(cpuFeatureIndex(arch, spec.name, name));
         const options = b.addOptions();
         options.addOption([]const u8, "name", spec.name);
         const object = b.addObject(.{
@@ -152,4 +148,9 @@ fn addHashVariants(b: *std.Build, module: *std.Build.Module, target: std.Build.R
         });
         module.addObject(object);
     }
+}
+
+fn cpuFeatureIndex(arch: std.Target.Cpu.Arch, variant: []const u8, name: []const u8) std.Target.Cpu.Feature.Set.Index {
+    for (arch.allFeaturesList()) |f| if (std.mem.eql(u8, f.name, name)) return f.index;
+    std.debug.panic("hash variant {s}: unknown CPU feature {s}", .{ variant, name });
 }
