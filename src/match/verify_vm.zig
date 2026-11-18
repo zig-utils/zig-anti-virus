@@ -80,12 +80,28 @@ pub const Budget = struct {
     /// Steps all verify calls for one file may take together.
     per_file: u64 = 1 << 24,
     used: u64 = 0,
-    /// Set when either budget ran out during this file.
+    /// Set when any budget ran out during this file.
     exhausted: bool = false,
+    /// Verify calls one file may make: `verify_floor` plus `verify_per_kib` for every KiB of
+    /// it. Benign files make at most 23 per KiB (B1, B2, S1); crafted input that repeats atoms
+    /// whose programs then fail makes up to a million per MB, each cheap and none near its step
+    /// budget (docs/experiments/E4-verify.md), so the count, not the steps, bounds it.
+    verify_floor: u64 = 16384,
+    verify_per_kib: u64 = 64,
+    verifies: u64 = 0,
+    /// Set when the verify count ran out: a limit event of its own (`verify_count`).
+    count_exhausted: bool = false,
 
     pub fn reset(b: *Budget) void {
         b.used = 0;
         b.exhausted = false;
+        b.verifies = 0;
+        b.count_exhausted = false;
+    }
+
+    /// The verify calls a file of `size` bytes may make.
+    pub fn verifyCap(b: Budget, size: usize) u64 {
+        return b.verify_floor +| b.verify_per_kib *| (size / 1024);
     }
 };
 

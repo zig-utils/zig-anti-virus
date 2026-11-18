@@ -508,6 +508,8 @@ const Tiered = struct {
 var tier_parts: [5]zav.match.prefilter.Partition = undefined;
 var tier_data: []u8 = &.{};
 var tier_ring: [zav.match.prefilter.ring_len]zav.match.prefilter.Candidate = undefined;
+/// The stage-one CPU variant being measured.
+var tier_kernel: *const zav.match.prefilter.Kernel = undefined;
 
 fn buildTier(gpa: std.mem.Allocator, random: std.Random, lens: []const usize, count: usize, costs: zav.compile.atoms.Costs) !zav.match.prefilter.Partition {
     const zc = zav.compile;
@@ -524,7 +526,7 @@ fn buildTier(gpa: std.mem.Allocator, random: std.Random, lens: []const usize, co
         var diag: zc.hexsig.Diag = .{};
         try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i) });
     }
-    const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), costs, inputs.items, &.{});
+    const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), costs, inputs.items, &.{}, null);
     var w = zc.prog_build.Writer.init(a, null);
     for (inputs.items, planned) |*in, pl| {
         in.atom = pl.atom(in.offset.kind);
@@ -544,7 +546,7 @@ fn Stage1Bench(comptime k: usize) type {
             var pos: usize = 0;
             var n: usize = 0;
             while (pos < tier_data.len) {
-                const got, const next = zav.match.prefilter.stage1(&tier_parts[k], tier_data, pos, &tier_ring);
+                const got, const next = zav.match.prefilter.stage1With(tier_kernel.run, &tier_parts[k], tier_data, pos, &tier_ring);
                 n += got;
                 pos = next;
             }
@@ -563,8 +565,13 @@ fn prefilterBenchmarks(io: std.Io, gpa: std.mem.Allocator, suite: *bench.Benchma
     tier_data = try gpa.alloc(u8, hash_input_len);
     r.bytes(tier_data);
     std.debug.print("stage 1: MB/s (10^6 bytes) per core over 1 MiB of random bytes, best of 5\n", .{});
-    inline for (0..5) |k| {
-        std.debug.print("stage 1: {s:<26} {d:>8.0}\n", .{ names[k], mbps(io, Stage1Bench(k).run) });
-        try suite.add("stage 1 " ++ ([_][]const u8{ "s3 11B", "s3 7B", "s1 gated", "D", "s8+s4" })[k] ++ " 1 MiB", Stage1Bench(k).run);
+    // Every CPU variant of the kernel this machine runs (P4.05 follow-up): the suite records the
+    // one dispatch picks, the console all of them.
+    var kbuf: [8]*const zav.match.prefilter.Kernel = undefined;
+    for (zav.match.prefilter.runnableKernels(&kbuf)) |kern| {
+        tier_kernel = kern;
+        inline for (0..5) |k| std.debug.print("stage 1 [{s}]: {s:<26} {d:>8.0}\n", .{ kern.name, names[k], mbps(io, Stage1Bench(k).run) });
     }
+    tier_kernel = zav.match.prefilter.activeKernel();
+    inline for (0..5) |k| try suite.add("stage 1 " ++ ([_][]const u8{ "s3 11B", "s3 7B", "s1 gated", "D", "s8+s4" })[k] ++ " 1 MiB", Stage1Bench(k).run);
 }

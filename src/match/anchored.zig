@@ -7,7 +7,8 @@
 //! maxshift is 0 are keyed by those four bytes in a sorted array: one 4-byte read at the offset
 //! and a binary search pick the only candidates worth verifying. The rest (a shift window, or a
 //! body that does not start with four literal bytes) sit in the group's list and are verified at
-//! every start the window allows.
+//! every start the window allows where their anchor literal occurs (found by a whole-literal
+//! search).
 //!
 //! Layout:
 //!
@@ -172,14 +173,32 @@ pub fn scan(index: Index, programs: prog.Programs, data: []const u8, info: vm.Fi
         for (index.groupList(grp)) |i| {
             const p = programs.get(i);
             const w = vm.startWindow(p.offset(), info) orelse continue;
-            memo.prepare(p.header.part_count);
-            // A literal first byte picks the starts worth verifying inside the window.
-            const head = p.pattern.ops[0];
-            const head_byte: ?u8 = if (head.code == .lit and head.flags & ir.op_nocase == 0) p.pattern.bytes(head)[0] else null;
+            var memo_ready = false;
             const hi: usize = @intCast(@min(w.hi, data.len));
             var s: usize = @intCast(@min(w.lo, data.len));
+            // The anchor literal (in the first part, at a fixed distance from the start) picks
+            // the starts worth verifying inside the window: its first byte found with memchr,
+            // then the whole literal compared, where a first byte of 00 or ff alone would stop
+            // at most bytes of a PE header. (std.mem.indexOfPos builds a skip table per call,
+            // which costs more than the search over the short windows most files give.)
+            const h = p.header;
+            const anchor: ?ir.Op = if (h.anchor_op != prog.no_anchor) p.pattern.ops[h.anchor_op] else null;
             while (s <= hi) : (s += 1) {
-                if (head_byte) |b| s = std.mem.indexOfScalarPos(u8, data[0..@min(data.len, hi + 1)], s, b) orelse break;
+                if (anchor) |o| {
+                    const lit = p.pattern.bytes(o);
+                    const hay = data[0..@min(data.len, hi + h.anchor_delta + lit.len)];
+                    const from = s + h.anchor_delta;
+                    if (from + lit.len > hay.len) break;
+                    const at = (if (o.flags & ir.op_nocase == 0)
+                        findLiteral(hay, from, lit)
+                    else
+                        std.ascii.findIgnoreCasePos(hay, from, lit)) orelse break;
+                    s = at - h.anchor_delta;
+                }
+                if (!memo_ready) {
+                    memo.prepare(p.header.part_count);
+                    memo_ready = true;
+                }
                 const m = vm.verifyMemo(p, data, w, s, budget, &memo) catch |err| {
                     if (budget.used >= budget.per_file) return err;
                     continue;
@@ -188,6 +207,17 @@ pub fn scan(index: Index, programs: prog.Programs, data: []const u8, info: vm.Fi
             }
         }
     }
+}
+
+/// The first occurrence of `lit` in `hay` at or after `from`: memchr on its first byte, then a
+/// compare.
+fn findLiteral(hay: []const u8, from: usize, lit: []const u8) ?usize {
+    var at = from;
+    while (at + lit.len <= hay.len) : (at += 1) {
+        at = std.mem.indexOfScalarPos(u8, hay[0 .. hay.len - lit.len + 1], at, lit[0]) orelse return null;
+        if (std.mem.eql(u8, hay[at..][0..lit.len], lit)) return at;
+    }
+    return null;
 }
 
 fn verifyOne(p: prog.Program, data: []const u8, w: vm.Window, at: usize, budget: *vm.Budget) vm.Error!?vm.Match {

@@ -159,7 +159,7 @@ const PrefilterSeed = struct {
             var diag: zc.hexsig.Diag = .{};
             try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i), .target = @intCast(i % 2) });
         }
-        const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), .{}, inputs.items, &.{});
+        const planned = try zc.atoms.plan(a, zc.gram_model.Model.default(), .{}, inputs.items, &.{}, null);
         var w = zc.prog_build.Writer.init(a, null);
         for (inputs.items, planned) |*in, p| {
             in.atom = p.atom(in.offset.kind);

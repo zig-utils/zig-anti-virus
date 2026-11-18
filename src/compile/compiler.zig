@@ -94,6 +94,8 @@ pub const Compiler = struct {
     histogram: atoms.Histogram = .{},
     /// How atom selection weighs candidates against filters (E2 and E3 vary it).
     atom_costs: atoms.Costs = .{},
+    /// Atom table keys taken so far (atoms.zig `Crowd`).
+    crowd: atoms.Crowd,
     sources: format.Sources = .{},
     hash_rules: u64 = 0,
     body_rules: u64 = 0,
@@ -113,6 +115,7 @@ pub const Compiler = struct {
             .programs = .init(gpa, options.spill),
             .logicals = .init(gpa),
             .model = .default(),
+            .crowd = .init(gpa, (atoms.Costs{}).max_chain),
         };
     }
 
@@ -126,10 +129,13 @@ pub const Compiler = struct {
     }
 
     fn addSearched(c: *Compiler, in: prog_build.Input) !void {
-        try c.addProgram(in, .{ .choice = atoms.chooseFor(c.model, c.atom_costs, in) });
+        const planned: atoms.Planned = .{ .choice = atoms.chooseFor(c.model, c.atom_costs, in, &c.crowd) };
+        try c.crowd.notePlanned(in, planned);
+        try c.addProgram(in, planned);
     }
 
     pub fn deinit(c: *Compiler) void {
+        c.crowd.deinit();
         c.names.deinit();
         c.hashes.deinit();
         c.programs.deinit();
@@ -322,7 +328,7 @@ pub const Compiler = struct {
             }
             // Atoms for every variant, and the subsigs outside the expression's cheapest cover
             // deferred (atoms.zig).
-            const planned = try atoms.plan(scratch, c.model, c.atom_costs, inputs.items, &.{.{ .rule = &rule, .first = 0, .count = @intCast(inputs.items.len) }});
+            const planned = try atoms.plan(scratch, c.model, c.atom_costs, inputs.items, &.{.{ .rule = &rule, .first = 0, .count = @intCast(inputs.items.len) }}, &c.crowd);
             for (inputs.items, planned) |in, pl| try c.addProgram(in, pl);
             const regex_first: u32 = @intCast(c.regex_blobs.items.len);
             for (rule.subsigs) |sub| switch (sub) {

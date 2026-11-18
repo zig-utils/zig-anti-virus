@@ -129,6 +129,12 @@ jobs:
           # never committed.
           python3 tools/diff/ftm_check.py --ftm $db/daily/daily.ftm --work "$RUNNER_TEMP/ftmw" --limit 10000 \
             /usr/bin /usr/lib /usr/share/doc /usr/share/perl /usr/share/python3 "$HOME/.cache/pip" /var/cache/apt /usr/share
+      - name: E4, crafted worst cases built from the databases stay under 50 ms per MB
+        run: |
+          # The inputs are generated from the databases on the runner (docs/experiments/E4-verify.md),
+          # so nothing ClamAV-derived is committed.
+          zig build prefilter -Doptimize=ReleaseFast -- compile "$RUNNER_TEMP/real.zavdb" "$HOME/clamav-db/main.cvd" "$HOME/clamav-db/daily.cvd"
+          ./zig-out/bin/prefilter worst "$RUNNER_TEMP/real.zavdb" --max-ms 50
       - name: E13, zig-regex against PCRE2 on the PCRE subsigs and a public YARA rule set
         run: |
           git clone -q --depth 1 https://github.com/Yara-Rules/rules.git "$RUNNER_TEMP/yara-rules"

@@ -94,10 +94,10 @@ pub const Check = extern struct {
 };
 
 pub const empty_slot: u32 = 0xffff_ffff;
-pub const gate_len = 65536;
-pub const gate_s1: u8 = 1 << 0;
-pub const gate_q3: u8 = 1 << 1;
-pub const gate_q2: u8 = 1 << 2;
+pub const gate_len = kernel.gate_len;
+pub const gate_s1 = kernel.gate_s1;
+pub const gate_q3 = kernel.gate_q3;
+pub const gate_q2 = kernel.gate_q2;
 
 pub const Slot = extern struct {
     key: u32,
@@ -341,9 +341,7 @@ pub inline fn slotOf(key: u32, n: usize) usize {
     return @intCast(h & (n - 1));
 }
 
-pub inline fn load4(data: []const u8, pos: usize) u32 {
-    return std.mem.readInt(u32, data[pos..][0..4], .little);
-}
+pub const load4 = kernel.load4;
 
 inline fn foldGram(x: u32) u32 {
     // ASCII lowercase on all four bytes at once: bytes in 'A'..'Z' get 0x20 added.
@@ -372,13 +370,10 @@ inline fn checkMatches(c: Check, data: []const u8, part_start: usize) bool {
 }
 
 /// A candidate from stage one: a sampled position and the filter that fired.
-pub const Candidate = packed struct(u64) {
-    pos: u56,
-    filter: u8,
-};
+pub const Candidate = kernel.Candidate;
 
 /// Candidates per stage-two batch (8 KiB on the scanning thread's stack).
-pub const ring_len = 1024;
+pub const ring_len = kernel.ring_len;
 
 /// Counters for E2 and E3.
 pub const Stats = struct {
@@ -390,6 +385,11 @@ pub const Stats = struct {
     verifies: u64 = 0,
     /// Deferred programs searched in the second pass.
     deferred: u64 = 0,
+    /// Passes of the deferred search over a file, and the positions it probed.
+    deferred_runs: u64 = 0,
+    deferred_probes: u64 = 0,
+    /// Verifies the deferred pass handed to the verifier.
+    deferred_verifies: u64 = 0,
     /// Verifies per program, when a benchmark wants to see which atoms fire.
     per_prog: ?[]u32 = null,
     /// Whole-buffer scanner runs per program (no atom, or deferred and not batched).
@@ -418,10 +418,84 @@ pub fn scan(part: *const Partition, data: []const u8, ring: *[ring_len]Candidate
 /// Stage one from `start` until the ring is nearly full or the data ends: the candidates
 /// written and where to resume.
 pub fn stage1(part: *const Partition, data: []const u8, start: usize, ring: *[ring_len]Candidate) struct { usize, usize } {
-    return kernel.run(part, data, start, ring);
+    return stage1With(activeKernel().run, part, data, start, ring);
+}
+
+/// Stage one through a given kernel variant (benchmarks and the kernel test pick each one).
+pub fn stage1With(run: kernel.Fn, part: *const Partition, data: []const u8, start: usize, ring: *[ring_len]Candidate) struct { usize, usize } {
+    var args: kernel.Args = .{
+        .blocks = @splat(.{ .ptr = &kernel.no_blocks, .len = 1 }),
+        .idx = @splat(0),
+        .present = @splat(false),
+        .seed = part.seed,
+        .gate = if (part.gate.len > 0) part.gate.ptr else undefined,
+        .data = data.ptr,
+        .data_len = data.len,
+        .start = start,
+        .ring = ring,
+    };
+    for (part.filters[0..part.filter_count], 0..) |f, i| {
+        const k = kernel.kindOf(f.stride, f.q);
+        args.idx[k] = @intCast(i);
+        args.present[k] = true;
+        args.blocks[k] = .{ .ptr = f.sbbf.blocks.ptr, .len = f.sbbf.blocks.len };
+    }
+    var out: kernel.Result = undefined;
+    run(&args, &out);
+    return .{ out.n, out.next };
 }
 
 const kernel = @import("stage1.zig");
+const variants = @import("../hash/variants.zig");
+const hash_dispatch = @import("../hash/dispatch.zig");
+const arch = @import("../simd/arch.zig");
+const builtin = @import("builtin");
+
+/// One CPU variant of the stage-one kernel (build.zig compiles stage1.zig once per entry of
+/// src/hash/variants.zig and links each as `zav_stage1_<name>`).
+pub const Kernel = struct {
+    name: []const u8,
+    requires: variants.Requirement,
+    run: kernel.Fn,
+};
+
+const specs = variants.forArch(builtin.cpu.arch);
+
+/// Every linked variant, best first; the kernel compiled into the engine where none are built.
+pub const kernels: []const Kernel = if (specs.len == 0) &.{.{ .name = "portable", .requires = .none, .run = &kernel.runArgs }} else blk: {
+    var list: [specs.len]Kernel = undefined;
+    for (specs, &list) |spec, *k| k.* = .{
+        .name = spec.name,
+        .requires = spec.requires,
+        .run = @extern(kernel.Fn, .{ .name = "zav_stage1_" ++ spec.name }),
+    };
+    const final = list;
+    break :blk &final;
+};
+
+var active_kernel: std.atomic.Value(?*const Kernel) = .init(null);
+
+/// The best stage-one variant for the running CPU, detected on first use.
+pub fn activeKernel() *const Kernel {
+    if (active_kernel.load(.acquire)) |k| return k;
+    const f = arch.detect();
+    const k = for (kernels) |*k| {
+        if (hash_dispatch.supports(f, k.requires)) break k;
+    } else unreachable;
+    active_kernel.store(k, .release);
+    return k;
+}
+
+/// The linked variants the running CPU can execute.
+pub fn runnableKernels(out: *[8]*const Kernel) []*const Kernel {
+    const f = arch.detect();
+    var n: usize = 0;
+    for (kernels) |*k| if (hash_dispatch.supports(f, k.requires) and n < out.len) {
+        out[n] = k;
+        n += 1;
+    };
+    return out[0..n];
+}
 
 /// Stage two over a batch of candidates.
 pub fn stage2(part: *const Partition, data: []const u8, cands: []const Candidate, sink: anytype, stats: ?*Stats) bool {
@@ -533,7 +607,7 @@ fn fixtureCosts(hexes: []const []const u8, costs: @import("../compile/atoms.zig"
         var diag: zc.hexsig.Diag = .{};
         try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, hex, &diag), .sig = @intCast(i) });
     }
-    const planned = try zc.atoms.plan(a, zc.gm.Model.default(), costs, inputs.items, &.{});
+    const planned = try zc.atoms.plan(a, zc.gm.Model.default(), costs, inputs.items, &.{}, null);
     var w = zc.prog_build.Writer.init(a, null);
     for (inputs.items, planned) |*in, p| {
         in.atom = p.atom(in.offset.kind);
@@ -672,20 +746,28 @@ fn kernelMatchesReference(sampled: []const u8) !void {
         got.clearRetainingCapacity();
         want.clearRetainingCapacity();
         try stage1Reference(&f.part, data[skip..], &want, testing.allocator);
-        var pos: usize = 0;
-        while (pos < data.len - skip) {
-            const n, const next = stage1(&f.part, data[skip..], pos, &ring);
-            try got.appendSlice(testing.allocator, ring[0..n]);
-            pos = next;
-        }
         const lt = struct {
             fn less(_: void, a: Candidate, b: Candidate) bool {
                 return @as(u64, @bitCast(a)) < @as(u64, @bitCast(b));
             }
         }.less;
         std.mem.sort(Candidate, want.items, {}, lt);
-        std.mem.sort(Candidate, got.items, {}, lt);
-        try testing.expectEqualSlices(u64, @ptrCast(want.items), @ptrCast(got.items));
+        // Every CPU variant the machine can run (CI runs this on x86-64-v3 and aarch64).
+        var buf: [8]*const Kernel = undefined;
+        for (runnableKernels(&buf)) |k| {
+            got.clearRetainingCapacity();
+            var pos: usize = 0;
+            while (pos < data.len - skip) {
+                const n, const next = stage1With(k.run, &f.part, data[skip..], pos, &ring);
+                try got.appendSlice(testing.allocator, ring[0..n]);
+                pos = next;
+            }
+            std.mem.sort(Candidate, got.items, {}, lt);
+            testing.expectEqualSlices(u64, @ptrCast(want.items), @ptrCast(got.items)) catch |err| {
+                std.debug.print("variant {s}, strides {any}, skip {d}\n", .{ k.name, sampled, skip });
+                return err;
+            };
+        }
     }
 }
 

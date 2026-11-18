@@ -20,6 +20,12 @@ const vm = zav.match.verify_vm;
 
 /// `--partition N`: type every file as target N (E2 measures the PE partition over all of B1).
 var force_partition: ?u8 = null;
+/// `planted --record N`: only logical signature record N.
+var planted_record: ?usize = null;
+/// `worst --max-ms X`: exit 1 when an input takes longer than X ms per MB (the E4 pass line).
+var worst_max_ms: f64 = std.math.inf(f64);
+/// `--verify-per-kib N`: the verify count budget per KiB (vm.Budget.verify_per_kib) in `worst`.
+var verify_per_kib: u64 = (vm.Budget{}).verify_per_kib;
 /// `--rounds N`: best of N passes in `stages` (a loaded machine needs more than three), and of
 /// N scans per file in `scan` (default 1 there).
 var rounds: usize = 3;
@@ -55,6 +61,15 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             rounds = try std.fmt.parseInt(usize, args[i], 10);
             rounds_set = true;
+        } else if (std.mem.eql(u8, args[i], "--verify-per-kib")) {
+            i += 1;
+            verify_per_kib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--max-ms")) {
+            i += 1;
+            worst_max_ms = try std.fmt.parseFloat(f64, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--record")) {
+            i += 1;
+            planted_record = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--partition")) {
             i += 1;
             force_partition = try std.fmt.parseInt(u8, args[i], 10);
@@ -64,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         } else try dirs.append(arena, args[i]);
     }
     var corpus: Corpus = .{};
-    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "short") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
+    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "rec") and !std.mem.eql(u8, cmd, "short") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
 
     if (std.mem.eql(u8, cmd, "census")) return census(database, index);
     if (std.mem.eql(u8, cmd, "short")) {
@@ -112,6 +127,18 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{d} candidates, {d} matches, {d} exhausted, {d} steps, {d:.1} ms\n", .{ n, hits, exhausted, budget.used, @as(f64, @floatFromInt(nsSince(io, t))) / 1e6 });
         return;
     }
+    if (std.mem.eql(u8, cmd, "rec")) {
+        // rec <db> <record>: the programs of one logical signature.
+        const rec = index.ldb.?.records[try std.fmt.parseInt(usize, dirs.items[0], 10)];
+        var buf: [4096]u8 = undefined;
+        for (rec.prog_first..rec.prog_first + rec.prog_count) |k| {
+            const p = index.programs.?.get(k);
+            var wr: std.Io.Writer = .fixed(&buf);
+            zav.compile.hexsig.format(p.pattern, &wr) catch {};
+            std.debug.print("prog {d} sub {d} t{d} flags {x} anchor op {d}: {s}\n", .{ k, p.header.subsig, p.header.target, p.header.flags, p.header.anchor_op, wr.buffered() });
+        }
+        return;
+    }
     if (std.mem.eql(u8, cmd, "show")) {
         // show <db> <prog index>...: print programs.
         var buf: [4096]u8 = undefined;
@@ -149,6 +176,10 @@ fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             c.atom_costs.prefix = true;
         } else if (std.mem.eql(u8, a, "--no-defer")) {
             c.atom_costs.no_defer = true;
+        } else if (std.mem.eql(u8, a, "--max-chain")) {
+            i += 1;
+            c.crowd.max_chain = try std.fmt.parseInt(u32, args[i], 10);
+            if (c.crowd.max_chain == 0) c.crowd.max_chain = std.math.maxInt(u32);
         } else if (std.mem.eql(u8, a, "--gate-ns")) {
             i += 1;
             c.atom_costs.gate_ns = try std.fmt.parseFloat(f64, args[i]);
@@ -263,6 +294,8 @@ fn scan(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: C
     var infected: usize = 0;
     var limited: usize = 0;
     var slowest: struct { ns: u64 = 0, path: []const u8 = "", size: usize = 0 } = .{};
+    var densest: struct { per_kib: f64 = 0, path: []const u8 = "", size: usize = 0 } = .{};
+    var verifies_before: u64 = 0;
     var name_buf: [512]u8 = undefined;
     const names = try zav.engine.hashscan.HashIndex.load(index_db);
     // With --rounds N each file is scanned N times and its fastest scan counts (counters and
@@ -281,6 +314,13 @@ fn scan(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: C
         }
         ns += dt;
         if (dt > slowest.ns) slowest = .{ .ns = dt, .path = p, .size = data.len };
+        // Densest file by verifies and by verify steps per KiB (files of 4 KiB or more).
+        if (data.len >= 4096) {
+            const kib = @as(f64, @floatFromInt(data.len)) / 1024;
+            const v = @as(f64, @floatFromInt(stats.verifies - verifies_before)) / kib;
+            if (v > densest.per_kib) densest = .{ .per_kib = v, .path = p, .size = data.len };
+        }
+        verifies_before = stats.verifies;
         switch (verdict) {
             .clean => {},
             .infected => |d| {
@@ -303,9 +343,11 @@ fn scan(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: C
         @as(f64, @floatFromInt(stats.verifies)) / mb,
         @as(f64, @floatFromInt(stats.deferred)) / mb,
     });
+    std.debug.print("deferred pass: {d} runs over {d} files, {d:.1} probes and {d:.1} verifies per MB\n", .{ stats.deferred_runs, corpus.paths.items.len, @as(f64, @floatFromInt(stats.deferred_probes)) / mb, @as(f64, @floatFromInt(stats.deferred_verifies)) / mb });
     for (stats.by_kind, [_][]const u8{ "stride 8", "stride 4", "stride 3", "stride 2", "stride 1", "3-gram", "2-gram" }) |k, name| {
         std.debug.print("  {s:<9} per MB: {d:>9.1} candidates {d:>9.1} probes {d:>8.1} verifies\n", .{ name, @as(f64, @floatFromInt(k.candidates)) / mb, @as(f64, @floatFromInt(k.probes)) / mb, @as(f64, @floatFromInt(k.verifies)) / mb });
     }
+    std.debug.print("densest: {s} ({d} bytes) {d:.1} verifies per KiB\n", .{ densest.path, densest.size, densest.per_kib });
     std.debug.print("slowest: {s} ({d} bytes) {d:.2} ms\n", .{ slowest.path, slowest.size, @as(f64, @floatFromInt(slowest.ns)) / 1e6 });
 }
 
@@ -581,49 +623,55 @@ fn kernelDiff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, cor
         if (random_round) prng.random().bytes(d);
         const part = index.partitionFor(targetOf(d)) orelse continue;
         want.clearRetainingCapacity();
-        got.clearRetainingCapacity();
         try pf.stage1Reference(part, d, &want, gpa);
-        var pos: usize = 0;
-        while (pos < d.len) {
-            const n, const next = pf.stage1(part, d, pos, &ring);
-            try got.appendSlice(gpa, ring[0..n]);
-            pos = next;
-        }
         std.mem.sort(pf.Candidate, want.items, {}, lt);
-        std.mem.sort(pf.Candidate, got.items, {}, lt);
-        if (!std.mem.eql(u64, @ptrCast(want.items), @ptrCast(got.items))) {
-            std.debug.print("MISMATCH {s}{s}: kernel {d}, reference {d}\n", .{ p, if (random_round) " (random)" else "", got.items.len, want.items.len });
-            var x: usize = 0;
-            var y: usize = 0;
-            while (x < got.items.len or y < want.items.len) {
-                const g: u64 = if (x < got.items.len) @bitCast(got.items[x]) else std.math.maxInt(u64);
-                const h: u64 = if (y < want.items.len) @bitCast(want.items[y]) else std.math.maxInt(u64);
-                if (g == h) {
-                    x += 1;
-                    y += 1;
-                } else if (g < h) {
-                    const c = got.items[x];
-                    std.debug.print("  kernel only: pos {d} filter {d} (stride {d} q {d}) len {d}\n", .{ c.pos, c.filter, part.filters[c.filter].stride, part.filters[c.filter].q, d.len });
-                    x += 1;
-                } else {
-                    const c = want.items[y];
-                    std.debug.print("  reference only: pos {d} filter {d} (stride {d} q {d}) len {d}\n", .{ c.pos, c.filter, part.filters[c.filter].stride, part.filters[c.filter].q, d.len });
-                    y += 1;
-                }
+        // Every CPU variant of the kernel this machine can run.
+        var kbuf: [8]*const pf.Kernel = undefined;
+        for (pf.runnableKernels(&kbuf)) |kern| {
+            got.clearRetainingCapacity();
+            var pos: usize = 0;
+            while (pos < d.len) {
+                const n, const next = pf.stage1With(kern.run, part, d, pos, &ring);
+                try got.appendSlice(gpa, ring[0..n]);
+                pos = next;
             }
-            return error.KernelMismatch;
+            std.mem.sort(pf.Candidate, got.items, {}, lt);
+            if (!std.mem.eql(u64, @ptrCast(want.items), @ptrCast(got.items))) {
+                std.debug.print("MISMATCH {s}{s} ({s}): kernel {d}, reference {d}\n", .{ p, if (random_round) " (random)" else "", kern.name, got.items.len, want.items.len });
+                var x: usize = 0;
+                var y: usize = 0;
+                while (x < got.items.len or y < want.items.len) {
+                    const g: u64 = if (x < got.items.len) @bitCast(got.items[x]) else std.math.maxInt(u64);
+                    const h: u64 = if (y < want.items.len) @bitCast(want.items[y]) else std.math.maxInt(u64);
+                    if (g == h) {
+                        x += 1;
+                        y += 1;
+                    } else if (g < h) {
+                        const c = got.items[x];
+                        std.debug.print("  kernel only: pos {d} filter {d} (stride {d} q {d}) len {d}\n", .{ c.pos, c.filter, part.filters[c.filter].stride, part.filters[c.filter].q, d.len });
+                        x += 1;
+                    } else {
+                        const c = want.items[y];
+                        std.debug.print("  reference only: pos {d} filter {d} (stride {d} q {d}) len {d}\n", .{ c.pos, c.filter, part.filters[c.filter].stride, part.filters[c.filter].q, d.len });
+                        y += 1;
+                    }
+                }
+                return error.KernelMismatch;
+            }
         }
         bytes += d.len;
         cands += got.items.len;
     }
-    std.debug.print("kernel = reference on {d} files and as many random buffers: {d:.1} MB, {d} candidates\n", .{ corpus.paths.items.len, @as(f64, @floatFromInt(bytes)) / 1e6, cands });
+    var kbuf: [8]*const pf.Kernel = undefined;
+    std.debug.print("kernel = reference for variants", .{});
+    for (pf.runnableKernels(&kbuf)) |kern| std.debug.print(" {s}", .{kern.name});
+    std.debug.print(" on {d} files and as many random buffers: {d:.1} MB, {d} candidates\n", .{ corpus.paths.items.len, @as(f64, @floatFromInt(bytes)) / 1e6, cands });
 }
 
 /// Logical signatures planted one per file, prefiltered (with deferral) against reference
 /// verdicts: each hex subsig's first variant is synthesised (shortest gaps, first
 /// alternatives) and the subsigs are concatenated with filler between them.
 fn planted(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, limit: usize) !void {
-    _ = io;
     const progs = index.programs.?;
     const table = index.ldb.?;
     const w = try Worker.init(gpa, &index);
@@ -640,8 +688,9 @@ fn planted(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, limit:
     var other_first: usize = 0;
     const n = @min(limit, table.records.len);
     const step = @max(1, table.records.len / n);
-    var rec_i: usize = 0;
+    var rec_i: usize = planted_record orelse 0;
     while (rec_i < table.records.len and tested < n) : (rec_i += step) {
+        if (planted_record != null and tested > 0) break;
         const rec = table.records[rec_i];
         if (rec.prog_count == 0) continue;
         buf.clearRetainingCapacity();
@@ -686,6 +735,10 @@ fn planted(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, limit:
         }
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
             std.debug.print("MISMATCH record {d}: prefiltered {any}, reference {any}\n", .{ rec_i, a, b });
+            // The file, for `top` and `vmprog`.
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "planted-{d}.bin", .{rec_i});
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = name, .data = buf.items });
             mismatches += 1;
             continue;
         }
@@ -705,6 +758,7 @@ fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
     const r = prng.random();
     const size = 1 << 20;
     const Kind = enum { anchors, unbounded, subsigs, zeros_opcodes };
+    var over: usize = 0;
     for (std.enums.values(Kind)) |kind| {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
@@ -765,7 +819,7 @@ fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
         var broken: usize = 0;
         while (broken < 2000) : (broken += 1) {
             w.state.reset();
-            var budget: vm.Budget = .{};
+            var budget: vm.Budget = .{ .verify_per_kib = verify_per_kib };
             var tracker = zav.engine.limits.Tracker.init(.{});
             const v = try bodyscan.scanBufferScratch(&index, data, .{ .info = .{ .size = data.len }, .target = 1 }, &budget, &tracker, &w.state, .auto, null, w.scan);
             if (v != .infected) break;
@@ -780,7 +834,7 @@ fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
         var stats: pf.Stats = .{};
         for (0..3) |_| {
             w.state.reset();
-            var budget: vm.Budget = .{};
+            var budget: vm.Budget = .{ .verify_per_kib = verify_per_kib };
             var tracker = zav.engine.limits.Tracker.init(.{});
             stats = .{};
             const t = now(io);
@@ -795,11 +849,22 @@ fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
             std.debug.print("  ({s} at {d})\n", .{ names.meta.?.name(verdict.infected.sig, &nb) catch "?", verdict.infected.start });
         }
         std.debug.print("  ({d} matches broken)\n", .{broken});
-        std.debug.print("{t:<14} {d:>7.2} ms/MB  {d:>9.0} steps/MB  {d:>8.0} verifies/MB  {d:>8.0} candidates/MB  {t}\n", .{
-            kind,                                           @as(f64, @floatFromInt(best)) / 1e6 / mb,
+        const ms_per_mb = @as(f64, @floatFromInt(best)) / 1e6 / mb;
+        var what_buf: [64]u8 = undefined;
+        const what = switch (verdict) {
+            .limited => |e| std.fmt.bufPrint(&what_buf, "limited ({t})", .{e}) catch "limited",
+            else => @tagName(std.meta.activeTag(verdict)),
+        };
+        std.debug.print("{t:<14} {d:>7.2} ms/MB  {d:>9.0} steps/MB  {d:>8.0} verifies/MB  {d:>8.0} candidates/MB  {s}\n", .{
+            kind,                                           ms_per_mb,
             @as(f64, @floatFromInt(steps)) / mb,            @as(f64, @floatFromInt(stats.verifies)) / mb,
-            @as(f64, @floatFromInt(stats.candidates)) / mb, std.meta.activeTag(verdict),
+            @as(f64, @floatFromInt(stats.candidates)) / mb, what,
         });
+        if (ms_per_mb > worst_max_ms) over += 1;
+    }
+    if (over > 0) {
+        std.debug.print("{d} inputs over the pass line of {d} ms/MB\n", .{ over, worst_max_ms });
+        std.process.exit(1);
     }
 }
 
@@ -829,6 +894,56 @@ fn census(database: zav.db.reader.Database, index: bodyscan.BodyIndex) !void {
     var w = std.debug.lockStderr(&buf).terminal().writer;
     defer std.debug.unlockStderr();
     try zav.match.prefilter.describe(&index.prefilters, w);
+    // Anchored index groups by offset kind, and their list programs.
+    for ([_]u8{ 0, 1 }) |part| if (index.anchored[part]) |ai| {
+        var kinds: [8]u64 = @splat(0);
+        var lists: [8]u64 = @splat(0);
+        var keyed: [8]u64 = @splat(0);
+        for (ai.groups) |g| {
+            const k = @min(7, @backingInt(g.off_kind));
+            kinds[k] += 1;
+            lists[k] += g.list_count;
+            keyed[k] += g.keyed_count;
+        }
+        try w.print("  anchored {d}: groups by kind {any}, list programs {any}, keyed {any}\n", .{ part, kinds, lists, keyed });
+    };
+    // Chain lengths of the shared atom table: every candidate walks its key's whole chain.
+    if (index.partitionFor(1)) |part| {
+        var hist: [8]u64 = @splat(0);
+        var longest: usize = 0;
+        var in_long: u64 = 0;
+        for (part.slots) |sl| {
+            if (sl.first == pf.empty_slot) continue;
+            var k = sl.first;
+            while (part.entries[k].flags & pf.entry_last == 0) k += 1;
+            const len = k - sl.first + 1;
+            longest = @max(longest, len);
+            hist[@min(7, std.math.log2_int(usize, len))] += 1;
+            if (len >= 64) in_long += len;
+            if (len >= 5000) {
+                var wb: [200]u8 = undefined;
+                var wr: std.Io.Writer = .fixed(&wb);
+                const p0 = index.programs.?.get(part.entries[sl.first].prog);
+                zav.compile.hexsig.format(p0.pattern, &wr) catch {};
+                try w.print("  key {x:0>8}: {d} entries, stride {d}, e.g. {s}\n", .{ @byteSwap(sl.key), len, part.entries[sl.first].stride, wr.buffered() });
+                var lens: [32]u32 = @splat(0);
+                var parts_one: usize = 0;
+                for (part.entries[sl.first..][0..len], 0..) |e, ei| {
+                    const pp = index.programs.?.get(e.prog);
+                    lens[@min(31, pp.pattern.ops[pp.header.anchor_op].len)] += 1;
+                    if (pp.header.part_count == 1 and pp.pattern.ops.len <= 2) parts_one += 1;
+                    if (ei % 20000 == 7) {
+                        var wb2: [200]u8 = undefined;
+                        var wr2: std.Io.Writer = .fixed(&wb2);
+                        zav.compile.hexsig.format(pp.pattern, &wr2) catch {};
+                        try w.print("    {s} (sig {d}.{d} flags {x})\n", .{ wr2.buffered(), pp.header.sig, pp.header.subsig, pp.header.flags });
+                    }
+                }
+                try w.print("    anchor literal lengths {any}; single-literal programs {d}\n", .{ lens, parts_one });
+            }
+        }
+        try w.print("  chains: longest {d}; by length 1, 2-3, 4-7, ..., 128+: {any}; {d} entries in chains of 64 or more\n", .{ longest, hist, in_long });
+    }
     try w.flush();
 }
 

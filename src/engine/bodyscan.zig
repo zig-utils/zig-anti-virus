@@ -191,6 +191,8 @@ const Sink = struct {
     target: u8,
     /// The file's verify budget ran out.
     stopped: bool = false,
+    /// Verify calls this file may make (`vm.Budget.verifyCap`).
+    verify_cap: u64 = std.math.maxInt(u64),
     stats: ?*prefilter.Stats = null,
     /// What earlier candidates of the same multi-part program learned (verify_vm.Memo), so a
     /// common anchor part next to an unbounded gap stays linear over the file, as with the
@@ -217,6 +219,15 @@ const Sink = struct {
         const is_ldb = p.header.flags & prog.flag_ldb != 0;
         if (is_ldb and s.c.settled(p)) return true;
         const window = vm.startWindow(p.offset(), s.info) orelse return true;
+        // Candidate density is bounded by a count, not only by steps: a verify that fails at
+        // once costs no step budget to speak of.
+        if (s.budget.verifies >= s.verify_cap) {
+            s.budget.exhausted = true;
+            s.budget.count_exhausted = true;
+            s.stopped = true;
+            return false;
+        }
+        s.budget.verifies += 1;
         const parts = p.header.part_count;
         var memo: *vm.Memo = s.working;
         var cached: ?*CompactMemo = null;
@@ -259,28 +270,42 @@ const Sink = struct {
 /// Deferred programs searched together: one pass over the buffer tests, at every position, a
 /// bitmap of the first two bytes of every pending atom, and on a hit probes a small table of
 /// the atoms' 4-, 3- and 2-byte keys (case variants of a folded atom are separate keys),
-/// instead of a pass per program. It lives on the stack (about 22 KiB).
+/// instead of a pass per program. It lives in the worker's `Scratch` (or on the stack, about 84 KiB).
 const Pending = struct {
-    const slots = 1024;
+    const slots = 4096;
     const max = slots / 2;
     const empty: u32 = 0xffff_ffff;
+    /// Gate passes collected before they are probed.
+    const pass_cap = 256;
 
     keys: [slots]u32,
     progs: [slots]u32,
     backs: [slots]u32,
     qs: [slots]u8,
+    /// The anchor literal's bytes after the key, up to four more (`ext_lens`), compared before
+    /// the verifier is called: deferred subsigs of one family share 4-byte prefixes (`558bec51`
+    /// starts thousands of them), and without the next bytes each occurrence verifies them all.
+    exts: [slots]u32,
+    ext_lens: [slots]u8,
+    nocase: [slots]bool,
+    /// The first two bytes of every key: the test at every position.
     bits: [65536 / 64]u64,
+    /// Per key length (2, 3, 4 bytes): a bit per 16-bit hash of the whole key, tested at the
+    /// positions `bits` passes, so a common prefix costs a bit test rather than three table
+    /// probes.
+    full: [3][65536 / 64]u64,
     n: usize,
 
     fn clear(t: *Pending) void {
         @memset(&t.progs, empty);
         @memset(&t.bits, 0);
+        for (&t.full) |*f| @memset(f, 0);
         t.n = 0;
     }
 
     /// A deferred program's key: the first (up to) four bytes of its anchor literal, the
-    /// literal atom selection picked for its rarest window. Programs without a literal of two
-    /// bytes use the scanner.
+    /// literal whose prefix atom selection found rarest (compile/atoms.zig `deferredAnchor`).
+    /// Programs without a literal of two bytes use the scanner.
     fn keyOf(p: prog.Program) ?[]const u8 {
         const h = p.header;
         if (h.anchor_op == prog.no_anchor) return null;
@@ -301,62 +326,104 @@ const Pending = struct {
         var key: [4]u8 = @splat(0);
         @memcpy(key[0..lit.len], lit);
         const q: u8 = @intCast(lit.len);
-        if (op.flags & @import("../compile/ir.zig").op_nocase == 0) {
-            t.put(std.mem.readInt(u32, &key, .little), q, index, h.anchor_delta);
+        const whole = p.pattern.bytes(op);
+        const more = whole[lit.len..][0..@min(whole.len - lit.len, 4)];
+        var ext_bytes: [4]u8 = @splat(0);
+        const nocase = op.flags & @import("../compile/ir.zig").op_nocase != 0;
+        for (more, 0..) |b, k| ext_bytes[k] = if (nocase) std.ascii.toLower(b) else b;
+        const ext: Ext = .{ .bytes = std.mem.readInt(u32, &ext_bytes, .little), .len = @intCast(more.len), .nocase = nocase };
+        if (!nocase) {
+            t.put(std.mem.readInt(u32, &key, .little), q, index, h.anchor_delta, ext);
             return;
         }
         var it = @import("../compile/atoms.zig").Variants.init(&key);
-        while (it.next()) |g| t.put(g, q, index, h.anchor_delta);
+        while (it.next()) |g| t.put(g, q, index, h.anchor_delta, ext);
     }
 
-    fn put(t: *Pending, key: u32, q: u8, index: u32, back: u32) void {
+    const Ext = struct { bytes: u32, len: u8, nocase: bool };
+
+    /// Whether the `len` bytes at `data[i..]` are the extension (lower-cased for a folded
+    /// literal). Past the end of the data the verifier decides.
+    inline fn extMatches(data: []const u8, i: usize, bytes: u32, len: u8, nocase: bool) bool {
+        if (len == 0) return true;
+        if (i + len > data.len) return true;
+        var got: u32 = 0;
+        for (0..len) |k| {
+            const b = data[i + k];
+            got |= @as(u32, if (nocase) std.ascii.toLower(b) else b) << @intCast(8 * k);
+        }
+        return got == bytes;
+    }
+
+    inline fn hash16(key: u32) u16 {
+        return @truncate((key *% 0x9E37_79B1) >> 16);
+    }
+
+    inline fn has(bits: *const [65536 / 64]u64, k: u32) bool {
+        return (bits[k >> 6] >> @intCast(k & 63)) & 1 != 0;
+    }
+
+    fn put(t: *Pending, key: u32, q: u8, index: u32, back: u32, ext: Ext) void {
         var s = prefilter.slotOf(key, slots);
         while (t.progs[s] != empty) s = (s + 1) & (slots - 1);
         t.keys[s] = key;
         t.qs[s] = q;
         t.progs[s] = index;
         t.backs[s] = back;
+        t.exts[s] = ext.bytes;
+        t.ext_lens[s] = ext.len;
+        t.nocase[s] = ext.nocase;
         t.bits[(key & 0xffff) >> 6] |= @as(u64, 1) << @intCast(key & 63);
+        const h = hash16(key);
+        t.full[q - 2][h >> 6] |= @as(u64, 1) << @intCast(h & 63);
         t.n += 1;
     }
 
     fn run(t: *const Pending, data: []const u8, sink: *Sink) bool {
         if (data.len < 2) return true;
+        if (sink.stats) |st| st.deferred_runs += 1;
         // Sixteen positions at a time: the bitmap tests append passing positions without a
-        // branch, and only those are probed.
+        // branch, and a batch of them is probed at once.
+        var passes: [pass_cap]u32 = undefined;
         var i: usize = 0;
-        while (i + 17 <= data.len) : (i += 16) {
-            var passed: [16]u8 = undefined;
-            var m: usize = 0;
-            inline for (0..16) |j| {
-                const g2: u32 = std.mem.readInt(u16, data[i + j ..][0..2], .little);
-                passed[m] = j;
-                m += @intCast((t.bits[g2 >> 6] >> @intCast(g2 & 63)) & 1);
+        while (i + 17 <= data.len) {
+            var np: usize = 0;
+            const base = i;
+            while (i + 17 <= data.len and np + 16 <= pass_cap) : (i += 16) {
+                inline for (0..16) |j| {
+                    const g2: u32 = std.mem.readInt(u16, data[i + j ..][0..2], .little);
+                    passes[np] = @intCast(i + j - base);
+                    np += @intFromBool(has(&t.bits, g2));
+                }
             }
-            for (passed[0..m]) |j| if (!t.probe(data, i + j, sink)) return false;
+            for (passes[0..np]) |off| if (!t.probe(data, base + off, sink)) return false;
         }
         while (i + 2 <= data.len) : (i += 1) {
             const g2: u32 = std.mem.readInt(u16, data[i..][0..2], .little);
-            if (t.bits[g2 >> 6] & (@as(u64, 1) << @intCast(g2 & 63)) == 0) continue;
+            if (!has(&t.bits, g2)) continue;
             if (!t.probe(data, i, sink)) return false;
         }
         return true;
     }
 
-    /// The pending atoms whose key sits at `i`.
+    /// The pending atoms whose key sits at `i`: each key length whose whole-key bit is set is
+    /// looked up in the table.
     fn probe(t: *const Pending, data: []const u8, i: usize, sink: *Sink) bool {
-        {
-            const g2: u32 = std.mem.readInt(u16, data[i..][0..2], .little);
-            const g3 = if (i + 3 <= data.len) g2 | @as(u32, data[i + 2]) << 16 else null;
-            const g4 = if (i + 4 <= data.len) prefilter.load4(data, i) else null;
-            const keys = [3]?u32{ g4, g3, g2 };
-            for (keys, [3]u8{ 4, 3, 2 }) |maybe, q| {
-                const g = maybe orelse continue;
-                var s = prefilter.slotOf(g, slots);
-                while (t.progs[s] != empty) : (s = (s + 1) & (slots - 1)) {
-                    if (t.keys[s] != g or t.qs[s] != q or t.backs[s] > i) continue;
-                    if (!sink.candidate(t.progs[s], i - t.backs[s])) return false;
-                }
+        const g2: u32 = std.mem.readInt(u16, data[i..][0..2], .little);
+        const g3: ?u32 = if (i + 3 <= data.len) g2 | @as(u32, data[i + 2]) << 16 else null;
+        const g4: ?u32 = if (i + 4 <= data.len) prefilter.load4(data, i) else null;
+        const keys = [3]?u32{ g2, g3, g4 };
+        for (keys, 0..) |maybe, k| {
+            const g = maybe orelse continue;
+            if (!has(&t.full[k], hash16(g))) continue;
+            if (sink.stats) |st| st.deferred_probes += 1;
+            const q: u8 = @intCast(k + 2);
+            var s = prefilter.slotOf(g, slots);
+            while (t.progs[s] != empty) : (s = (s + 1) & (slots - 1)) {
+                if (t.keys[s] != g or t.qs[s] != q or t.backs[s] > i) continue;
+                if (!extMatches(data, i + q, t.exts[s], t.ext_lens[s], t.nocase[s])) continue;
+                if (sink.stats) |st| st.deferred_verifies += 1;
+                if (!sink.candidate(t.progs[s], i - t.backs[s])) return false;
             }
         }
         return true;
@@ -461,7 +528,7 @@ pub fn scanBufferScratch(index: *const BodyIndex, data: []const u8, file: File, 
         }
         @memset(memo_progs, std.math.maxInt(u32));
         for (compact) |*e| e.prog = std.math.maxInt(u32);
-        var sink: Sink = .{ .c = &c, .data = data, .info = info, .budget = budget, .target = target, .stats = stats, .compact = compact, .working = working, .memos = memos, .memo_progs = memo_progs };
+        var sink: Sink = .{ .c = &c, .data = data, .info = info, .budget = budget, .target = target, .stats = stats, .compact = compact, .working = working, .memos = memos, .memo_progs = memo_progs, .verify_cap = budget.verifyCap(data.len) };
         _ = prefilter.scan(pf, data, ring, &sink, stats);
         if (c.hit) |d| return .{ .infected = d };
         if (sink.stopped or c.overflow) break :search;
@@ -591,6 +658,10 @@ pub fn scanBufferScratch(index: *const BodyIndex, data: []const u8, file: File, 
         tracker.note(.logical_state);
         return .{ .limited = .logical_state };
     }
+    if (budget.count_exhausted) {
+        tracker.note(.verify_count);
+        return .{ .limited = .verify_count };
+    }
     if (budget.exhausted) {
         tracker.note(.verify_steps);
         return .{ .limited = .verify_steps };
@@ -646,6 +717,15 @@ test "compile .ndb signatures and detect them end to end" {
     const many = "PAYLOAD EXAMPLE..........PAYLOAD EXAMPLE..........PAYLOAD";
     try std.testing.expectEqual(Verdict{ .limited = .verify_steps }, try scanBuffer(&index, many, .{ .info = .{ .size = many.len } }, &tiny, &tracker, null));
     try std.testing.expect(tracker.raised.contains(.verify_steps));
+
+    // So is a verify count that runs out (candidate density), with ample steps.
+    var few: vm.Budget = .{ .verify_floor = 2, .verify_per_kib = 0 };
+    try std.testing.expectEqual(Verdict{ .limited = .verify_count }, try scanBuffer(&index, many, .{ .info = .{ .size = many.len } }, &few, &tracker, null));
+    try std.testing.expect(tracker.raised.contains(.verify_count));
+    // A detection before the count runs out is still a detection.
+    var two: vm.Budget = .{ .verify_floor = 2, .verify_per_kib = 0 };
+    const found = try scanBuffer(&index, doc, .{ .info = .{ .size = doc.len } }, &two, &tracker, null);
+    try std.testing.expect(found == .infected);
 }
 
 test "logical signatures end to end: counts, target descriptions, anchored subsigs" {

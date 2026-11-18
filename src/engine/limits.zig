@@ -65,6 +65,9 @@ pub const Event = enum(u8) {
     memory,
     /// An HTML file over MaxHTMLNoTags: its text-only form was not matched.
     html_notags,
+    /// One file's verify calls passed their count budget, proportional to its size
+    /// (verify_vm.Budget): crafted candidate density.
+    verify_count,
 };
 
 /// Per-scan accounting. Lives in scratch; resetting it is O(1).

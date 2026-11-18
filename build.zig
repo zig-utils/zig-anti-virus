@@ -281,7 +281,9 @@ fn capiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
 /// Compile the hash kernels once per CPU variant of the target architecture (src/hash/variants.zig)
 /// and link every object into `module`, so one binary carries all of them and src/hash/dispatch.zig
 /// picks one at runtime. std.crypto only emits SHA-NI or ARMv8 SHA instructions when the target
-/// enables them at compile time, which is why this cannot be a single object.
+/// enables them at compile time, which is why this cannot be a single object. The stage-one
+/// prefilter kernel is built per variant the same way (AVX2 and SSSE3 shuffles, vector
+/// multiplies), and match/prefilter.zig picks one at runtime.
 fn addHashVariants(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
     const arch = target.result.cpu.arch;
     for (hash_variants.forArch(arch)) |spec| {
@@ -307,6 +309,26 @@ fn addHashVariants(b: *std.Build, module: *std.Build.Module, target: std.Build.R
             }),
         });
         module.addObject(object);
+
+        // The stage-one prefilter kernel (src/match/stage1.zig) for the same CPU model.
+        const variant_target = b.resolveTargetQuery(query);
+        const stage1_options = b.addOptions();
+        stage1_options.addOption([]const u8, "name", spec.name);
+        const regex_variant = b.dependency("regex", .{ .target = variant_target, .optimize = optimize }).module("regex");
+        const stage1 = b.addObject(.{
+            .name = b.fmt("zav-stage1-{s}", .{spec.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/match/stage1_variant.zig"),
+                .target = variant_target,
+                .optimize = optimize,
+                .pic = true,
+                .imports = &.{
+                    .{ .name = "zav_stage1_variant", .module = stage1_options.createModule() },
+                    .{ .name = "regex", .module = regex_variant },
+                },
+            }),
+        });
+        module.addObject(stage1);
     }
 }
 

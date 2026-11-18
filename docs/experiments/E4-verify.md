@@ -67,8 +67,48 @@ of B2, are PCRE step budgets).
 - 2^24 steps per file: the worst input uses 2.19 million steps per MB, so the file budget ends a
   scan of such data after about 7.6 MB (reported as a limit, never as clean) and is not reached
   by any benign file. It bounds time per file, not per MB.
+- 16,384 verify calls per file plus 64 per KiB (added below): benign files stay under 23 per
+  KiB, so the per-KiB part keeps about 3x headroom on large files and the floor covers small
+  ones (a planted 704-byte file of a large family needs 2,218); crafted inputs then cost 6 to
+  24 ms/MB. It bounds time per MB, which the step budget does not.
 
-## Verdict
+## Bounding candidate density (follow-up, zig-utils/zig-anti-virus#35)
+
+Three changes, all measured on the inputs above (regenerated: they follow the atoms, so they
+differ between databases) and on the benign corpora:
+
+- **Crowded keys** (compile/atoms.zig `Crowd`). After the single stride-3 filter (E2), 108,490
+  logical subsigs shared the atom key `VB5!` (the start of every Visual Basic 5 header): one
+  occurrence walked all of them, and the `anchors` input took 500 ms/MB. Once a key holds 32
+  programs, later programs take their next cheapest window whose key is not crowded, when it
+  costs at most 0.002 ns per byte more (moving a family onto a common gram costs benign files
+  far more than the crowded key costs crafted ones; a limit of 16 without that slack sent B1's
+  verifies from 213 to 2,000 per KiB in some files). Longest chain 108,490 to 40.
+- **The deferred pass compares the anchor literal's next four bytes** before calling the
+  verifier: thousands of deferred subsigs of one family start `558bec51`, and a planted file
+  of that family made 16,594 verifies in 704 bytes (2,218 after).
+- **A verify-count budget** (verify_vm.Budget): 16,384 verify calls per file plus 64 per KiB.
+  Benign files make at most 22.6 per KiB (B1, a 25 KB file), 16.3 (S1) and 0.6 (B2), and none
+  of B1, B2 or S1 reaches it. Past it the search stops and the file is `limited
+  (verify_count)`, a limit event, never clean; a detection found before is still reported.
+  The planted differential (E3) has no mismatch with it.
+
+Per MB of input, Apple M3 Pro shared with other builds, best of three (main + daily +
+bytecode):
+
+| Input | before (ms/MB) | after (ms/MB) | verifies/MB after | verdict after |
+|---|---:|---:|---:|---|
+| anchors | 126 | 24.4 | 87,637 | limited (regex_steps) |
+| unbounded | 20.9 | 10.5 | 5,261 | limited (regex_steps) |
+| subsigs | 148 | 18.0 | 80,613 | limited (verify_count) |
+| zeros_opcodes | 62.2 | 6.3 | 78,126 | limited (verify_count) |
+
+("Before" is the previous build on the same machine and load; the first table's times were
+taken under a lighter load.) **Pass line met** for all four. CI regenerates the inputs from the
+databases in the Differential workflow's real-database job and fails above 50 ms/MB
+(`zig build prefilter -- worst <db> --max-ms 50`).
+
+## Verdict (before the follow-up)
 
 **Pass line missed** for three of the four inputs (89 to 192 ms/MB against 50), on a loaded
 machine. Every one of them is candidate density, not verify depth: up to a million atoms per MB

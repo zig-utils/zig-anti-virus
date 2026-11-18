@@ -201,7 +201,9 @@ The windows chosen:
 - **C: stride 1**, 4- and 5-byte runs, behind the stride-one gate.
 - **D: a 3-byte or 2-byte atom**, stride 1, behind the gate; no atom at all only for programs without a 2-byte literal (none in main + daily).
 
-**Deferral by covers** (P4.10, Hyperscan's Rose idea applied to ClamAV expressions): a cover of a logical expression is a set of subsigs one of which must match whenever it holds (`0&1`: either; `0|1`: both; `(0|1)>2`: both; byte compares by their trigger, PCRE by its trigger expression, pinned subsigs free). Only the cheapest cover is searched; every other subsig, of any tier, is deferred to a second pass over files whose signature was touched, all pending atoms in one batched pass. Expressions without a cover defer nothing, so detections are those of searching everything (planted differential on the full database: no mismatch).
+**Crowded keys.** Atom selection weighs expected cost, but a key many programs share is a worst case wherever it occurs: every occurrence walks the whole chain. Once a key holds 32 programs, later programs take their next cheapest window whose key is not crowded if it costs at most 0.002 ns per byte more (`VB5!` held 108,490 logical subsigs; longest chain now 40). Deferred programs are spread the same way over their anchor literals' prefixes.
+
+**Deferral by covers** (P4.10, Hyperscan's Rose idea applied to ClamAV expressions): a cover of a logical expression is a set of subsigs one of which must match whenever it holds (`0&1`: either; `0|1`: both; `(0|1)>2`: both; byte compares by their trigger, PCRE by its trigger expression, pinned subsigs free). Only the cheapest cover is searched; every other subsig, of any tier, is deferred to a second pass over files whose signature was touched, all pending atoms in one batched pass: a bitmap of the keys' first two bytes at every position, a whole-key bit per key length at the positions it passes, then the table and the anchor literal's next four bytes before the verifier. A deferred program's anchor is the literal whose prefix is rarest (that prefix is its key), not the one holding its rarest window. On B1's PE files this pass was half of the whole scan; it is now one pass per file (2,048 keys) and 6% of the probes. Expressions without a cover defer nothing, so detections are those of searching everything (planted differential on the full database: no mismatch).
 
 Main + daily [M, E3]: 1,570,219 searched programs, 1,178,274 deferred; searched A 299,544, B 81,108, C 9,158, D 2,335. Against ClamAV's depth-3 prefixes this gives 200x fewer candidates on B1 and 45x on B2; deferral alone divides candidates by 7 to 12 and verifies by about 90. Tier D: 60% deferred or anchored (pass line 90%: missed); the rest are `.ndb` signatures with no partner, held to 165 candidates per MB on B1 by 3- and 2-byte atoms (follow-up: bounded expansions and sparse grams, #107).
 
@@ -256,7 +258,7 @@ miss -> read first 4 KiB -> file-type trie
 
 **Verify VM:**
 - Starts at the anchor part and searches the other parts within their gap bounds, using SIMD memchr and masked compares.
-- Has a per-subsignature step budget and a per-file verify budget. When a budget runs out it is recorded as a limit event, never a silent pass.
+- Has a per-subsignature step budget, a per-file step budget, and a per-file verify-count budget proportional to size (16,384 calls plus 64 per KiB; benign files make under 23 per KiB). When a budget runs out it is recorded as a limit event, never a silent pass. The count is what bounds crafted candidate density: verifies that fail at once cost almost no steps (E4: worst inputs 6 to 24 ms/MB).
 - ClamAV semantics (wildcards, gap ranges, maxshift, `::f` boundaries, count and offset ordering) are checked differentially against libclamav.
 
 **Logical state:** an 8192-slot open-addressing table per worker, reset through a touched list. Target predicates are checked on first touch. Overflow spills to an arena.

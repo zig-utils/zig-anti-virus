@@ -66,6 +66,10 @@ pub const Costs = struct {
     prefix: bool = false,
     /// Search every subsig (the non-deferred path the deferred one is checked against).
     no_defer: bool = false,
+    /// Programs one atom table key (or deferred-pass key) may hold while another window is
+    /// available (`Crowd`) that costs at most `crowd_slack` more.
+    max_chain: u32 = 32,
+    crowd_slack: f64 = 0.002,
 
     fn allows(c: Costs, s: u8) bool {
         return s == 1 or std.mem.indexOfScalar(u8, c.sampled, s) != null;
@@ -221,6 +225,45 @@ pub const Variants = struct {
 /// The cheapest atom window of a program. Programs pinned to an offset are verified from where
 /// the match starts, so `part0_only` keeps their anchor in the first part (as prog_build does).
 pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Choice {
+    return chooseAvoiding(model, costs, p, part0_only, null);
+}
+
+/// Atom table keys too many programs share (`Costs.max_chain`): a candidate walks its key's
+/// whole chain, so a key shared by a hundred thousand programs (`VB5!`, the start of every
+/// Visual Basic 5 header, held 108,490) costs a hundred thousand compares wherever it occurs.
+/// A key is its gram length and its gram, lower-cased for a folded literal.
+pub const Banned = std.AutoHashMapUnmanaged(u64, void);
+
+pub fn keyId(bytes: []const u8, nocase: bool) u64 {
+    var g: u32 = 0;
+    for (bytes, 0..) |b, i| g |= @as(u32, if (nocase) std.ascii.toLower(b) else b) << @intCast(8 * i);
+    return @as(u64, bytes.len) << 32 | g;
+}
+
+fn isBanned(banned: ?*const Banned, bytes: []const u8, nocase: bool) bool {
+    const b = banned orelse return false;
+    return b.contains(keyId(bytes, nocase));
+}
+
+/// The table key of a choice (null without an atom).
+pub fn choiceKey(c: Choice, p: ir.Pattern) ?u64 {
+    if (c.q == 0 or c.anchor.op == prog.no_anchor) return null;
+    const o = p.ops[c.anchor.op];
+    return keyId(p.bytes(o)[c.atom_off..][0..c.q], o.flags & ir.op_nocase != 0);
+}
+
+/// The key a deferred program is searched by (engine/bodyscan.zig `Pending`): its anchor
+/// literal's first four bytes, or fewer.
+pub fn deferredKey(a: prog_build.Anchor, p: ir.Pattern) ?u64 {
+    if (a.op == prog.no_anchor) return null;
+    const o = p.ops[a.op];
+    const bytes = p.bytes(o);
+    if (bytes.len < 2) return null;
+    return keyId(bytes[0..@min(bytes.len, 4)], o.flags & ir.op_nocase != 0);
+}
+
+/// `choose`, skipping windows whose key is in `banned`.
+pub fn chooseAvoiding(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool, banned: ?*const Banned) Choice {
     if (costs.prefix) return choosePrefix(p, part0_only);
     var best: Choice = .{ .anchor = prog_build.chooseAnchor(p, part0_only) };
     var it: Literals = .{ .pattern = p, .part0_only = part0_only };
@@ -244,7 +287,7 @@ pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Ch
                 // first gram (its table key) costs a verify.
                 var cost = costs.probe_ns * sum + costs.verify_ns * probs[off] + costs.stride_penalty[si];
                 if (s == 1) cost += costs.gate_ns * gram2Prob(model, bytes[off..][0..2], nocase);
-                if (cost < best.cost) best = .{
+                if (cost < best.cost and !isBanned(banned, bytes[off..][0..4], nocase)) best = .{
                     .stride = s,
                     .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
                     .atom_off = @intCast(off),
@@ -268,7 +311,7 @@ pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Ch
         for (0..bytes.len - 2) |off| {
             const cost = costs.q3_penalty + (costs.probe_ns + costs.verify_ns) * gram3Prob(model, bytes[off..][0..3], nocase) +
                 costs.gate_ns * gram2Prob(model, bytes[off..][0..2], nocase);
-            if (cost < best.cost) best = .{
+            if (cost < best.cost and !isBanned(banned, bytes[off..][0..3], nocase)) best = .{
                 .stride = 1,
                 .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
                 .atom_off = @intCast(off),
@@ -297,7 +340,7 @@ pub fn choose(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool) Ch
                 }
             } else prob = model.prob2(bytes[off..][0..2]);
             const cost = costs.q2_penalty + (costs.probe_ns + costs.verify_ns + costs.gate_ns) * prob;
-            if (cost < best.cost) best = .{
+            if (cost < best.cost and !isBanned(banned, bytes[off..][0..2], nocase)) best = .{
                 .stride = 1,
                 .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
                 .atom_off = @intCast(off),
@@ -343,8 +386,17 @@ pub const Planned = struct {
 };
 
 /// The atom of a program that nothing can defer (a body signature, a YARA string).
-pub fn chooseFor(model: gm.Model, costs: Costs, in: prog_build.Input) Choice {
-    return if (in.offset.kind == .any) choose(model, costs, in.pattern, false) else pinned(in.pattern);
+pub fn chooseFor(model: gm.Model, costs: Costs, in: prog_build.Input, crowd: ?*const Crowd) Choice {
+    if (in.offset.kind != .any) return pinned(in.pattern);
+    const best = choose(model, costs, in.pattern, false);
+    const cr = crowd orelse return best;
+    const key = choiceKey(best, in.pattern) orelse return best;
+    if (!cr.banned.contains(key)) return best;
+    // The cheapest window's key is crowded: the next cheapest whose key is not, unless it costs
+    // more than `crowd_slack` beyond it (moving a family onto a common gram would cost every
+    // benign file far more than the crowded key costs crafted ones).
+    const free = chooseAvoiding(model, costs, in.pattern, false, &cr.banned);
+    return if (free.q != 0 and free.cost <= best.cost + costs.crowd_slack) free else best;
 }
 
 /// Cover of an expression: a subsig mask and its cost, or none.
@@ -437,13 +489,16 @@ const CoverCtx = struct {
 /// subsigs of each logical rule outside its cheapest cover. `rules[i]` covers the programs
 /// `first[i] .. first[i] + count[i]`; YARA rules are passed as null (their conditions are not
 /// RPN, so nothing of theirs is deferred).
-pub fn plan(gpa: std.mem.Allocator, model: gm.Model, costs: Costs, inputs: []const prog_build.Input, logicals: []const Logical) ![]Planned {
+pub fn plan(gpa: std.mem.Allocator, model: gm.Model, costs: Costs, inputs: []const prog_build.Input, logicals: []const Logical, crowd: ?*Crowd) ![]Planned {
     const out = try gpa.alloc(Planned, inputs.len);
     errdefer gpa.free(out);
     for (inputs, out) |in, *o| {
-        o.* = .{ .choice = chooseFor(model, costs, in) };
+        o.* = .{ .choice = chooseFor(model, costs, in, crowd) };
     }
-    if (costs.prefix or costs.no_defer) return out;
+    if (costs.prefix or costs.no_defer) {
+        try noteAll(crowd, inputs, out);
+        return out;
+    }
     var sub_costs: [ir.max_subsigs]?f64 = undefined;
     for (logicals) |l| {
         const rule = l.rule orelse continue;
@@ -462,10 +517,102 @@ pub fn plan(gpa: std.mem.Allocator, model: gm.Model, costs: Costs, inputs: []con
         const cover = ctx.expr(rule.expr) orelse continue;
         for (programs, out[l.first..][0..l.count]) |in, *o| {
             if (in.offset.kind != .any) continue;
-            if (in.subsig < 64 and cover.mask & (@as(u64, 1) << @intCast(in.subsig)) == 0) o.deferred = true;
+            if (in.subsig < 64 and cover.mask & (@as(u64, 1) << @intCast(in.subsig)) == 0) {
+                o.deferred = true;
+                if (deferredAnchorCrowd(model, costs, in.pattern, crowd)) |a| o.choice.anchor = a;
+            }
         }
     }
+    try noteAll(crowd, inputs, out);
     return out;
+}
+
+/// The keys programs have taken so far, for `Costs.max_chain`: a candidate walks its key's
+/// whole chain, so a key many programs share is a worst case wherever it occurs, and crafted
+/// input can repeat it (E4). The compiler adds programs in database order; once a key holds
+/// `max_chain` of them, later programs take their next cheapest window (or, deferred, anchor
+/// literal) whose key is not crowded, and a program with no other keeps the crowded key.
+/// Expected cost is what atom selection weighs; this bounds the worst case.
+pub const Crowd = struct {
+    gpa: std.mem.Allocator,
+    max_chain: u32,
+    counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    banned: Banned = .empty,
+
+    pub fn init(gpa: std.mem.Allocator, max_chain: u32) Crowd {
+        return .{ .gpa = gpa, .max_chain = max_chain };
+    }
+
+    pub fn deinit(cr: *Crowd) void {
+        cr.counts.deinit(cr.gpa);
+        cr.banned.deinit(cr.gpa);
+    }
+
+    pub fn note(cr: *Crowd, key: u64) !void {
+        const gop = try cr.counts.getOrPut(cr.gpa, key);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        if (gop.value_ptr.* == cr.max_chain) try cr.banned.put(cr.gpa, key, {});
+    }
+
+    /// Record the key of one planned program.
+    pub fn notePlanned(cr: *Crowd, in: prog_build.Input, o: Planned) !void {
+        if (in.offset.kind != .any) return;
+        const key = (if (o.deferred) deferredKey(o.choice.anchor, in.pattern) else choiceKey(o.choice, in.pattern)) orelse return;
+        try cr.note(key);
+    }
+};
+
+fn noteAll(crowd: ?*Crowd, inputs: []const prog_build.Input, out: []const Planned) !void {
+    const cr = crowd orelse return;
+    for (inputs, out) |in, o| try cr.notePlanned(in, o);
+}
+
+/// The anchor of a deferred program. The second pass keys a deferred program on the first
+/// (up to) four bytes of its anchor literal behind a bitmap of their first two
+/// (engine/bodyscan.zig `Pending`), so the literal whose prefix is rarest is the cheapest
+/// anchor, not the one holding the rarest window: a prefix of `00 00` passes the bitmap at
+/// most positions of a PE file. Null keeps the anchor (no literal of two bytes).
+pub fn deferredAnchor(model: gm.Model, costs: Costs, p: ir.Pattern, banned: ?*const Banned) ?prog_build.Anchor {
+    const a = deferredAnchorCost(model, costs, p, banned) orelse return null;
+    return a.anchor;
+}
+
+const CostedAnchor = struct { anchor: prog_build.Anchor, cost: f64 };
+
+/// A deferred program's anchor under a crowd: the cheapest literal, or the cheapest whose key
+/// is not crowded when it costs at most `crowd_slack` more.
+fn deferredAnchorCrowd(model: gm.Model, costs: Costs, p: ir.Pattern, crowd: ?*const Crowd) ?prog_build.Anchor {
+    const best = deferredAnchorCost(model, costs, p, null) orelse return null;
+    const cr = crowd orelse return best.anchor;
+    const key = deferredKey(best.anchor, p) orelse return best.anchor;
+    if (!cr.banned.contains(key)) return best.anchor;
+    const free = deferredAnchorCost(model, costs, p, &cr.banned) orelse return best.anchor;
+    return if (free.cost <= best.cost + costs.crowd_slack) free.anchor else best.anchor;
+}
+
+fn deferredAnchorCost(model: gm.Model, costs: Costs, p: ir.Pattern, banned: ?*const Banned) ?CostedAnchor {
+    var best: ?prog_build.Anchor = null;
+    var best_cost: f64 = std.math.inf(f64);
+    var it: Literals = .{ .pattern = p, .part0_only = false };
+    while (it.next()) |lit| {
+        const o = p.ops[lit.op];
+        const bytes = p.bytes(o);
+        if (bytes.len < 2) continue;
+        const nocase = o.flags & ir.op_nocase != 0;
+        if (isBanned(banned, bytes[0..@min(bytes.len, 4)], nocase)) continue;
+        const key_prob = switch (@min(bytes.len, 4)) {
+            4 => gramProb(model, bytes[0..4], nocase),
+            3 => gram3Prob(model, bytes[0..3], nocase),
+            else => gram2Prob(model, bytes[0..2], nocase),
+        };
+        const cost = costs.gate_ns * gram2Prob(model, bytes[0..2], nocase) + (costs.probe_ns + costs.verify_ns) * key_prob;
+        // The longer literal on ties: it fails sooner in the verifier.
+        if (cost < best_cost or (cost == best_cost and best != null and o.len > p.ops[best.?.op].len)) {
+            best_cost = cost;
+            best = .{ .part = lit.part, .op = lit.op, .delta = lit.delta };
+        }
+    }
+    return .{ .anchor = best orelse return null, .cost = best_cost };
 }
 
 /// A program pinned to an offset: the anchored index finds it, so it needs no atom.
@@ -638,7 +785,7 @@ test "covers defer subsigs a cheaper partner implies" {
         const rule = try ldb.parseLine(a, case.line, &column);
         var inputs: std.ArrayList(prog_build.Input) = .empty;
         for (rule.subsigs, 0..) |sub, i| if (sub == .hex) try inputs.append(a, .{ .pattern = sub.hex.pattern, .offset = sub.hex.offset, .sig = 0, .subsig = @intCast(i) });
-        const planned = try plan(a, m, .{}, inputs.items, &.{.{ .rule = &rule, .first = 0, .count = @intCast(inputs.items.len) }});
+        const planned = try plan(a, m, .{}, inputs.items, &.{.{ .rule = &rule, .first = 0, .count = @intCast(inputs.items.len) }}, null);
         for (planned, case.deferred) |p, want| testing.expectEqual(want, p.deferred) catch |err| {
             std.debug.print("{s}: costs {any}\n", .{ case.line, planned });
             return err;
