@@ -462,7 +462,7 @@ test "archives: every tar, cpio and zip variant, positional and streamed" {
 
 test "overlapping-entry zip bombs are reported and bounded" {
     for (fixtures.archives) |a| {
-        if (std.mem.indexOf(u8, a.name, "bomb.zip") == null) continue;
+        if (std.mem.indexOf(u8, a.name, "overlap-bomb") == null and std.mem.indexOf(u8, a.name, "entry-bomb") == null) continue;
         var rig: TestRig = undefined;
         try rig.init(.{});
         defer rig.deinit();

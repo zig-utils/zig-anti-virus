@@ -194,6 +194,9 @@ pub const archives = [_]Archive{
     } },
     .{ .name = "overlap-bomb.zip", .bytes = @embedFile("archive-overlap-bomb.zip.bin"), .malformed = false, .members = &.{} },
     .{ .name = "same-entry-bomb.zip", .bytes = @embedFile("archive-same-entry-bomb.zip.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "nested-bomb.zip", .bytes = @embedFile("archive-nested-bomb.zip.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "deep-40.zip", .bytes = @embedFile("archive-deep-40.zip.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "deep-40.gz", .bytes = @embedFile("archive-deep-40.gz.bin"), .malformed = false, .members = &.{} },
 };
 
 pub const Exe = struct { name: []const u8, bytes: []const u8, entry: ?u64, sections: usize, imphash: []const u8, impsize: u64, members: []const Member, malformed: bool };

@@ -43,4 +43,5 @@ test {
     _ = macho;
     _ = html_norm;
     _ = text_norm;
+    _ = @import("adversarial.zig");
 }

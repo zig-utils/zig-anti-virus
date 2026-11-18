@@ -63,11 +63,12 @@ pub const Cursor = struct {
         var limited = r.limited(.limited64(size), limited_buf);
         try c.w.child(name, .{ .stream = .{ .reader = &limited.interface, .len_hint = size } }, kind);
         // Skip what the child did not read (a skipped member, a limit hit); buffered bytes first.
-        const left_in_buffer = limited.interface.bufferedLen();
         limited.interface.tossBuffered();
-        _ = left_in_buffer;
         const unread = @backingInt(limited.remaining);
-        r.discardAll64(unread) catch {};
+        r.discardAll64(unread) catch |e| {
+            if (e == error.EndOfStream) c.w.notice(.malformed, "member runs past the end of the archive");
+            return false;
+        };
         c.off += size;
         return true;
     }

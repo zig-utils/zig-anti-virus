@@ -580,6 +580,28 @@ function sameEntryBomb(n: number): Uint8Array {
 }
 archive('same-entry-bomb.zip', sameEntryBomb(1000), [], false)
 
+// Adversarial corpus (P5.17). A recursive bomb in the style of 42.zip: four levels of 16
+// identical deflated zips over a leaf of 64 MiB of zeros, claiming 4 TiB.
+function nestedBomb(levels: number, fanout: number): Uint8Array {
+  let inner = zipBytes([{ name: 'zeros.bin', data: new Uint8Array(64 * 1024 * 1024) }])
+  for (let l = 0; l < levels; l++) {
+    inner = zipBytes(Array.from({ length: fanout }, (_, i) => ({ name: `l${l}-${i.toString(16)}.zip`, data: inner })))
+  }
+  return inner
+}
+archive('nested-bomb.zip', nestedBomb(4, 16), [], false)
+
+// Nesting far past MaxRecursion (17): a zip in a zip, 40 deep, and a gzip in a gzip, 40 deep.
+function deepZip(depth: number): Uint8Array {
+  let b: Uint8Array = evil
+  for (let d = 0; d < depth; d++) b = zipBytes([{ name: `d${d}`, data: b, method: d % 2 === 0 ? 0 : 8 }])
+  return b
+}
+archive('deep-40.zip', deepZip(40), [], false)
+let deepGz: Uint8Array = evil
+for (let d = 0; d < 40; d++) deepGz = zlib.gzipSync(deepGz)
+archive('deep-40.gz', deepGz, [], false)
+
 // ---------------------------------------------------------------------------------------------
 // Executables (P5.05 PE, P5.06 ELF and Mach-O), built from the format specifications.
 

@@ -1,0 +1,51 @@
+name: Nightly fuzz
+
+# Long deterministic fuzz runs with a fresh seed each night, plus the adversarial corpus in a
+# ReleaseSafe build. Every PR already runs a 20k-iteration smoke (ci.yml); this is the depth.
+# A failing seed is printed by the fuzzer and reproduces locally with -Dfuzz-seed.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: '0.17.0-dev.1857+3c46da14d'
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Format parsers and decoders: every fmt.* target each iteration.
+          - { target: fmt., iterations: 2000000 }
+          # Everything else in rotation.
+          - { target: all, iterations: 5000000 }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Fuzz
+        run: |
+          seed=${{ github.run_id }}
+          echo "seed $seed"
+          if [ "${{ matrix.target }}" = "all" ]; then
+            zig build fuzz -Doptimize=safe -Dfuzz-iterations=${{ matrix.iterations }} -Dfuzz-seed=$seed
+          else
+            zig build fuzz -Doptimize=safe -Dfuzz-iterations=${{ matrix.iterations }} -Dfuzz-seed=$seed -Dfuzz-target=${{ matrix.target }}
+          fi
+
+  adversarial:
+    name: Adversarial corpus (ReleaseSafe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test -Doptimize=safe --summary all
