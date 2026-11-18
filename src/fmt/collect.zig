@@ -2,15 +2,19 @@
 //! filters, the hex of an RTF object. Push parsers produce these a slice at a time, so they cannot
 //! hand the walker a reader; the bytes are collected first and then scanned as one child.
 //!
-//! Bytes go to a scratch buffer that grows in place while it is the newest scratch allocation,
-//! up to `memory_child_max`, then to an unlinked spill file. Past MaxFileSize the rest is dropped
-//! and the file_size limit is reported once; what was collected is still scanned.
+//! Bytes go to a scratch buffer reserved when the collector is made (so a parser may mark and
+//! release scratch around its own work while collecting), then to an unlinked spill file. Past
+//! MaxFileSize the rest is dropped and the file_size limit is reported once; what was collected
+//! is still scanned.
 const std = @import("std");
 const container = @import("../engine/container.zig");
 const source_mod = @import("../engine/source.zig");
 const Walker = container.Walker;
 const Source = source_mod.Source;
 const Spill = source_mod.Spill;
+
+/// Scratch bytes a collector reserves by default; larger children spill.
+pub const default_capacity: usize = 1024 * 1024;
 
 pub const Collector = struct {
     w: *Walker,
@@ -20,8 +24,15 @@ pub const Collector = struct {
     /// Bytes past MaxFileSize, or storage failed: the rest of this child is dropped.
     full: bool = false,
 
+    /// Reserve `default_capacity` (at most memory_child_max) of scratch now.
     pub fn init(w: *Walker) Collector {
-        return .{ .w = w };
+        return initCapacity(w, default_capacity);
+    }
+
+    pub fn initCapacity(w: *Walker, capacity: usize) Collector {
+        const cap: usize = @intCast(@min(capacity, w.options.memory_child_max, w.tracker.limits.max_file_size));
+        const buf: []u8 = w.scratch.allocator().alloc(u8, cap) catch &[_]u8{};
+        return .{ .w = w, .buf = buf };
     }
 
     /// Bytes collected so far.
@@ -39,44 +50,22 @@ pub const Collector = struct {
             c.full = true;
             w.limit(.file_size);
         }
+        if (c.spill == null and c.len + take.len > c.buf.len) {
+            // Past the reserved buffer: move to a spill file.
+            var s = Spill.create(w.io, w.spill_dir) catch return c.fail();
+            s.append(w.io, c.buf[0..c.len]) catch {
+                s.close(w.io);
+                return c.fail();
+            };
+            c.spill = s;
+            c.len = 0;
+        }
         if (c.spill) |*s| {
             s.append(w.io, take) catch c.fail();
             return;
         }
-        if (c.len + take.len > c.buf.len) c.grow(c.len + take.len);
-        if (c.spill) |*s| {
-            s.append(w.io, take) catch c.fail();
-            return;
-        }
-        if (c.len + take.len > c.buf.len) return c.fail();
         @memcpy(c.buf[c.len..][0..take.len], take);
         c.len += take.len;
-    }
-
-    fn grow(c: *Collector, need: usize) void {
-        const w = c.w;
-        const mem_max: usize = @intCast(@min(w.options.memory_child_max, w.tracker.limits.max_file_size));
-        if (need <= mem_max) {
-            const want = @min(mem_max, @max(need, c.buf.len * 2, container.block_len));
-            const a = w.scratch.allocator();
-            if (c.buf.len == 0) {
-                if (a.alloc(u8, want)) |b| {
-                    c.buf = b;
-                    return;
-                } else |_| {}
-            } else if (a.resize(c.buf, want)) {
-                c.buf = c.buf.ptr[0..want];
-                return;
-            }
-        }
-        // Too big for scratch, or something else was allocated after the buffer: spill.
-        var s = Spill.create(w.io, w.spill_dir) catch return c.fail();
-        s.append(w.io, c.buf[0..c.len]) catch {
-            s.close(w.io);
-            return c.fail();
-        };
-        c.spill = s;
-        c.len = 0;
     }
 
     fn fail(c: *Collector) void {
@@ -111,9 +100,8 @@ test "collects in scratch, then spills, and stops at MaxFileSize" {
     var rig: @import("scan.zig").TestRig = undefined;
     try rig.init(.{ .max_file_size = 300 * 1024 });
     defer rig.deinit();
-    rig.walker.options.memory_child_max = 128 * 1024;
     const mark = rig.scratch.mark();
-    var c: Collector = .init(&rig.walker);
+    var c: Collector = .initCapacity(&rig.walker, 128 * 1024);
     defer c.deinit();
     var block: [1000]u8 = undefined;
     for (&block, 0..) |*b, i| b.* = @truncate(i);

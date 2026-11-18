@@ -34,8 +34,13 @@ pub const html_norm = @import("html_norm.zig");
 pub const text_norm = @import("text_norm.zig");
 pub const mime = @import("mime.zig");
 pub const collect = @import("collect.zig");
+pub const pdf = @import("pdf.zig");
+pub const pdf_filter = @import("pdf_filter.zig");
+pub const pdf_crypt = @import("pdf_crypt.zig");
 /// Reference vectors (tests, fuzzing, benchmarks).
 pub const fixtures = @import("fixtures/fixtures.zig");
+/// Document fixtures: PDF, RTF and 7z (fixtures/documents.ts).
+pub const docs = @import("fixtures/docs.zig");
 
 test {
     _ = types;
@@ -71,5 +76,8 @@ test {
     _ = text_norm;
     _ = mime;
     _ = collect;
+    _ = pdf;
+    _ = pdf_filter;
+    _ = pdf_crypt;
     _ = @import("adversarial.zig");
 }

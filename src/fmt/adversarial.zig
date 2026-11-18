@@ -184,3 +184,93 @@ fn tarHeader(h: *[512]u8, i: usize, size: u64) void {
     for (h) |c| sum += c;
     _ = std.fmt.bufPrint(h[148..156], "{o:0>6}\x00 ", .{sum}) catch unreachable;
 }
+
+/// A zlib stream of `n` zero bytes: one literal, then fixed-Huffman matches of 258 at distance
+/// 1 (13 bits each), so 64 MiB costs about 420 KB.
+fn zlibZeros(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, &.{ 0x78, 0x01 });
+    var bits: u64 = 0;
+    var nbits: u6 = 0;
+    const W = struct {
+        fn put(o: *std.ArrayList(u8), g: std.mem.Allocator, b: *u64, nb: *u6, v: u64, len: u6) !void {
+            b.* |= v << nb.*;
+            nb.* += len;
+            while (nb.* >= 8) {
+                try o.append(g, @truncate(b.*));
+                b.* >>= 8;
+                nb.* -= 8;
+            }
+        }
+        /// Huffman codes go most significant bit first.
+        fn code(o: *std.ArrayList(u8), g: std.mem.Allocator, b: *u64, nb: *u6, v: u64, len: u6) !void {
+            var r: u64 = 0;
+            for (0..len) |i| r |= ((v >> @intCast(i)) & 1) << @intCast(len - 1 - i);
+            try put(o, g, b, nb, r, len);
+        }
+    };
+    try W.put(&out, gpa, &bits, &nbits, 1, 1); // final
+    try W.put(&out, gpa, &bits, &nbits, 1, 2); // fixed Huffman
+    try W.code(&out, gpa, &bits, &nbits, 0x30, 8); // literal 0
+    var left = n - 1;
+    while (left >= 258) : (left -= 258) {
+        try W.code(&out, gpa, &bits, &nbits, 0xc5, 8); // length 258
+        try W.code(&out, gpa, &bits, &nbits, 0, 5); // distance 1
+    }
+    try W.code(&out, gpa, &bits, &nbits, 0, 7); // end of block
+    if (nbits > 0) try out.append(gpa, @truncate(bits));
+    return out.toOwnedSlice(gpa);
+}
+
+test "pathological PDFs stay within bounds" {
+    const gpa = std.testing.allocator;
+    // A 64 MiB zero bomb in one stream: the ratio guard stops it.
+    {
+        const z = try zlibZeros(gpa, 64 * 1024 * 1024);
+        defer gpa.free(z);
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(gpa);
+        try b.print(gpa, "%PDF-1.7\n1 0 obj\n<< /Filter /FlateDecode /Length {d} >>\nstream\n", .{z.len});
+        try b.appendSlice(gpa, z);
+        try b.appendSlice(gpa, "\nendstream\nendobj\n%%EOF\n");
+        try run(.{ .name = "bomb.pdf", .bytes = b.items, .expect = .{ .limit = .ratio }, .max_ms = 10_000, .lim = tight });
+    }
+    // 200,000 nested dictionaries in one object.
+    {
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(gpa);
+        try b.appendSlice(gpa, "%PDF-1.7\n1 0 obj\n");
+        try b.appendNTimes(gpa, '<', 400_000);
+        try b.appendSlice(gpa, "\nendobj\n");
+        try run(.{ .name = "deep.pdf", .bytes = b.items, .expect = .{ .notice = .malformed }, .max_ms = 10_000, .lim = tight });
+    }
+    // More objects than the table holds.
+    {
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(gpa);
+        try b.appendSlice(gpa, "%PDF-1.7\n");
+        for (0..pdf.max_objects + 1000) |i| try b.print(gpa, "{d} 0 obj null endobj\n", .{i + 1});
+        try run(.{ .name = "many.pdf", .bytes = b.items, .expect = .{ .notice = .malformed }, .max_ms = 20_000, .lim = tight });
+    }
+    // A thousand chained filters.
+    {
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(gpa);
+        try b.appendSlice(gpa, "%PDF-1.7\n1 0 obj\n<< /Filter [");
+        for (0..1000) |_| try b.appendSlice(gpa, "/AHx ");
+        try b.appendSlice(gpa, "] /Length 4 >>\nstream\n4142\nendstream\nendobj\n");
+        try run(.{ .name = "chain.pdf", .bytes = b.items, .expect = .{ .notice = .unsupported }, .max_ms = 5_000, .lim = tight });
+    }
+    // 20,000 streams that never end, lying lengths that refer to themselves, unclosed strings
+    // and unresolvable JavaScript references: linear, not quadratic.
+    {
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(gpa);
+        try b.appendSlice(gpa, "%PDF-1.7\n");
+        for (0..20_000) |i| try b.print(gpa, "{d} 0 obj << /Length {d} 0 R /JS {d} 0 R >> stream\n((((( data\n", .{ i + 1, i + 1, i + 900_000 });
+        try run(.{ .name = "unterminated.pdf", .bytes = b.items, .expect = .nothing, .max_ms = 10_000, .lim = tight });
+    }
+}
+
+const pdf = @import("pdf.zig");

