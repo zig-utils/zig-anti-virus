@@ -65,9 +65,28 @@ fn range(text: []const u8) error{BadCdbField}!?ir.Range {
 }
 
 /// Compile a regex to a serialised byte-mode program in `arena`.
-pub fn compileRegex(arena: std.mem.Allocator, pattern: []const u8, flags: regex.common.CompileFlags) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
+pub fn compileRegex(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
     var f = flags;
     f.bytes = true;
+    // A leading option setting such as `(?i)` or `(?si)` applies to the whole pattern in PCRE
+    // (and in libclamav's filename regexes), so it is the compile flag; zig-regex's programs
+    // refuse inline modifiers anywhere else.
+    var pattern = pattern_in;
+    if (std.mem.startsWith(u8, pattern, "(?")) {
+        var i: usize = 2;
+        var lead = f;
+        while (i < pattern.len) : (i += 1) switch (pattern[i]) {
+            'i' => lead.case_insensitive = true,
+            's' => lead.dot_all = true,
+            'm' => lead.multiline = true,
+            'x' => lead.extended = true,
+            else => break,
+        };
+        if (i > 2 and i < pattern.len and pattern[i] == ')') {
+            f = lead;
+            pattern = pattern[i + 1 ..];
+        }
+    }
     const program = regex.Program.compile(arena, pattern, f) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.UnsupportedByProgram, error.ProgramTooLarge => error.RegexUnsupported,

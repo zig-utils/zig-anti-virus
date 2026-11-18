@@ -137,6 +137,25 @@ pub fn build(b: *std.Build) void {
     const diff_tests = b.addTest(.{ .root_module = diff_exe.root_module });
     test_step.dependOn(&b.addRunArtifact(diff_tests).step);
 
+    // E13: zig-regex byte mode against PCRE2 (tools/diff/e13.zig). Needs libpcre2-8: from the
+    // system, or from -Dpcre2=PREFIX (its lib/libpcre2-8.a is linked statically).
+    const e13_exe = b.addExecutable(.{
+        .name = "e13",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/diff/e13.zig"),
+            .target = target,
+            .optimize = if (optimize == .debug) .safe else optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    if (b.option([]const u8, "pcre2", "PCRE2 install prefix for zig build e13")) |prefix| {
+        e13_exe.root_module.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libpcre2-8.a", .{prefix}) });
+    } else e13_exe.root_module.linkSystemLibrary("pcre2-8", .{});
+    const run_e13 = b.addRunArtifact(e13_exe);
+    run_e13.addPassthruArgs();
+    b.step("e13", "Compare zig-regex byte mode with PCRE2 on a corpus (zig build e13 -- CORPUS)").dependOn(&run_e13.step);
+
     // Deterministic fuzzing.
     const fuzz_exe = b.addExecutable(.{
         .name = "fuzz",

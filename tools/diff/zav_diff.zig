@@ -651,6 +651,10 @@ fn check(app: App, args: []const []const u8) !u8 {
     // --print: also write zav's own verdicts (`LOAD case sigN LOADS|REJECTS`, `RESULT case sN
     // names`) for every signature zav loads, for comparisons with other engines (yara).
     var print = false;
+    // --refusals-known: a signature zav refuses with a reason counts as a known difference (for
+    // cases generated from the databases, where the refusals are tallied by reason elsewhere).
+    var refusals_known = false;
+    var refused: usize = 0;
     var known_path: ?[]const u8 = null;
     var paths: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
@@ -663,6 +667,8 @@ fn check(app: App, args: []const []const u8) !u8 {
             known_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--print")) {
             print = true;
+        } else if (std.mem.eql(u8, args[i], "--refusals-known")) {
+            refusals_known = true;
         } else try paths.append(app.arena, args[i]);
     }
     const cases = try loadCases(app, paths.items);
@@ -697,7 +703,11 @@ fn check(app: App, args: []const []const u8) !u8 {
             if (compiled.rejected != sig.rejected) {
                 total += 1;
                 const got: []const u8 = if (compiled.rejected) "REJECTS" else "LOADS";
-                if (findKnown(known.items, case.name, 1_000_000 + si + 1)) |k| {
+                if (refusals_known and compiled.rejected) {
+                    refused += 1;
+                    known_hits += 1;
+                    try excused.append(app.arena, try app.arena.dupe(u8, sig_name));
+                } else if (findKnown(known.items, case.name, 1_000_000 + si + 1)) |k| {
                     k.used = true;
                     if (std.mem.eql(u8, k.zav, got)) {
                         known_hits += 1;
@@ -770,7 +780,7 @@ fn check(app: App, args: []const []const u8) !u8 {
         failures += 1;
         try app.out.print("FAIL known difference {s} {d} matches no case or sample\n", .{ k.case, k.sample });
     };
-    try app.out.print("zav-diff: {d} cases, {d} checks: {d} agree, {d} known differences, {d} failures\n", .{ cases.items.len, total, agree, known_hits, failures });
+    try app.out.print("zav-diff: {d} cases, {d} checks: {d} agree, {d} known differences ({d} signatures zav refuses), {d} failures\n", .{ cases.items.len, total, agree, known_hits, refused, failures });
     return if (failures == 0) 0 else 1;
 }
 

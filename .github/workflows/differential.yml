@@ -58,3 +58,60 @@ jobs:
         with:
           name: recorded-verdicts
           path: ${{ runner.temp }}/recorded.diff
+
+  realdb:
+    name: Real databases against libclamav
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install ClamAV ${{ env.CLAMAV_VERSION }}, PCRE2 and Python tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
+          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb" libpcre2-dev
+          echo "CLAMSCAN=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')" >> "$GITHUB_ENV"
+          echo "CLAMAV_CERTS=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")" >> "$GITHUB_ENV"
+          python3 -m pip install --quiet cvdupdate yara-python
+      # database.clamav.net serves Cisco's cvdupdate, not generic clients. The databases are
+      # cached between runs and never leave the runner.
+      - name: Restore the ClamAV databases
+        uses: actions/cache@v4
+        with:
+          path: ~/clamav-db
+          key: clamav-db-${{ github.run_id }}
+          restore-keys: clamav-db-
+      - name: Update the ClamAV databases
+        run: |
+          cvd config set --dbdir "$HOME/clamav-db"
+          cvd update
+          mkdir -p "$RUNNER_TEMP/db/main" "$RUNNER_TEMP/db/daily"
+          tail -c +513 "$HOME/clamav-db/main.cvd" | tar xz -C "$RUNNER_TEMP/db/main"
+          tail -c +513 "$HOME/clamav-db/daily.cvd" | tar xz -C "$RUNNER_TEMP/db/daily"
+          chmod -R u+r "$RUNNER_TEMP/db"
+          head -c 100 "$HOME/clamav-db/main.cvd"; echo; head -c 100 "$HOME/clamav-db/daily.cvd"; echo
+      - run: zig build diff-tool -Doptimize=ReleaseSafe
+      - name: Every line zav refuses has a reason libclamav's loading does not contradict
+        run: |
+          db="$RUNNER_TEMP/db"
+          ./zig-out/bin/zav-diff rejects $db/main/*.ndb $db/main/*.ldb $db/main/*.cdb $db/daily/*.ndb $db/daily/*.ndu $db/daily/*.ldb $db/daily/*.ldu $db/daily/*.cdb $db/daily/*.ftm > "$RUNNER_TEMP/rejects.txt" || true
+          cut -d: -f4 "$RUNNER_TEMP/rejects.txt" | sort | uniq -c
+          # Unsupported features and regexes zig-regex refuses are expected; anything else is a
+          # line libclamav loads and zav misreads.
+          if cut -d: -f4 "$RUNNER_TEMP/rejects.txt" | grep -v -E '^ (fuzzy_image|icon|handler_type|version_info)_unsupported$|^ regex_(syntax|unsupported)$'; then exit 1; fi
+      - name: PCRE and byte-compare subsignatures, isolated
+        run: |
+          db="$RUNNER_TEMP/db"
+          python3 tools/diff/realdb.py pcre --db $db/main --db $db/daily --out "$RUNNER_TEMP/pcre.case"
+          python3 tools/diff/realdb.py bytecompare --db $db/main --db $db/daily --out "$RUNNER_TEMP/bc.case"
+          python3 tools/diff/clamav.py --raw --record --work "$RUNNER_TEMP/rwork" "$RUNNER_TEMP/pcre.case" "$RUNNER_TEMP/bc.case" | tail -1
+          ./zig-out/bin/zav-diff check --refusals-known --tmp "$RUNNER_TEMP/zd" "$RUNNER_TEMP/pcre.case" "$RUNNER_TEMP/bc.case"
+      - name: E13, zig-regex against PCRE2 on the PCRE subsigs and a public YARA rule set
+        run: |
+          git clone -q --depth 1 https://github.com/Yara-Rules/rules.git "$RUNNER_TEMP/yara-rules"
+          db="$RUNNER_TEMP/db"
+          python3 tools/diff/realdb.py corpus --db $db/main --db $db/daily --yara "$RUNNER_TEMP/yara-rules" --out "$RUNNER_TEMP/e13.txt"
+          zig build e13 -Doptimize=ReleaseSafe -- "$RUNNER_TEMP/e13.txt" --show 60

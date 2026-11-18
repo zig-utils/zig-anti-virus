@@ -22,8 +22,6 @@ pcre-basic s8 zav=OK
 # programs and refuses them (regex_unsupported), so these signatures never load.
 pcre-syntax sig5 zav=REJECTS
 pcre-syntax sig6 zav=REJECTS
-# A leading inline flag group ((?i)) is a scoped modifier to zig-regex 0.3.1 (regex_unsupported).
-pcre-syntax sig7 zav=REJECTS
 # YARA: zav follows yara (tools/diff/yara_check.py checks zav against it), and libclamav's YARA
 # support differs from yara here:
 # - it refuses a hex string without two literal bytes in a row, which yara accepts;

@@ -27,10 +27,17 @@ def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, **kw)
 
 
+# --raw: no format parsers, so embedded type triggers (HTML, mail, PDF...) cannot re-type a
+# sample and every file is matched as the raw bytes it is. For signatures from the databases,
+# whose samples are generated text.
+RAW = ["--scan-mail=no", "--scan-html=no", "--scan-ole2=no", "--scan-pdf=no", "--scan-swf=no",
+       "--scan-xmldocs=no", "--scan-hwp3=no", "--scan-onenote=no", "--scan-archive=no", "--scan-image=no"]
+
+
 class Clamscan:
-    def __init__(self, path, certs):
+    def __init__(self, path, certs, raw=False):
         self.path = path
-        self.base = [path, "--no-summary", "--allmatch", "--bytecode=no"]
+        self.base = [path, "--no-summary", "--allmatch", "--bytecode=no"] + (RAW if raw else [])
         if certs:
             self.base.append("--cvdcertsdir=" + certs)
 
@@ -112,6 +119,7 @@ def main():
     ap.add_argument("--zav-diff", default="zig-out/bin/zav-diff")
     ap.add_argument("--work", default=".zav-diff-work")
     ap.add_argument("--record", action="store_true")
+    ap.add_argument("--raw", action="store_true", help="disable libclamav's format parsers")
     ap.add_argument("cases", nargs="+")
     args = ap.parse_args()
 
@@ -119,7 +127,7 @@ def main():
     if r.returncode != 0:
         sys.stderr.write(r.stderr.decode() + r.stdout.decode())
         return 2
-    clam = Clamscan(args.clamscan, args.certs)
+    clam = Clamscan(args.clamscan, args.certs, args.raw)
     empty = os.path.join(args.work, "empty")
     open(empty, "w").close()
 
