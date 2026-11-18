@@ -14,7 +14,7 @@ Every [E] figure is provisional until an experiment replaces it with a measureme
 
 1. **Compile offline, mmap at runtime.**
    - One signed, versioned, little-endian blob holds offsets only and no pointers.
-   - Loading it is `mmap(PROT_READ)` plus header checks, about 10 ms [E].
+   - Loading it is `mmap(PROT_READ)` plus header checks: 0.8 ms with the hash index of the full ClamAV databases, warm page cache [M] (E1).
    - All signature data lives in clean file-backed pages, so signatures cost about 0 MB of private dirty memory.
    - Compiling from CVD happens in a separate short-lived process (`zav compile`), never inside the daemon.
 2. **Hashes use a size-gated two-tier index.**
@@ -139,7 +139,7 @@ keys:    [N]u32 first 4 digest bytes, big-endian, sorted within each size bucket
 **Other tables:**
 - Size-less tables use interpolation search over uniformly distributed prefixes, about 2-3 probes [K].
 - FP tables always store full digests.
-- An optional `HASH_FILTER[t]` binary fuse filter (about 9 bits per key) is kept only if E1 shows it helps when keys have been evicted.
+- No `HASH_FILTER[t]` binary fuse filter: E1 measured 223 ns warm hits and 196 ns warm misses on the real tables, and a filter would only trade one evicted page for another [M] ([E1](experiments/E1-hash-index.md)).
 
 **`SIGMETA`** tokenises signature names into 8-byte records:
 - Fields: `{family u24, source u4, pua u1, shape u2, number u24, revision u8}`, then a table of family offsets into `NAME_POOL`.
@@ -192,7 +192,7 @@ Large sections (programs, cold rows, sort runs) live in spill files and are mapp
 
 For each subsignature, enumerate every fixed run of 4 bytes or more and every bounded expansion. Score each window by its estimated benign frequency, using a 4-gram model built from a benign corpus. Penalise padding runs and common prologues. Pick the rarest window.
 
-Tiers come from the length L of the rarest fixed run. E0 measured the longest fixed run of every subsignature [M]: `.ndb` subsigs are 98% tier A, but `.ldb` subsigs are 57% A, 17% B, 26% C and 0.17% D (2,520, of which 2,048 have a fixed offset). Tier C, not D, is the candidate-volume risk.
+Tiers come from the length L of the rarest fixed run. E0 measured the longest fixed run of every subsignature [M]: `.ndb` subsigs are 98% tier A, but `.ldb` subsigs are 57% A, 17% B, 26% C and 0.17% D (2,521, of which 2,048 have a fixed offset). Tier C, not D, is the candidate-volume risk.
 - **A: L ≥ 11.** Stride 8; insert all 8 4-grams of the anchor.
 - **B: 7 ≤ L ≤ 10.** Stride 4.
 - **C: 4 ≤ L ≤ 6.** Stride 1, in a separate smaller filter.
@@ -259,7 +259,7 @@ miss -> read first 4 KiB -> file-type trie
 
 **Hashing:**
 - Expected single-core speeds: MD5 about 700 MB/s, SHA-1 about 1 GB/s in software, SHA-256 1.5-2.5 GB/s with hardware [K/E].
-- Size gating should skip most hashed *bytes*, since large files rarely have size-matched signatures [E].
+- Size gating skips 91.6% of MD5 bytes on a 27 GB benign filesystem and 99.7% on its files of 4 MiB or more, and SHA-1 entirely [M] (E1). The 13 size-less signatures (E0) still make MD5 and SHA-256 run on every file, which caps hashing at MD5's 730 MB/s per core; E1 lists the options.
 - For unknown-size streams, a hasher runs only while the byte count stays at or below the largest size in its table.
 
 ## 6. Containers and normalisers
@@ -496,7 +496,7 @@ bench/         corpus manifests, runner, memory sampler, clamd driver, gates
 | # | Experiment | Pass line |
 |---|---|---|
 | E0 | Database census: counts by extension, target and offset kind; tier histogram; size-less hashes; size coverage; name tokenisation; PCRE count; functionality levels ([results](experiments/E0-census.md)) | produces the numbers that replace the [E] figures |
-| E1 | Hash index lookup cost, warm and cold; share of hashed bytes skipped | lookup ≤ 300 ns warm; ≥ 70% of MD5 bytes skipped on B1 |
+| E1 | Hash index lookup cost, warm and cold; share of hashed bytes skipped ([results](experiments/E1-hash-index.md)) | lookup ≤ 300 ns warm; ≥ 70% of MD5 bytes skipped on B1 |
 | E2 | Prefilter bake-off: SBBF vs FDR shift-or vs double-array Aho-Corasick vs Teddy | PE partition ≥ 1 GB/s per core including stage 2 |
 | E3 | Atom selection vs prefix selection; tier-D deferral coverage | ≥ 10x fewer candidates; ≥ 90% of tier D deferrable or anchorable |
 | E4 | Verify VM worst case on A1 | no input over 50 ms/MB |

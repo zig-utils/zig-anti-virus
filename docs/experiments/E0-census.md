@@ -38,20 +38,22 @@ databases. Its numbers drive the hash index (size-less signatures, size coverage
    largest single-size bucket holds 4,190 file entries and 38,871 section entries.
 4. **Body subsignatures are mostly long**: 98% of `.ndb` subsigs are tier A. Logical subsigs are
    not: 57% A, 17% B, **26% C** and 0.17% D. Tier C is the candidate-volume risk, not tier D: a
-   six-byte run is the single commonest length (386,632 subsigs). Only 2,520 logical and 476 body subsigs are tier D, and 2,048 plus
+   six-byte run is the single commonest length (386,632 subsigs). Only 2,521 logical and 476 body subsigs are tier D, and 2,048 plus
    198 of those carry a fixed offset.
-5. **Names tokenise almost completely, but not with the shape the engine assumed.** 79% of names
-   are `Family-N` (one number) and 21% `Family-N-R`. The tokeniser in `ir.NameTokens` only
-   accepts `Family-N-R`, so 2.9 million names were stored verbatim (65 MB of NAME_POOL). With
-   both shapes, every one of the 3,641,273 names tokenises into 308,730 distinct families
-   (5.8 MB). The largest number is 10,060,800 (under 2^24) and the largest revision 12.
-6. **PCRE is rare**: 1,157 PCRE subsigs in 1,135 logical signatures; one byte-compare subsig.
+5. **Names tokenise completely, but not with the shape the engine first assumed.** 79% of names
+   are `Family-N` (one number) and 21% `Family-N-R`. The first tokeniser only accepted
+   `Family-N-R`, so 2.9 million names were stored verbatim (65 MB of NAME_POOL). `ir.NameTokens`
+   now takes both shapes (53dac6d): every one of the 3,641,288 names tokenises into 308,737
+   distinct families (5.8 MB). The largest number is 10,060,800 (under 2^24) and the largest
+   revision 12.
+6. **PCRE is rare**: 1,159 PCRE subsigs in 1,137 logical signatures; one byte-compare subsig.
 7. **Functionality levels**: no hash, `.ldb` or `.cdb` rule is outside the engine's level 220.
    161 `.ndb` rules and 12 `.ftm` rules are retired before it (maximum below 220) and are skipped.
-8. **320 lines do not parse** out of 3,651,997: 111 `fuzzy_img` and 81 icon subsigs, 55
-   regexes zig-regex rejects, 19 `.cdb` regexes that need backtracking, 14 `.ftm` lines with
-   offsets or types the engine does not know, and a handful of malformed bodies. Every one is in
-   the coverage report with its reason. Every hash line parses.
+8. **305 lines do not parse** out of 3,643,679: 111 `fuzzy_img` and 81 icon subsigs, 12 handler
+   types and 10 version-info offsets, 58 regexes zig-regex rejects, 19 `.cdb` regexes that need
+   backtracking, and 14 `.ftm` lines with offsets or types the engine does not know. Every one is
+   in the coverage report with its reason. Every hash line parses. (The first census, before the
+   `.ldb` parser fixes of 22e111d, counted 320.)
 9. **Bytecode**: 85 programs (bytecode.cvd's header says 80), 0.0023% of signatures.
 
 ## Report
@@ -85,7 +87,7 @@ Lines are non-blank, non-comment lines; rejected lines are listed by reason belo
 | daily.idb | 36469 | 223 | 223 | 0 |
 | daily.ign | 29 | 1 | 1 | 0 |
 | daily.ign2 | 571 | 23 | 23 | 0 |
-| daily.ldb | 76863804 | 273589 | 273450 | 139 |
+| daily.ldb | 76863804 | 273589 | 273460 | 129 |
 | daily.ldu | 3528282 | 10166 | 10161 | 5 |
 | daily.mdb | 744257 | 11575 | 11575 | 0 |
 | daily.mdu | 19999 | 315 | 315 | 0 |
@@ -101,24 +103,19 @@ Lines are non-blank, non-comment lines; rejected lines are listed by reason belo
 | main.fp | 27584 | 513 | 513 | 0 |
 | main.hdb | 1301813 | 20425 | 20425 | 0 |
 | main.hsb | 32993092 | 466838 | 466838 | 0 |
-| main.ldb | 11584977 | 38721 | 38578 | 143 |
+| main.ldb | 11584977 | 38721 | 38583 | 138 |
 | main.mdb | 166681400 | 2658972 | 2658972 | 0 |
 | main.msb | 92 | 1 | 1 | 0 |
 | main.ndb | 23714801 | 101587 | 101587 | 0 |
 | main.sfp | 87 | 1 | 1 | 0 |
-| **total** | 323783041 | 3643679 | 3643359 | 320 |
+| **total** | 323783041 | 3643679 | 3643374 | 305 |
 
 Rejections:
 
 - daily.cdb: 1 regex_unsupported
 - daily.ftm: 10 bad_offset
 - daily.ftm: 4 unknown_file_type
-- daily.ldb: 3 hex_bad_range
-- daily.ldb: 2 hex_bad_alternation
-- daily.ldb: 1 bad_modifier
 - daily.ldb: 3 version_info_unsupported
-- daily.ldb: 2 bad_expression
-- daily.ldb: 2 bad_pcre
 - daily.ldb: 111 fuzzy_image_unsupported
 - daily.ldb: 3 handler_type_unsupported
 - daily.ldb: 5 regex_syntax
@@ -127,10 +124,7 @@ Rejections:
 - daily.ldu: 1 handler_type_unsupported
 - daily.ldu: 3 regex_unsupported
 - main.cdb: 18 regex_unsupported
-- main.ldb: 1 hex_bad_range
-- main.ldb: 2 hex_too_complex
 - main.ldb: 7 version_info_unsupported
-- main.ldb: 2 bad_expression
 - main.ldb: 80 icon_unsupported
 - main.ldb: 8 handler_type_unsupported
 - main.ldb: 36 regex_syntax
@@ -175,30 +169,30 @@ Longest fixed run per hex subsig (bytes: subsigs, 64 means 64 or more): 2: 32, 3
 
 ## Logical signatures (.ldb, .ldu)
 
-Signatures: 322189. Hex subsignatures: 1511775, compiled into 1517081 variants (0 do not expand and are listed in the coverage report).
+Signatures: 322204. Hex subsignatures: 1511835, compiled into 1517157 variants (0 do not expand and are listed in the coverage report).
 
-By target type: any 2993, PE 306300, OLE2 5196, HTML 394, mail 176, graphics 6, ELF 4062, ASCII 773, Mach-O 2047, PDF 121, Flash 93, Java 28.
+By target type: any 2997, PE 306304, OLE2 5198, HTML 395, mail 176, graphics 6, ELF 4064, ASCII 775, Mach-O 2047, PDF 121, Flash 93, Java 28.
 
-Hex subsignatures by offset kind: any (*) 1508231, absolute 3187, EOF-n 25, EP+n 264, Sx+n 45, SEx 23.
+Hex subsignatures by offset kind: any (*) 1508285, absolute 3193, EOF-n 25, EP+n 264, Sx+n 45, SEx 23.
 
 | tier | longest fixed run | hex subsigs | share |
 |---|---|---:|---:|
-| A | 11+ | 866553 | 57.32% |
-| B | 7-10 | 252475 | 16.70% |
-| C | 4-6 | 390227 | 25.81% |
-| D | 0-3 | 2520 | 0.17% |
+| A | 11+ | 866601 | 57.32% |
+| B | 7-10 | 252477 | 16.70% |
+| C | 4-6 | 390236 | 25.81% |
+| D | 0-3 | 2521 | 0.17% |
 
-Tier D: 2048 anchorable (fixed offset), 2174 in a signature that also has a tier A-C hex subsig (deferrable candidates).
+Tier D: 2048 anchorable (fixed offset), 2175 in a signature that also has a tier A-C hex subsig (deferrable candidates).
 
-Signatures by their best hex subsig: A 254397, B 60245, C 7230, D 317.
+Signatures by their best hex subsig: A 254410, B 60245, C 7232, D 317.
 
-Modifiers: nocase 111601, wide 132198, ascii 1676, fullword 346.
+Modifiers: nocase 111608, wide 132201, ascii 1676, fullword 346.
 
-PCRE subsigs: 1157 in 1135 signatures. Byte-compare subsigs: 1.
+PCRE subsigs: 1159 in 1137 signatures. Byte-compare subsigs: 1.
 
-Subsigs per signature (count: signatures): 1: 1545, 2: 1804, 3: 110896, 4: 1366, 5: 190441, 6: 4291, 7: 315, 8: 1086, 9: 497, 10: 570, 11: 549, 12: 645, 13: 355, 14: 325, 15: 245, 16: 188, 17: 241, 18: 185, 19: 155, 20: 6415, 21: 6, 22: 23, 23: 2, 24: 5, 25: 3, 26: 3, 27: 1, 28: 4, 29: 2, 30: 2, 31: 1, 33: 2, 34: 2, 35: 1, 39: 1, 41: 1, 42: 2, 47: 1, 50: 9, 56: 1, 60: 1, 63: 1, 64: 1.
+Subsigs per signature (count: signatures): 1: 1545, 2: 1810, 3: 110898, 4: 1367, 5: 190443, 6: 4293, 7: 315, 8: 1086, 9: 499, 10: 570, 11: 549, 12: 645, 13: 355, 14: 325, 15: 245, 16: 188, 17: 241, 18: 185, 19: 155, 20: 6415, 21: 6, 22: 23, 23: 2, 24: 5, 25: 3, 26: 3, 27: 1, 28: 4, 29: 2, 30: 2, 31: 1, 33: 2, 34: 2, 35: 1, 39: 1, 41: 1, 42: 2, 47: 1, 50: 9, 56: 1, 60: 1, 63: 1, 64: 1.
 
-Longest fixed run per hex subsig (bytes: subsigs, 64 means 64 or more): 2: 2141, 3: 379, 4: 1188, 5: 2407, 6: 386632, 7: 128265, 8: 58764, 9: 38626, 10: 26820, 11: 28928, 12: 21671, 13: 19577, 14: 15116, 15: 13009, 16: 289820, 17: 9831, 18: 119535, 19: 7736, 20: 13586, 21: 5828, 22: 9014, 23: 4924, 24: 9565, 25: 4201, 26: 7153, 27: 3219, 28: 7669, 29: 2844, 30: 9715, 31: 5097, 32: 8764, 33: 4674, 34: 6367, 35: 4012, 36: 5636, 37: 3916, 38: 4805, 39: 4306, 40: 5102, 41: 2643, 42: 3917, 43: 2758, 44: 3299, 45: 2656, 46: 3335, 47: 2278, 48: 3121, 49: 2129, 50: 2830, 51: 1768, 52: 2854, 53: 1827, 54: 2318, 55: 1749, 56: 2539, 57: 1697, 58: 2208, 59: 2171, 60: 2501, 61: 1948, 62: 2812, 63: 1670, 64: 153905.
+Longest fixed run per hex subsig (bytes: subsigs, 64 means 64 or more): 2: 2141, 3: 380, 4: 1195, 5: 2408, 6: 386633, 7: 128265, 8: 58765, 9: 38626, 10: 26821, 11: 28932, 12: 21673, 13: 19580, 14: 15119, 15: 13010, 16: 289823, 17: 9836, 18: 119540, 19: 7738, 20: 13591, 21: 5828, 22: 9017, 23: 4925, 24: 9565, 25: 4201, 26: 7153, 27: 3220, 28: 7669, 29: 2844, 30: 9716, 31: 5098, 32: 8764, 33: 4674, 34: 6367, 35: 4013, 36: 5636, 37: 3916, 38: 4806, 39: 4306, 40: 5102, 41: 2643, 42: 3917, 43: 2758, 44: 3299, 45: 2656, 46: 3336, 47: 2278, 48: 3121, 49: 2130, 50: 2830, 51: 1768, 52: 2854, 53: 1827, 54: 2318, 55: 1749, 56: 2539, 57: 1697, 58: 2208, 59: 2171, 60: 2501, 61: 1948, 62: 2812, 63: 1671, 64: 153908.
 
 ## Other signature kinds
 
@@ -207,9 +201,8 @@ Longest fixed run per hex subsig (bytes: subsigs, 64 means 64 or more): 2: 2141,
 
 ## Signature names
 
-- names: 3641273, distinct: 3641250, distinct name bytes: 85724848
-- current tokeniser (`Family-N-R` only): 762489 tokenised (20.94%), 2905608 distinct families, 65005992 family bytes, 0 round-trip failures
-- `Family-N` or `Family-N-R`, canonical decimals: 2878772 `Family-N` and 762489 `Family-N-R` (100.00%), 308730 distinct families, 5795254 family bytes, largest N 10060800
+- names: 3641288, distinct: 3641265, distinct name bytes: 85725295
+- `ir.NameTokens` (`Family-N` or `Family-N-R`, canonical decimals): 2878777 `Family-N` and 762499 `Family-N-R` (100.00%), 308737 distinct families, 5795410 family bytes, largest N 10060800, 0 round-trip failures
 
 ## Functionality levels
 
@@ -219,6 +212,6 @@ The engine declares level 220; a rule is out of range when its minimum is above 
 |---|---:|---:|---:|---:|---|
 | hash | 3212898 | 521412 | 0 | 0 | 0: 2691486, 73: 521346, 74: 15, 81: 2, 90: 49 |
 | ndb | 106070 | 900 | 184 | 161 | 0: 105170, 17: 166, 18: 18, 19: 7, 20: 7, 21: 3, 25: 38, 26: 2, 27: 102, 30: 2, 32: 60, 38: 264, 43: 1, 48: 1, 49: 1, 51: 22, 55: 2, 58: 1, 65: 2, 70: 41, 71: 2, 73: 82, 74: 55, 76: 1, 78: 5, 81: 5, 82: 5, 90: 5 |
-| ldb | 322189 | 321624 | 321624 | 0 | 0: 565, 51: 150140, 52: 1, 53: 10, 54: 248, 55: 257, 58: 1, 65: 2, 70: 101, 71: 67, 73: 55, 74: 26, 77: 1, 78: 1, 79: 327, 80: 1, 81: 93131, 82: 5, 83: 109, 84: 1, 85: 2, 86: 3, 90: 2434, 91: 87, 92: 7, 95: 19, 96: 50, 100: 4, 106: 74188, 121: 6, 151: 340 |
+| ldb | 322204 | 321638 | 321638 | 0 | 0: 566, 51: 150144, 52: 1, 53: 10, 54: 248, 55: 257, 58: 1, 65: 2, 70: 103, 71: 67, 73: 55, 74: 26, 77: 1, 78: 1, 79: 327, 80: 1, 81: 93133, 82: 5, 83: 109, 84: 1, 85: 2, 86: 3, 90: 2440, 91: 87, 92: 7, 95: 19, 96: 50, 100: 4, 106: 74188, 121: 6, 151: 340 |
 | ftm | 254 | 155 | 12 | 12 | 0: 99, 30: 1, 45: 10, 46: 1, 47: 1, 51: 1, 55: 3, 71: 3, 74: 1, 75: 7, 76: 1, 77: 3, 78: 1, 79: 1, 80: 5, 81: 3, 82: 3, 83: 3, 84: 1, 90: 3, 100: 1, 115: 1, 120: 1, 122: 5, 200: 1, 210: 94 |
 | cdb | 116 | 0 | 0 | 0 | 0: 116 |
