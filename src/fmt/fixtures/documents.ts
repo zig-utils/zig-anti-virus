@@ -555,6 +555,161 @@ function rtfHex(d: Uint8Array): string {
 }
 
 // ---------------------------------------------------------------------------------------------
+// 7z (7zFormat.txt), with coder streams from liblzma (Python's lzma, raw mode), zlib and bz2.
+
+function num7(v: number): number[] {
+  // The first byte's leading 1 bits count the extra little-endian bytes.
+  for (let n = 0; n < 8; n++) {
+    if (v < 2 ** (7 * (n + 1))) {
+      const bytes: number[] = []
+      let x = v
+      for (let k = 0; k < n; k++) {
+        bytes.push(x % 256)
+        x = Math.floor(x / 256)
+      }
+      const mask = (0xff << (8 - n)) & 0xff
+      return [mask | x, ...bytes]
+    }
+  }
+  const out = [0xff]
+  let x = v
+  for (let k = 0; k < 8; k++) {
+    out.push(x % 256)
+    x = Math.floor(x / 256)
+  }
+  return out
+}
+function u64le(v: number): number[] {
+  const o: number[] = []
+  let x = v
+  for (let k = 0; k < 8; k++) {
+    o.push(x % 256)
+    x = Math.floor(x / 256)
+  }
+  return o
+}
+interface Coder7 { id: number[], props?: Uint8Array }
+interface Folder7 {
+  /** Coders from the folder's main output down to the packed stream; each feeds the one before. */
+  coders: Coder7[]
+  packed: Uint8Array
+  /** Unpacked size of each coder's output, in the same order. */
+  sizes: number[]
+  /** Sizes of the files in this folder. */
+  files: number[]
+}
+function streamsInfo(packPos: number, folders: Folder7[]): number[] {
+  const h: number[] = [0x06, ...num7(packPos), ...num7(folders.length), 0x09]
+  for (const f of folders) h.push(...num7(f.packed.length))
+  h.push(0x00, 0x07, 0x0b, ...num7(folders.length), 0x00)
+  for (const f of folders) {
+    h.push(...num7(f.coders.length))
+    for (const c of f.coders) {
+      h.push(c.id.length | (c.props ? 0x20 : 0), ...c.id)
+      if (c.props) h.push(...num7(c.props.length), ...c.props)
+    }
+    // Coder k's input is bound to coder k+1's output.
+    for (let k = 0; k + 1 < f.coders.length; k++) h.push(...num7(k), ...num7(k + 1))
+  }
+  h.push(0x0c)
+  for (const f of folders) for (const s of f.sizes) h.push(...num7(s))
+  h.push(0x00, 0x08, 0x0d)
+  for (const f of folders) h.push(...num7(f.files.length))
+  h.push(0x09)
+  for (const f of folders) for (const s of f.files.slice(0, -1)) h.push(...num7(s))
+  h.push(0x00, 0x00)
+  return h
+}
+interface File7 { name: string, empty?: boolean }
+function sevenZip(folders: Folder7[], files: File7[], o: { encodeHeader?: boolean, corruptHeaderCrc?: boolean } = {}): Uint8Array {
+  const packed = concat(...folders.map(f => f.packed))
+  const h: number[] = [0x01, 0x04, ...streamsInfo(0, folders), 0x05, ...num7(files.length)]
+  if (files.some(f => f.empty)) {
+    const bits = new Uint8Array(Math.ceil(files.length / 8))
+    files.forEach((f, i) => {
+      if (f.empty) bits[i >> 3] |= 0x80 >> (i & 7)
+    })
+    h.push(0x0e, ...num7(bits.length), ...bits)
+  }
+  const names = concat(new Uint8Array([0]), ...files.map(f => {
+    const b = new Uint8Array((f.name.length + 1) * 2)
+    for (let i = 0; i < f.name.length; i++) new DataView(b.buffer).setUint16(i * 2, f.name.charCodeAt(i), true)
+    return b
+  }))
+  h.push(0x11, ...num7(names.length), ...names, 0x00, 0x00)
+  let header = new Uint8Array(h)
+  let extra = new Uint8Array(0)
+  if (o.encodeHeader) {
+    const enc = lzmaRaw(header)
+    extra = enc.data
+    header = new Uint8Array([0x17, ...streamsInfo(packed.length, [{ coders: [{ id: [3, 1, 1], props: enc.props }], packed: enc.data, sizes: [header.length], files: [header.length] }])])
+  }
+  const body = concat(packed, extra)
+  const start = new Uint8Array(20)
+  start.set(u64le(body.length), 0)
+  start.set(u64le(header.length), 8)
+  start.set(u32le(crc32(header)), 16)
+  const sig = concat(latin1('7z\xbc\xaf\x27\x1c'), new Uint8Array([0, 4]), u32le(crc32(start)), start)
+  return concat(sig, body, header)
+}
+function lzmaRaw(d: Uint8Array): { data: Uint8Array, props: Uint8Array } {
+  const data = py('sys.stdout.buffer.write(lzma.compress(data, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA1, "dict_size": 1 << 16, "lc": 3, "lp": 0, "pb": 2}]))', d)
+  return { data, props: concat(new Uint8Array([93]), u32le(1 << 16)) }
+}
+function lzma2Raw(d: Uint8Array, bcj = false): Uint8Array {
+  const filters = `${bcj ? '{"id": lzma.FILTER_X86}, ' : ''}{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 16}`
+  return py(`sys.stdout.buffer.write(lzma.compress(data, format=lzma.FORMAT_RAW, filters=[${filters}]))`, d)
+}
+{
+  const a = concat(enc.encode('first member\n'))
+  const b = concat(enc.encode('second '.repeat(500)), eicar)
+  // x86-like code: calls and jumps with nearby targets among other bytes.
+  const code = new Uint8Array(6000)
+  let seed = 7
+  for (let i = 0; i < code.length; i++) {
+    seed = (seed * 1103515245 + 12345) >>> 0
+    code[i] = seed >>> 24
+    if (i % 37 === 0 && i + 5 < code.length) {
+      code[i] = i % 2 ? 0xe8 : 0xe9
+      new DataView(code.buffer).setInt32(i + 1, ((seed >>> 8) % 4000) - 2000, true)
+      i += 4
+    }
+  }
+  const lz = lzmaRaw(eicar)
+  doc('lzma.7z', sevenZip([{ coders: [{ id: [3, 1, 1], props: lz.props }], packed: lz.data, sizes: [eicar.length], files: [eicar.length] }], [{ name: 'eicar.com' }]), [
+    { path: 'eicar.com', data: eicar },
+  ])
+  // A solid LZMA2 folder of three files, plus an empty file and a directory.
+  const solid = concat(a, b, eicar)
+  doc('solid.7z', sevenZip([{ coders: [{ id: [0x21], props: new Uint8Array([8]) }], packed: lzma2Raw(solid), sizes: [solid.length], files: [a.length, b.length, eicar.length] }], [
+    { name: 'dir', empty: true },
+    { name: 'dir\\a.txt' },
+    { name: 'empty.txt', empty: true },
+    { name: 'b.txt' },
+    { name: 'eicar.com' },
+  ], { encodeHeader: true }), [
+    { path: 'dir/a.txt', data: a },
+    { path: 'b.txt', data: b },
+    { path: 'eicar.com', data: eicar },
+  ])
+  // BCJ x86 over LZMA2, then Deflate, BZip2 and Copy folders.
+  const bz = py('import bz2\nsys.stdout.buffer.write(bz2.compress(data, 9))', b)
+  doc('coders.7z', sevenZip([
+    { coders: [{ id: [3, 3, 1, 3] }, { id: [0x21], props: new Uint8Array([8]) }], packed: lzma2Raw(code, true), sizes: [code.length, code.length], files: [code.length] },
+    { coders: [{ id: [4, 1, 8] }], packed: new Uint8Array(zlib.deflateRawSync(b)), sizes: [b.length], files: [b.length] },
+    { coders: [{ id: [4, 2, 2] }], packed: bz, sizes: [b.length], files: [b.length] },
+    { coders: [{ id: [0] }], packed: eicar, sizes: [eicar.length], files: [eicar.length] },
+  ], [{ name: 'code.bin' }, { name: 'deflate.txt' }, { name: 'bzip2.txt' }, { name: 'stored.com' }]), [
+    { path: 'code.bin', data: code },
+    { path: 'deflate.txt', data: b },
+    { path: 'bzip2.txt', data: b },
+    { path: 'stored.com', data: eicar },
+  ])
+  // AES-256: reported, not decrypted.
+  doc('encrypted.7z', sevenZip([{ coders: [{ id: [0x21], props: new Uint8Array([8]) }, { id: [6, 0xf1, 7, 1], props: new Uint8Array([0x13, 0x07]) }], packed: new Uint8Array(64).fill(0x5a), sizes: [eicar.length, 64], files: [eicar.length] }], [{ name: 'secret.com' }]), [], ['encrypted'])
+}
+
+// ---------------------------------------------------------------------------------------------
 // docs.zig
 
 const lines = [

@@ -65,4 +65,19 @@ pub const docs = [_]Doc{
         .{ .path = "objdata/0", .len = 68, .crc = 0x6851cf3c },
         .{ .path = "objdata/1", .len = 68, .crc = 0x6851cf3c },
     } },
+    .{ .name = "lzma.7z", .bytes = @embedFile("docs/lzma.7z.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "solid.7z", .bytes = @embedFile("docs/solid.7z.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "dir/a.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "b.txt", .len = 3568, .crc = 0xcc653372 },
+        .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "coders.7z", .bytes = @embedFile("docs/coders.7z.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "code.bin", .len = 6000, .crc = 0x5b283a8e },
+        .{ .path = "deflate.txt", .len = 3568, .crc = 0xcc653372 },
+        .{ .path = "bzip2.txt", .len = 3568, .crc = 0xcc653372 },
+        .{ .path = "stored.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "encrypted.7z", .bytes = @embedFile("docs/encrypted.7z.bin"), .notices = &.{"encrypted"}, .members = &.{} },
 };

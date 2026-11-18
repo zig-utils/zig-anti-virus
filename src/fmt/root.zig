@@ -37,6 +37,8 @@ pub const collect = @import("collect.zig");
 pub const pdf = @import("pdf.zig");
 pub const js_norm = @import("js_norm.zig");
 pub const rtf = @import("rtf.zig");
+pub const sevenzip = @import("sevenzip.zig");
+pub const bcj = @import("bcj.zig");
 pub const pdf_filter = @import("pdf_filter.zig");
 pub const pdf_crypt = @import("pdf_crypt.zig");
 /// Reference vectors (tests, fuzzing, benchmarks).
@@ -81,6 +83,8 @@ test {
     _ = pdf;
     _ = js_norm;
     _ = rtf;
+    _ = sevenzip;
+    _ = bcj;
     _ = pdf_filter;
     _ = pdf_crypt;
     _ = @import("adversarial.zig");

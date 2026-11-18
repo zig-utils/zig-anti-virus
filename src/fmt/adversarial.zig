@@ -318,3 +318,78 @@ test "pathological RTF stays linear" {
         try run(.{ .name = "a.rtf", .bytes = buf, .expect = c[1], .max_ms = 10_000, .lim = tight });
     }
 }
+
+/// A 7z archive of one folder (`coder` id, packed bytes) holding `files` files of the given
+/// sizes, built from 7zFormat.txt.
+fn sevenZip(gpa: std.mem.Allocator, coder: []const u8, packed_bytes: []const u8, unpack: u64, sizes: []const u64) ![]u8 {
+    var h: std.ArrayList(u8) = .empty;
+    defer h.deinit(gpa);
+    const num = struct {
+        fn put(l: *std.ArrayList(u8), g: std.mem.Allocator, v: u64) !void {
+            // Always the 9-byte form: simple and valid.
+            try l.append(g, 0xff);
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, v, .little);
+            try l.appendSlice(g, &b);
+        }
+    }.put;
+    try h.appendSlice(gpa, &.{ 0x01, 0x04, 0x06 });
+    try num(&h, gpa, 0);
+    try num(&h, gpa, 1);
+    try h.append(gpa, 0x09);
+    try num(&h, gpa, packed_bytes.len);
+    try h.appendSlice(gpa, &.{ 0x00, 0x07, 0x0b });
+    try num(&h, gpa, 1);
+    try h.append(gpa, 0);
+    try num(&h, gpa, 1);
+    try h.append(gpa, @intCast(coder.len));
+    try h.appendSlice(gpa, coder);
+    try h.append(gpa, 0x0c);
+    try num(&h, gpa, unpack);
+    try h.appendSlice(gpa, &.{ 0x00, 0x08, 0x0d });
+    try num(&h, gpa, sizes.len);
+    try h.append(gpa, 0x09);
+    for (sizes[0 .. sizes.len - 1]) |s| try num(&h, gpa, s);
+    try h.appendSlice(gpa, &.{ 0x00, 0x00, 0x00 });
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "7z\xbc\xaf\x27\x1c\x00\x04\x00\x00\x00\x00");
+    var tail: [16]u8 = undefined;
+    std.mem.writeInt(u64, tail[0..8], packed_bytes.len, .little);
+    std.mem.writeInt(u64, tail[8..16], h.items.len, .little);
+    try out.appendSlice(gpa, &tail);
+    try out.appendSlice(gpa, "\x00\x00\x00\x00");
+    try out.appendSlice(gpa, packed_bytes);
+    try out.appendSlice(gpa, h.items);
+    return out.toOwnedSlice(gpa);
+}
+
+test "pathological 7z archives stay within bounds" {
+    const gpa = std.testing.allocator;
+    // A Deflate bomb: 64 MiB of zeros in one file.
+    {
+        const z = try zlibZeros(gpa, 64 * 1024 * 1024);
+        defer gpa.free(z);
+        const a = try sevenZip(gpa, "\x04\x01\x08", z[2..], 64 * 1024 * 1024, &.{64 * 1024 * 1024});
+        defer gpa.free(a);
+        try run(.{ .name = "bomb.7z", .bytes = a, .expect = .{ .limit = .ratio }, .max_ms = 10_000, .lim = tight });
+    }
+    // 5000 one-byte files in one stored folder: MaxFiles (2000 here).
+    {
+        const data = try gpa.alloc(u8, 5000);
+        defer gpa.free(data);
+        @memset(data, 'x');
+        const sizes = try gpa.alloc(u64, 5000);
+        defer gpa.free(sizes);
+        @memset(sizes, 1);
+        const a = try sevenZip(gpa, "\x00", data, 5000, sizes);
+        defer gpa.free(a);
+        try run(.{ .name = "many.7z", .bytes = a, .expect = .{ .limit = .files }, .max_ms = 10_000, .lim = tight });
+    }
+    // Sizes that claim far more than the folder holds.
+    {
+        const a = try sevenZip(gpa, "\x00", "abc", 1 << 40, &.{ 1 << 39, 1 << 39 });
+        defer gpa.free(a);
+        try run(.{ .name = "lies.7z", .bytes = a, .expect = .nothing, .max_ms = 5_000, .lim = tight });
+    }
+}
