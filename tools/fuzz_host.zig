@@ -8,6 +8,7 @@ const Target = struct { name: []const u8, run: *const fn (std.mem.Allocator, std
 const targets = [_]Target{
     .{ .name = "hostPackages", .run = hostPackages },
     .{ .name = "hostProcfs", .run = hostProcfs },
+    .{ .name = "hostNetwork", .run = hostNetwork },
 };
 
 /// Run every target whose name contains `only` (all when empty); returns the case count.
@@ -112,4 +113,24 @@ pub fn hostProcfs(gpa: std.mem.Allocator, random: std.Random) !void {
     _ = process.minerEvidence(p);
     _ = process.exeRisk(input);
     _ = zav.host.tokens.commandRisk(input);
+}
+
+/// /proc/net lines and netlink sock_diag replies.
+pub fn hostNetwork(gpa: std.mem.Allocator, random: std.Random) !void {
+    const network = zav.host.linux.network;
+    var buf: [512]u8 = undefined;
+    const seeds = [_][]const u8{
+        "   0: 0100007F:0CEA 0200007F:A2D2 01 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 20 4 30 10 -1",
+        "   1: 00000000000000000000000001000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 999 1",
+    };
+    const line = mutateCopy(random, &buf, seeds[random.uintLessThan(usize, seeds.len)]);
+    _ = network.parseInetLine(.tcp, line);
+    _ = network.socketInode(line);
+    var msg: [256]u8 align(4) = @splat(0);
+    random.bytes(msg[0..random.uintLessThan(usize, msg.len)]);
+    if (random.boolean()) std.mem.writeInt(u32, msg[0..4], 16 + 72, .little);
+    var out: std.ArrayList(u64) = .empty;
+    defer out.deinit(gpa);
+    var done = false;
+    network.parseDiag(gpa, msg[0..random.uintLessThan(usize, msg.len + 1)], &out, &done) catch |e| if (e == error.OutOfMemory) return e;
 }
