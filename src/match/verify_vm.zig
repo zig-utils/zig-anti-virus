@@ -103,8 +103,18 @@ const unknown = std.math.maxInt(usize);
 /// at a position does not depend on the rest of the chain, so this stays true for every later
 /// candidate and keeps unbounded-gap signatures linear over a file.
 pub const Memo = struct {
-    dead_from: [max_parts]usize = @splat(unknown),
-    dead_upto: [max_parts]usize = @splat(unknown),
+    dead_from: [max_parts]usize = undefined,
+    dead_upto: [max_parts]usize = undefined,
+    /// Entries below this are initialised.
+    parts: usize = 0,
+
+    /// Forget everything and size the memo for a program with `part_count` parts. Only the
+    /// entries in use are touched, so a one-part program pays nothing.
+    pub fn prepare(m: *Memo, part_count: usize) void {
+        @memset(m.dead_from[0..part_count], unknown);
+        @memset(m.dead_upto[0..part_count], unknown);
+        m.parts = part_count;
+    }
 };
 
 const Vm = struct {
@@ -511,12 +521,14 @@ const Vm = struct {
 /// Verify a candidate: the program's anchor part starting at `anchor_start`.
 pub fn verify(p: prog.Program, data: []const u8, window: Window, anchor_start: usize, budget: *Budget) Error!?Match {
     var memo: Memo = .{};
+    memo.prepare(p.header.part_count);
     return verifyMemo(p, data, window, anchor_start, budget, &memo);
 }
 
 /// `verify` sharing what earlier calls on the same program and data learned.
 pub fn verifyMemo(p: prog.Program, data: []const u8, window: Window, anchor_start: usize, budget: *Budget, memo: *Memo) Error!?Match {
     if (anchor_start > data.len) return null;
+    std.debug.assert(memo.parts == p.header.part_count);
     var vm = Vm.init(p, data, window, budget, memo);
     const a = p.header.anchor_part;
     try vm.step();
@@ -539,6 +551,7 @@ pub const Scanner = struct {
 
     pub fn init(p: prog.Program, data: []const u8, info: FileInfo, budget: *Budget) Scanner {
         var s: Scanner = .{ .program = p, .data = data, .window = startWindow(p.offset(), info), .budget = budget };
+        s.memo.prepare(p.header.part_count);
         if (s.window) |w| {
             // The anchor part cannot start before the match does.
             if (p.header.anchor_part == 0) {

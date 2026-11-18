@@ -4,9 +4,11 @@
 pub const hashidx = @import("hashidx.zig");
 pub const prog = @import("prog.zig");
 pub const verify_vm = @import("verify_vm.zig");
+pub const anchored = @import("anchored.zig");
 
 test {
     _ = hashidx;
     _ = prog;
     _ = verify_vm;
+    _ = anchored;
 }

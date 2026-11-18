@@ -16,7 +16,9 @@ pub const Input = struct {
 pub const Anchor = struct { part: u8 = 0, op: u16 = prog.no_anchor, delta: u16 = prog.no_anchor };
 
 /// The longest literal with a fixed distance from its part's start (the earliest on ties).
-pub fn chooseAnchor(p: ir.Pattern) Anchor {
+/// Programs with an offset are verified from where the match starts, so `part0_only` keeps
+/// their anchor in the first part.
+pub fn chooseAnchor(p: ir.Pattern, part0_only: bool) Anchor {
     var best: Anchor = .{};
     var best_len: u16 = 0;
     var part: usize = 0;
@@ -24,6 +26,7 @@ pub fn chooseAnchor(p: ir.Pattern) Anchor {
     for (p.ops, 0..) |o, i| {
         switch (o.code) {
             .part_end => {
+                if (part0_only) break;
                 part += 1;
                 delta = 0;
                 continue;
@@ -68,7 +71,7 @@ pub fn build(gpa: std.mem.Allocator, inputs: []const Input) ![]u8 {
     for (inputs, 0..) |in, i| {
         while (out.items.len % 4 != 0) try out.append(gpa, 0);
         std.mem.writeInt(u32, out.items[@sizeOf(prog.SectionHeader) + i * 4 ..][0..4], @intCast(out.items.len), .little);
-        const anchor = chooseAnchor(in.pattern);
+        const anchor = chooseAnchor(in.pattern, in.offset.kind != .any);
         const h: prog.ProgHeader = .{
             .sig = in.sig,
             .subsig = in.subsig,
@@ -101,13 +104,14 @@ test "anchors prefer the longest fixed-distance literal" {
     defer arena.deinit();
     var diag: hexsig.Diag = .{};
     const p = try hexsig.parse(arena.allocator(), "aa??bbcc*dd(ee|ffff)112233445566", &diag);
-    const a = chooseAnchor(p);
+    const a = chooseAnchor(p, false);
     // After the variable-length alternation the distance is unknown: "112233.." cannot anchor.
     try testing.expectEqual(@as(u8, 0), a.part);
     try testing.expectEqual(@as(u16, 2), a.op);
     try testing.expectEqual(@as(u16, 2), a.delta);
     const q = try hexsig.parse(arena.allocator(), "aa*bb(cc|dd)11223344", &diag);
-    const b = chooseAnchor(q);
+    const b = chooseAnchor(q, false);
+    try testing.expectEqual(@as(u8, 0), chooseAnchor(q, true).part);
     try testing.expectEqual(@as(u8, 1), b.part);
     try testing.expectEqual(@as(u16, 2), b.delta);
     try testing.expectEqual(@as(u32, 7), minLen(q));

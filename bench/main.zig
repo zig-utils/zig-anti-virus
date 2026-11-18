@@ -18,6 +18,63 @@ fn hashLookup() void {
     if (lookup_table.lookup(1000 + (lookup_i % 4096), d)) |sig| sink +%= sig;
 }
 
+var anchored_index: zav.match.anchored.Index = undefined;
+var anchored_programs: zav.match.prog.Programs = undefined;
+var anchored_file: [4096]u8 = undefined;
+var anchored_sections: [4]zav.match.verify_vm.Section = undefined;
+
+fn countHit(n: *u64, hit: zav.match.anchored.Hit) bool {
+    n.* +%= hit.prog;
+    return true;
+}
+
+/// One file through an anchored index of 20k EP, absolute, EOF and section signatures (P4.07).
+fn anchoredScan() void {
+    var budget: zav.match.verify_vm.Budget = .{};
+    const info: zav.match.verify_vm.FileInfo = .{ .size = anchored_file.len, .entry_point = 1024, .sections = &anchored_sections };
+    zav.match.anchored.scan(anchored_index, anchored_programs, &anchored_file, info, &budget, &sink, countHit) catch unreachable;
+}
+
+fn buildAnchored(gpa: std.mem.Allocator, random: std.Random) !void {
+    const zc = zav.compile;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    const a = arena.allocator();
+    var inputs: std.ArrayList(zc.prog_build.Input) = .empty;
+    const kinds = [_]zc.ir.Offset{
+        .{ .kind = .entry_point, .a = 0 },
+        .{ .kind = .entry_point, .a = 16 },
+        .{ .kind = .absolute, .a = 0 },
+        .{ .kind = .eof_minus, .a = 64 },
+        .{ .kind = .section_start, .section = 1, .a = 0 },
+        .{ .kind = .last_section, .a = 8 },
+    };
+    for (0..20_000) |i| {
+        var hex: [16]u8 = undefined;
+        var raw: [8]u8 = undefined;
+        random.bytes(&raw);
+        _ = std.fmt.bufPrint(&hex, "{x}", .{raw}) catch unreachable;
+        var diag: zc.hexsig.Diag = .{};
+        const off = kinds[i % kinds.len];
+        try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, &hex, &diag), .target = 1, .offset = off, .sig = @intCast(i) });
+    }
+    // A few window signatures that are verified at every start of a 16-byte window.
+    for (0..64) |i| {
+        var diag: zc.hexsig.Diag = .{};
+        try inputs.append(a, .{ .pattern = try zc.hexsig.parse(a, "e8????????5d", &diag), .target = 1, .offset = .{ .kind = .entry_point, .a = @intCast(i), .shift = 16 }, .sig = 0 });
+    }
+    const bytes = try zc.prog_build.build(a, inputs.items);
+    const pimage = try a.alignedAlloc(u8, .@"4", bytes.len);
+    @memcpy(pimage, bytes);
+    anchored_programs = try .init(pimage);
+    const section = (try zc.anchored_build.build(a, anchored_programs, 1)).?;
+    const image = try a.alignedAlloc(u8, .@"4", section.len);
+    @memcpy(image, section);
+    anchored_index = try .init(image, anchored_programs);
+    random.bytes(&anchored_file);
+    anchored_sections = .{ .{ .offset = 512, .size = 1024 }, .{ .offset = 1536, .size = 1024 }, .{ .offset = 2560, .size = 512 }, .{ .offset = 3072, .size = 1024 } };
+    // The arena lives for the whole run; the programs and index point into it.
+}
+
 /// Open and close a 200 MB database: header, signature and section-table checks only.
 fn dbOpen() void {
     const db = zav.db.reader.open(io_global, dir_global, "bench.zavdb", .{ .allow_unsigned = true }) catch unreachable;
@@ -78,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
     hash_prng.random().bytes(hash_input);
     try hashBenchmarks(init.io, &suite);
     try suite.add("hash lookup, 1M MD5 entries", hashLookup);
+    try buildAnchored(init.gpa, random);
+    try suite.add("anchored index, 20k signatures, one file", anchoredScan);
     suite.setBaseline(out_path);
     try suite.run();
     std.mem.doNotOptimizeAway(sink);

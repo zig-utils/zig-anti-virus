@@ -6,14 +6,33 @@ const std = @import("std");
 const db = @import("../db/root.zig");
 const prog = @import("../match/prog.zig");
 const vm = @import("../match/verify_vm.zig");
+const anchored = @import("../match/anchored.zig");
 const limits_mod = @import("limits.zig");
 
 pub const BodyIndex = struct {
     programs: ?prog.Programs = null,
+    /// ANCHORED_INDEX per partition (target type).
+    anchored: [15]?anchored.Index = @splat(null),
 
     pub fn load(database: db.reader.Database) !BodyIndex {
         const bytes = database.section(.subsig_prog, 0) orelse return .{};
-        return .{ .programs = try .init(bytes) };
+        var index: BodyIndex = .{ .programs = try .init(bytes) };
+        for (&index.anchored, 0..) |*slot, p| {
+            if (database.section(.anchored_index, @intCast(p))) |section| slot.* = try .init(section, index.programs.?);
+        }
+        return index;
+    }
+};
+
+const FirstHit = struct {
+    programs: prog.Programs,
+    hit: ?Detection = null,
+
+    fn take(f: *FirstHit, h: anchored.Hit) bool {
+        const p = f.programs.get(h.prog);
+        if (p.header.flags & prog.flag_ldb != 0) return true;
+        f.hit = .{ .sig = p.header.sig, .start = h.match.start, .end = h.match.end };
+        return false;
     }
 };
 
@@ -34,9 +53,18 @@ pub const Verdict = union(enum) {
 /// Scan `data` (the whole file) of ClamAV target type `target`. `budget` is per file.
 pub fn scanBuffer(index: *const BodyIndex, data: []const u8, info: vm.FileInfo, target: u8, budget: *vm.Budget, tracker: *limits_mod.Tracker) Verdict {
     const progs = index.programs orelse return .clean;
+    // Signatures pinned to an offset: direct lookups through the file's partition and type 0.
+    var first: FirstHit = .{ .programs = progs };
+    for ([_]u8{ target, 0 }, 0..) |part, n| {
+        if (n == 1 and target == 0) break;
+        const a = if (part < index.anchored.len) index.anchored[part] orelse continue else continue;
+        anchored.scan(a, progs, data, info, budget, &first, FirstHit.take) catch break;
+        if (first.hit) |d| return .{ .infected = d };
+    }
+    // Everything else is searched for.
     for (0..progs.count()) |i| {
         const p = progs.get(i);
-        if (p.header.flags & prog.flag_ldb != 0) continue;
+        if (p.header.flags & prog.flag_ldb != 0 or anchored.isAnchored(p)) continue;
         if (p.header.target != 0 and p.header.target != target) continue;
         var scanner = vm.Scanner.init(p, data, info, budget);
         const m = scanner.next() catch break;

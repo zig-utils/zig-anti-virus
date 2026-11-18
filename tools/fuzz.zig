@@ -46,6 +46,10 @@ pub fn main(init: std.process.Init) !void {
             progSection(random);
             cases += 1;
         }
+        if (selected(only, "anchoredSection")) {
+            anchoredSection(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
     }
@@ -404,6 +408,49 @@ fn progSection(random: std.Random) void {
         var s = zav.match.verify_vm.Scanner.init(progs.get(i), &data, .{ .size = data.len, .entry_point = 3 }, &budget);
         while (s.next() catch null) |_| {}
     }
+}
+
+/// ANCHORED_INDEX validation against its programs, then a scan with whatever validates.
+fn anchoredSection(random: std.Random) void {
+    const zc = zav.compile;
+    const match = zav.match;
+    var mem: [64 * 1024]u8 align(8) = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    const arena = fba.allocator();
+    var diag: zc.hexsig.Diag = .{};
+    const specs = [_]struct { []const u8, zc.ir.Offset }{
+        .{ "4d5a9000", .{ .kind = .absolute, .a = 0 } },
+        .{ "4d5a5000ff", .{ .kind = .absolute, .a = 0 } },
+        .{ "e8??0000", .{ .kind = .entry_point, .a = 0 } },
+        .{ "c3c3c3c3", .{ .kind = .entry_point, .a = 2, .shift = 3 } },
+        .{ "aa*bbcc", .{ .kind = .section_start, .section = 1, .a = 1 } },
+        .{ "50414420", .{ .kind = .eof_minus, .a = 4 } },
+    };
+    var inputs: [specs.len]zc.prog_build.Input = undefined;
+    for (specs, &inputs, 0..) |sp, *in, i| in.* = .{ .pattern = zc.hexsig.parse(arena, sp[0], &diag) catch unreachable, .target = 1, .offset = sp[1], .sig = @intCast(i) };
+    const bytes = zc.prog_build.build(arena, &inputs) catch return;
+    const pimage = arena.alignedAlloc(u8, .@"4", bytes.len) catch return;
+    @memcpy(pimage, bytes);
+    const programs = match.prog.Programs.init(pimage) catch unreachable;
+    const section = (zc.anchored_build.build(arena, programs, 1) catch return) orelse unreachable;
+    const image = arena.alignedAlloc(u8, .@"4", section.len) catch return;
+    @memcpy(image, section);
+    for (0..random.uintLessThan(usize, 6)) |_| image[random.uintLessThan(usize, image.len)] = random.int(u8);
+    const index = match.anchored.Index.init(image[0 .. random.uintAtMost(usize, image.len) & ~@as(usize, 3)], programs) catch return;
+    var data: [96]u8 = undefined;
+    random.bytes(&data);
+    const sections = [_]match.verify_vm.Section{ .{ .offset = random.uintAtMost(u64, 100), .size = random.uintAtMost(u64, 100) }, .{ .offset = random.uintAtMost(u64, 100), .size = 8 } };
+    const info: match.verify_vm.FileInfo = .{ .size = data.len, .entry_point = random.uintAtMost(u64, 120), .sections = &sections };
+    var budget: match.verify_vm.Budget = .{ .per_verify = 1000, .per_file = 10_000 };
+    const Sink = struct {
+        fn take(n: *usize, hit: match.anchored.Hit) bool {
+            _ = hit;
+            n.* += 1;
+            return true;
+        }
+    };
+    var n: usize = 0;
+    match.anchored.scan(index, programs, &data, info, &budget, &n, Sink.take) catch {};
 }
 
 /// CVD/CLD header parsing, verification and member walking over mutated containers.

@@ -11,6 +11,7 @@ const hashsig = @import("hashsig.zig");
 const hexsig = @import("hexsig.zig");
 const ndb = @import("ndb.zig");
 const prog_build = @import("prog_build.zig");
+const anchored_build = @import("anchored_build.zig");
 const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
 const coverage_mod = @import("coverage.zig");
@@ -204,8 +205,19 @@ pub const Compiler = struct {
                 try inputs.append(c.gpa, .{ .pattern = v.pattern, .offset = rule.subsig.offset, .target = rule.target, .sig = sig, .flags = flags });
             }
         }
-        const programs = try prog_build.build(c.gpa, inputs.items);
+        const programs_raw = try prog_build.build(c.gpa, inputs.items);
+        defer c.gpa.free(programs_raw);
+        const programs = try c.gpa.alignedAlloc(u8, .@"4", programs_raw.len);
         defer c.gpa.free(programs);
+        @memcpy(programs, programs_raw);
+
+        // One anchored-offset index per partition, each proven to reach all of its programs.
+        var anchored_sections: [ndb.max_target + 1]?[]u8 = @splat(null);
+        defer for (anchored_sections) |a| if (a) |bytes| c.gpa.free(bytes);
+        if (inputs.items.len > 0) {
+            const progs = try prog.Programs.init(programs);
+            for (&anchored_sections, 0..) |*slot, p| slot.* = try anchored_build.build(c.gpa, progs, @intCast(p));
+        }
         var allow = try hash_build.build(c.gpa, c.allow.items);
         defer allow.deinit();
 
@@ -222,6 +234,9 @@ pub const Compiler = struct {
             try sections.append(c.gpa, .{ .kind = .fp_tables, .variant = fp_cold_variant_offset + @as(u16, @intCast(t)), .bytes = allow.cold[t].? });
         };
         if (inputs.items.len > 0) try sections.append(c.gpa, .{ .kind = .subsig_prog, .bytes = programs });
+        for (anchored_sections, 0..) |a, p| if (a) |bytes| {
+            try sections.append(c.gpa, .{ .kind = .anchored_index, .variant = @intCast(p), .partition = @intCast(p), .hot = true, .bytes = bytes });
+        };
         try sections.append(c.gpa, .{ .kind = .coverage_report, .bytes = report.written() });
 
         var opts = options;
