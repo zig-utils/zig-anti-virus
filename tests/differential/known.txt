@@ -12,7 +12,7 @@ hex-bracket-before-far s5 zav=Diff.Bracket.Far2 Diff.Bracket.Far4 Diff.Bracket.F
 hex-negated-nibble sig1 zav=LOADS
 hex-negated-nibble sig2 zav=LOADS
 # Backreferences and lookaround need a backtracker; zav compiles only allocation-free byte-mode
-# programs and refuses them (regex_unsupported), so these signatures never load.
+# programs and refuses them (regex_backreference, regex_lookaround), so these signatures never load.
 pcre-syntax sig5 zav=REJECTS
 pcre-syntax sig6 zav=REJECTS
 # YARA: zav follows yara (tools/diff/yara_check.py checks zav against it), and libclamav's YARA

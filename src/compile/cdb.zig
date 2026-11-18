@@ -13,7 +13,21 @@ const ir = @import("ir.zig");
 const types = @import("../fmt/types.zig");
 const regex = @import("regex");
 
-pub const LineError = error{ FieldCount, EmptyName, BadCdbField, UnknownFileType, BadFlevel, RegexSyntax, RegexUnsupported, OutOfMemory };
+/// Why a regex has no zig-regex program, by construct where one is named.
+pub const RegexError = error{ RegexSyntax, RegexUnsupported, RegexBackreference, RegexLookaround, RegexAtomicGroup, RegexTooLarge };
+
+pub fn regexReason(err: RegexError) ir.Reason {
+    return switch (err) {
+        error.RegexSyntax => .regex_syntax,
+        error.RegexUnsupported => .regex_unsupported,
+        error.RegexBackreference => .regex_backreference,
+        error.RegexLookaround => .regex_lookaround,
+        error.RegexAtomicGroup => .regex_atomic_group,
+        error.RegexTooLarge => .regex_too_large,
+    };
+}
+
+pub const LineError = error{ FieldCount, EmptyName, BadCdbField, UnknownFileType, BadFlevel, OutOfMemory } || RegexError;
 
 pub fn reasonOf(err: LineError) ir.Reason {
     return switch (err) {
@@ -22,9 +36,8 @@ pub fn reasonOf(err: LineError) ir.Reason {
         error.BadCdbField => .bad_cdb_field,
         error.UnknownFileType => .unknown_file_type,
         error.BadFlevel => .bad_flevel,
-        error.RegexSyntax => .regex_syntax,
-        error.RegexUnsupported => .regex_unsupported,
         error.OutOfMemory => .hex_too_complex,
+        else => |e| regexReason(@errorCast(e)),
     };
 }
 
@@ -70,39 +83,88 @@ fn range(text: []const u8) error{BadCdbField}!?ir.Range {
 /// asked whether it matches, where both kinds agree.
 pub const MatchKind = regex.program.MatchKind;
 
-pub fn compileRegex(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
+pub fn compileRegex(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags) (RegexError || error{OutOfMemory})![]const u8 {
     return compileRegexKind(arena, pattern_in, flags, .leftmost_longest);
 }
 
-pub fn compileRegexKind(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags, kind: MatchKind) error{ RegexSyntax, RegexUnsupported, OutOfMemory }![]const u8 {
+pub fn compileRegexKind(arena: std.mem.Allocator, pattern_in: []const u8, flags: regex.common.CompileFlags, kind: MatchKind) (RegexError || error{OutOfMemory})![]const u8 {
     var f = flags;
     f.bytes = true;
-    // A leading option setting such as `(?i)` or `(?si)` applies to the whole pattern in PCRE
-    // (and in libclamav's filename regexes), so it is the compile flag; zig-regex's programs
-    // refuse inline modifiers anywhere else.
-    var pattern = pattern_in;
-    if (std.mem.startsWith(u8, pattern, "(?")) {
-        var i: usize = 2;
-        var lead = f;
-        while (i < pattern.len) : (i += 1) switch (pattern[i]) {
-            'i' => lead.case_insensitive = true,
-            's' => lead.dot_all = true,
-            'm' => lead.multiline = true,
-            'x' => lead.extended = true,
-            else => break,
-        };
-        if (i > 2 and i < pattern.len and pattern[i] == ')') {
-            f = lead;
-            pattern = pattern[i + 1 ..];
-        }
-    }
+    // Inline option settings (`(?i)`, `(?s:...)`, mid-pattern too) are zig-regex's own since
+    // 0.4.1, with PCRE2's scoping: a standalone one lasts to the end of its group.
+    const pattern = pattern_in;
     const program = regex.Program.compileWithOptions(arena, pattern, f, .{ .match_kind = kind }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.UnsupportedByProgram, error.ProgramTooLarge => error.RegexUnsupported,
-        else => error.RegexSyntax,
+        error.ProgramTooLarge => error.RegexTooLarge,
+        // Name the construct that needs the backtracker, whichever way zig-regex refused it
+        // (an atomic group is still a syntax error to its parser).
+        else => |e| switch (construct(pattern)) {
+            .backreference => error.RegexBackreference,
+            .lookaround => error.RegexLookaround,
+            .atomic_group => error.RegexAtomicGroup,
+            .large_repeat => error.RegexTooLarge,
+            .none => if (e == error.UnsupportedByProgram) error.RegexUnsupported else error.RegexSyntax,
+        },
     };
     return program.bytes();
 }
+
+/// The first construct in `pattern` that only a backtracker runs: a backreference (`\1`,
+/// `\g{1}`, `\k<n>`, `(?P=n)`) before lookaround (`(?=`, `(?!`, `(?<=`, `(?<!`) before an atomic
+/// group (`(?>`) before a counted repeat of `large_repeat` or more. Escapes and character
+/// classes are skipped.
+pub fn construct(pattern: []const u8) enum { none, backreference, lookaround, atomic_group, large_repeat } {
+    var found: enum { none, lookaround, atomic_group, large_repeat } = .none;
+    var i: usize = 0;
+    var class = false;
+    while (i < pattern.len) : (i += 1) {
+        const c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 >= pattern.len) break;
+            const e = pattern[i + 1];
+            if (!class and ((e >= '1' and e <= '9') or e == 'g' or e == 'k')) return .backreference;
+            i += 1;
+            continue;
+        }
+        if (class) {
+            if (c == ']') class = false;
+            continue;
+        }
+        if (c == '[') {
+            class = true;
+            // A `]` right after `[` or `[^` is a literal.
+            if (i + 1 < pattern.len and pattern[i + 1] == '^') i += 1;
+            if (i + 1 < pattern.len and pattern[i + 1] == ']') i += 1;
+            continue;
+        }
+        if (c == '{' and found == .none) {
+            var n: u64 = 0;
+            var j = i + 1;
+            while (j < pattern.len and std.ascii.isDigit(pattern[j]) and n < large_repeat) : (j += 1) n = n * 10 + (pattern[j] - '0');
+            if (n >= large_repeat) found = .large_repeat;
+            continue;
+        }
+        if (c != '(' or i + 2 >= pattern.len or pattern[i + 1] != '?') continue;
+        const rest = pattern[i + 2 ..];
+        if (std.mem.startsWith(u8, rest, "P=")) return .backreference;
+        if (std.mem.startsWith(u8, rest, "=") or std.mem.startsWith(u8, rest, "!") or
+            std.mem.startsWith(u8, rest, "<=") or std.mem.startsWith(u8, rest, "<!"))
+        {
+            if (found != .lookaround) found = .lookaround;
+        } else if (std.mem.startsWith(u8, rest, ">")) {
+            if (found == .none or found == .large_repeat) found = .atomic_group;
+        }
+    }
+    return switch (found) {
+        .none => .none,
+        .lookaround => .lookaround,
+        .atomic_group => .atomic_group,
+        .large_repeat => .large_repeat,
+    };
+}
+
+/// Counted repeats from here up are expanded past what a program may hold.
+pub const large_repeat = 10_000;
 
 /// Parse one line. Rules borrow `line`; a compiled filename program lives in `arena`.
 pub fn parseLine(arena: std.mem.Allocator, line: []const u8, column: *u32) LineError!ir.CdbRule {
@@ -198,9 +260,31 @@ test "cdb lines: wildcards, exact values, ranges, and rejections" {
         .{ "X:*:*:*:*:*:*:*:*:7", error.BadCdbField, 18 },
         .{ "X:*:*:*:*:*:*:*:*:*:x", error.BadFlevel, 20 },
         .{ "X:*:*:(a:*:*:*:*:*:*", error.RegexSyntax, 6 },
-        .{ "X:*:*:(a)\\1:*:*:*:*:*:*", error.RegexUnsupported, 6 },
+        .{ "X:*:*:(a)\\1:*:*:*:*:*:*", error.RegexBackreference, 6 },
     }) |c| {
         try testing.expectError(c[1], parseLine(arena, c[0], &column));
         try testing.expectEqual(c[2], column);
     }
+}
+
+test "a regex without a program is named by the construct that needs a backtracker" {
+    const T = struct { []const u8, @TypeOf(construct("")) };
+    for ([_]T{
+        .{ "(?P<n>\\w+)x(?P=n)", .backreference },
+        .{ "a(?=b)(c)\\1", .backreference },
+        .{ "\\w+(?=%)", .lookaround },
+        .{ "(?<!\\w)inject", .lookaround },
+        .{ "\\[(?>\\[.*\\]){17}", .atomic_group },
+        .{ "[\\1(?=]x", .none },
+        .{ "[]\\]](?>a)", .atomic_group },
+        .{ "\\(?=a", .none },
+        .{ "(?i)abc", .none },
+        .{ "[a-z]{50000,}", .large_repeat },
+        .{ "(?>a){20000}", .atomic_group },
+    }) |t| try std.testing.expectEqual(t[1], construct(t[0]));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.RegexAtomicGroup, compileRegex(arena.allocator(), "a(?>bc)d", .{}));
+    try std.testing.expectError(error.RegexLookaround, compileRegex(arena.allocator(), "a(?!b)", .{}));
+    try std.testing.expectError(error.RegexSyntax, compileRegex(arena.allocator(), "(ab", .{}));
 }

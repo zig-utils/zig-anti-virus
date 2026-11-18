@@ -53,6 +53,10 @@ pub const ParseError = error{
     YaraXorRange,
     RegexSyntax,
     RegexUnsupported,
+    RegexBackreference,
+    RegexLookaround,
+    RegexAtomicGroup,
+    RegexTooLarge,
     OutOfMemory,
 } || hexsig.Error;
 
@@ -64,8 +68,7 @@ pub fn reasonOf(err: ParseError) ir.Reason {
         error.YaraShortString => .yara_short_string,
         error.YaraNoStrings => .yara_no_strings,
         error.YaraXorRange => .yara_xor_range,
-        error.RegexSyntax => .regex_syntax,
-        error.RegexUnsupported => .regex_unsupported,
+        error.RegexSyntax, error.RegexUnsupported, error.RegexBackreference, error.RegexLookaround, error.RegexAtomicGroup, error.RegexTooLarge => |e| cdb.regexReason(e),
         else => |e| hexsig.reasonOf(@errorCast(e)),
     };
 }
@@ -902,9 +905,9 @@ test "rejections carry reasons and parsing resumes at the next rule" {
     try testing.expectEqual(@as(usize, 1), rules.items.len);
     try testing.expectEqualStrings("Good", rules.items[0].name);
     const want = [_]ir.Reason{
-        .yara_unsupported,  .yara_unsupported, .yara_unsupported,    .yara_unsupported, .yara_short_string,
-        .yara_no_strings,   .yara_xor_range,   .yara_unsupported,    .yara_unsupported, .regex_syntax,
-        .regex_unsupported, .yara_unsupported, .hex_bad_alternation, .yara_syntax,      .yara_unsupported,
+        .yara_unsupported,    .yara_unsupported, .yara_unsupported,    .yara_unsupported, .yara_short_string,
+        .yara_no_strings,     .yara_xor_range,   .yara_unsupported,    .yara_unsupported, .regex_syntax,
+        .regex_backreference, .yara_unsupported, .hex_bad_alternation, .yara_syntax,      .yara_unsupported,
     };
     try testing.expectEqual(want.len, rejected.items.len);
     for (want, rejected.items, 1..) |w, r, line| {

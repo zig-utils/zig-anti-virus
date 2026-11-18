@@ -39,12 +39,10 @@ pub const LineError = error{
     VersionInfoUnsupported,
     BadPcre,
     PcreFlagUnsupported,
-    RegexSyntax,
-    RegexUnsupported,
     MacroUnsupported,
     FuzzyImageUnsupported,
     BadByteCompare,
-} || hexsig.Error;
+} || hexsig.Error || cdb.RegexError;
 
 pub fn reasonOf(err: LineError) ir.Reason {
     return switch (err) {
@@ -64,8 +62,7 @@ pub fn reasonOf(err: LineError) ir.Reason {
         error.VersionInfoUnsupported => .version_info_unsupported,
         error.BadPcre => .bad_pcre,
         error.PcreFlagUnsupported => .pcre_flag_unsupported,
-        error.RegexSyntax => .regex_syntax,
-        error.RegexUnsupported => .regex_unsupported,
+        error.RegexSyntax, error.RegexUnsupported, error.RegexBackreference, error.RegexLookaround, error.RegexAtomicGroup, error.RegexTooLarge => |e| cdb.regexReason(e),
         error.MacroUnsupported => .macro_unsupported,
         error.FuzzyImageUnsupported => .fuzzy_image_unsupported,
         error.BadByteCompare => .bad_byte_compare,
@@ -646,7 +643,7 @@ test "pcre subsignatures: offsets, triggers, flags, compile failures" {
         .{ "0=0/abc/", 1, error.ExprTrueWithoutHits },
         .{ "EP+0:0/abc/", 1, error.OffsetNeedsExecutable },
         .{ "0/(ab/", 1, error.RegexSyntax },
-        .{ "0/(a)\\1/", 1, error.RegexUnsupported },
+        .{ "0/(a)\\1/", 1, error.RegexBackreference },
     }) |c| try testing.expectError(c[2], parsePcre(a, c[0], std.mem.indexOfScalar(u8, c[0], '/').?, c[1], 0));
 }
 

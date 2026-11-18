@@ -675,7 +675,7 @@ test "compile files and a container, filter, and write a database" {
     try std.testing.expect(std.mem.indexOf(u8, report, "main.pdb: 1 skipped (unsupported_database)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "main.ldb: 1 skipped (bad_expression)") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "daily.ftm: 1 skipped (bad_magic_type)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (regex_unsupported)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "daily.cdb: 1 skipped (regex_backreference)") != null);
     const pool = try regex_pool.RegexPool.init(opened.section(.regex_pool, 0).?);
     const cdbt = try container.CdbTable.init(opened.section(.cdb_table, 0).?, pool);
     try std.testing.expectEqual(@as(usize, 2), cdbt.records.len);

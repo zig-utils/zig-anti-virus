@@ -132,6 +132,13 @@ pub const Reason = enum(u8) {
     /// inline modifiers), so no allocation-free program exists. Repeated alternations and lazy
     /// repeats compile (zig-regex 0.3.1).
     regex_unsupported,
+    /// Regexes zig-regex parses but has no program for, by construct (zig-regex's backtracker
+    /// runs them with no step bound, so they are not run at all).
+    regex_backreference,
+    regex_lookaround,
+    regex_atomic_group,
+    /// A program over zig-regex's size limit, or a counted repeat of 10,000 or more.
+    regex_too_large,
     // YARA rules.
     yara_syntax,
     yara_unsupported,
