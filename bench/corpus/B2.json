@@ -1,0 +1,79 @@
+{
+  "name": "B2",
+  "description": "Large benign files (8 MiB and up): executables, installers and archives scanned whole.",
+  "sampling": "files in SHA-256 order; the CI subset is every file whose hash starts with 0",
+  "file_count": 12,
+  "total_bytes": 366373300,
+  "ci_file_count": 1,
+  "ci_total_bytes": 12334080,
+  "archives": [
+    {
+      "id": "node-win-x64",
+      "url": "https://nodejs.org/dist/v20.15.1/node-v20.15.1-win-x64.zip",
+      "format": "zip",
+      "license": "MIT and bundled licences (LICENSE in the archive)",
+      "project": "Node.js 20.15.1 (win-x64)",
+      "sha256": "ba6c3711e2c3d0638c5f7cea3c234553808a73c52a5962a6cdb47b5210b70b04",
+      "size": 29483778
+    },
+    {
+      "id": "node-darwin-arm64",
+      "url": "https://nodejs.org/dist/v20.15.1/node-v20.15.1-darwin-arm64.tar.gz",
+      "format": "tar.gz",
+      "license": "MIT and bundled licences (LICENSE in the archive)",
+      "project": "Node.js 20.15.1 (darwin-arm64)",
+      "sha256": "4743bc042f90ba5d9edf09403207290a9cdd2f6061bdccf7caaa0bbfd49f343e",
+      "size": 41888895
+    },
+    {
+      "id": "go-linux-amd64",
+      "url": "https://dl.google.com/go/go1.22.5.linux-amd64.tar.gz",
+      "format": "tar.gz",
+      "license": "BSD-3-Clause",
+      "project": "Go 1.22.5 toolchain (linux/amd64)",
+      "sha256": "904b924d435eaea086515bc63235b192ea441bd8c9b198c507e85009e6e4c7f0",
+      "size": 68972532
+    },
+    {
+      "id": "go-windows-amd64",
+      "url": "https://dl.google.com/go/go1.22.5.windows-amd64.zip",
+      "format": "zip",
+      "license": "BSD-3-Clause",
+      "project": "Go 1.22.5 toolchain (windows/amd64)",
+      "sha256": "59968438b8d90f108fd240d4d2f95b037e59716995f7409e0a322dcb996e9f42",
+      "size": 76262299
+    },
+    {
+      "id": "python-installer-amd64",
+      "url": "https://www.python.org/ftp/python/3.12.4/python-3.12.4-amd64.exe",
+      "format": "file",
+      "license": "PSF-2.0",
+      "project": "CPython 3.12.4 Windows installer (amd64)",
+      "sha256": "da5809df5cb05200b3a528a186f39b7d6186376ce051b0a393f1ddf67c995258",
+      "size": 26772456
+    },
+    {
+      "id": "go-windows-msi",
+      "url": "https://dl.google.com/go/go1.22.5.windows-amd64.msi",
+      "format": "file",
+      "license": "BSD-3-Clause",
+      "project": "Go 1.22.5 Windows installer (an OLE2 compound file)",
+      "sha256": "86b0299ab8cb9c44882a9080dac03f7f4d9546f51ed1ba1015599114bcbc66d0",
+      "size": 63184896
+    }
+  ],
+  "files": [
+    {"sha256":"0fb481ce78d36c40ce125281c8808a50a1f0b768b83353cfbb29f414aad6980f","size":12334080,"archive":"go-windows-amd64","member":"go/pkg/tool/windows_amd64/trace.exe"},
+    {"sha256":"100c9a920f93315d3b125531177974501b8557ab038ce7be5a7a6e7bf3c0babd","size":19649024,"archive":"go-windows-amd64","member":"go/pkg/tool/windows_amd64/compile.exe"},
+    {"sha256":"229fb64aeb10d3cc18eaaa2f5a4c3f1c81792dd3647c5c4350e142db528d0f89","size":69331096,"archive":"node-win-x64","member":"node-v20.15.1-win-x64/node.exe"},
+    {"sha256":"4565f55b45b9c06b8f0b12c26d48edf0e0e62906991b3ee0e5a75fc81d0c116d","size":12684651,"archive":"go-linux-amd64","member":"go/bin/go"},
+    {"sha256":"5059b667ea1fdd76f651f0e72d212f0334e72bdd65414725bf0ad0c72ec759d8","size":12107541,"archive":"go-linux-amd64","member":"go/pkg/tool/linux_amd64/trace"},
+    {"sha256":"7b38d245edffcc24f87befca3d8bf17c62e2bf3a03ad35ba3e6a015804e1bd8a","size":12959744,"archive":"go-windows-amd64","member":"go/bin/go.exe"},
+    {"sha256":"86b0299ab8cb9c44882a9080dac03f7f4d9546f51ed1ba1015599114bcbc66d0","size":63184896,"archive":"go-windows-msi","member":""},
+    {"sha256":"8dcf6c676172ed7e66ec014096d0c17995b78867c5d97bdec0a8789c7606ddd2","size":12102656,"archive":"go-windows-amd64","member":"go/pkg/tool/windows_amd64/pprof.exe"},
+    {"sha256":"da5809df5cb05200b3a528a186f39b7d6186376ce051b0a393f1ddf67c995258","size":26772456,"archive":"python-installer-amd64","member":""},
+    {"sha256":"e6b4b22bcdd03e5542381e9c909fda1f244dc1b28cab97b7d24358fb689edbd2","size":94145840,"archive":"node-darwin-arm64","member":"node-v20.15.1-darwin-arm64/bin/node"},
+    {"sha256":"f096330f9273813f249bb33a9b6e500b07ebc481ac8c7c20649878220bde4e2a","size":11756511,"archive":"go-linux-amd64","member":"go/pkg/tool/linux_amd64/pprof"},
+    {"sha256":"f383e7e2ca22d5a919f090d853dc64affcfbacee08cba01f2deaa2028b09670e","size":19344805,"archive":"go-linux-amd64","member":"go/pkg/tool/linux_amd64/compile"}
+  ]
+}

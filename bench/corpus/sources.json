@@ -1,0 +1,148 @@
+{
+  "comment": "Inputs to `bun bench/fetch.ts --generate`, which turns them into B1.json, B2.json and S1.json. Each archive is a public, freely licensed download; `take` picks members by size and path, and `max_bytes` caps a source by keeping its members in SHA-256 order (a deterministic sample). See README.md for the licences.",
+  "corpora": {
+    "B1": {
+      "description": "Benign filesystem slice: executables (ELF, PE, Mach-O), shared libraries, scripts, source, HTML, office documents, PDFs and compressed archives as they sit on disk.",
+      "min_size": 1024,
+      "max_size": 8388607,
+      "sources": [
+        {
+          "id": "go-linux-amd64",
+          "url": "https://dl.google.com/go/go1.22.5.linux-amd64.tar.gz",
+          "format": "tar.gz",
+          "license": "BSD-3-Clause",
+          "project": "Go 1.22.5 toolchain (linux/amd64)",
+          "max_bytes": 80000000
+        },
+        {
+          "id": "go-windows-amd64",
+          "url": "https://dl.google.com/go/go1.22.5.windows-amd64.zip",
+          "format": "zip",
+          "license": "BSD-3-Clause",
+          "project": "Go 1.22.5 toolchain (windows/amd64)",
+          "max_bytes": 60000000
+        },
+        {
+          "id": "go-darwin-arm64",
+          "url": "https://dl.google.com/go/go1.22.5.darwin-arm64.tar.gz",
+          "format": "tar.gz",
+          "license": "BSD-3-Clause",
+          "project": "Go 1.22.5 toolchain (darwin/arm64)",
+          "max_bytes": 60000000
+        },
+        {
+          "id": "node-win-x64",
+          "url": "https://nodejs.org/dist/v20.15.1/node-v20.15.1-win-x64.zip",
+          "format": "zip",
+          "license": "MIT and bundled licences (LICENSE in the archive)",
+          "project": "Node.js 20.15.1 (win-x64)",
+          "max_bytes": 40000000
+        },
+        {
+          "id": "python-embed-amd64",
+          "url": "https://www.python.org/ftp/python/3.12.4/python-3.12.4-embed-amd64.zip",
+          "format": "zip",
+          "license": "PSF-2.0",
+          "project": "CPython 3.12.4 embeddable package (amd64)",
+          "max_bytes": 30000000
+        },
+        {
+          "id": "poi-test-data",
+          "url": "https://github.com/apache/poi/archive/refs/tags/REL_5_2_5.tar.gz",
+          "format": "tar.gz",
+          "license": "Apache-2.0",
+          "project": "Apache POI 5.2.5 test documents",
+          "include": [
+            "poi-REL_5_2_5/test-data/"
+          ],
+          "archive_hash_unstable": true,
+          "max_bytes": 120000000
+        },
+        {
+          "id": "busybox-x86_64",
+          "url": "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox",
+          "format": "file",
+          "license": "GPL-2.0-only",
+          "project": "BusyBox 1.35.0 static binary"
+        },
+        {
+          "id": "putty-w64",
+          "url": "https://the.earth.li/~sgtatham/putty/0.81/w64/putty.exe",
+          "format": "file",
+          "license": "MIT",
+          "project": "PuTTY 0.81 (w64)"
+        }
+      ]
+    },
+    "B2": {
+      "description": "Large benign files (8 MiB and up): executables, installers and archives scanned whole.",
+      "min_size": 8388608,
+      "max_size": 1073741824,
+      "sources": [
+        {
+          "id": "node-win-x64",
+          "url": "https://nodejs.org/dist/v20.15.1/node-v20.15.1-win-x64.zip",
+          "format": "zip",
+          "license": "MIT and bundled licences (LICENSE in the archive)",
+          "project": "Node.js 20.15.1 (win-x64)"
+        },
+        {
+          "id": "node-darwin-arm64",
+          "url": "https://nodejs.org/dist/v20.15.1/node-v20.15.1-darwin-arm64.tar.gz",
+          "format": "tar.gz",
+          "license": "MIT and bundled licences (LICENSE in the archive)",
+          "project": "Node.js 20.15.1 (darwin-arm64)"
+        },
+        {
+          "id": "go-linux-amd64",
+          "url": "https://dl.google.com/go/go1.22.5.linux-amd64.tar.gz",
+          "format": "tar.gz",
+          "license": "BSD-3-Clause",
+          "project": "Go 1.22.5 toolchain (linux/amd64)"
+        },
+        {
+          "id": "go-windows-amd64",
+          "url": "https://dl.google.com/go/go1.22.5.windows-amd64.zip",
+          "format": "zip",
+          "license": "BSD-3-Clause",
+          "project": "Go 1.22.5 toolchain (windows/amd64)"
+        },
+        {
+          "id": "python-installer-amd64",
+          "url": "https://www.python.org/ftp/python/3.12.4/python-3.12.4-amd64.exe",
+          "format": "file",
+          "license": "PSF-2.0",
+          "project": "CPython 3.12.4 Windows installer (amd64)"
+        },
+        {
+          "id": "go-windows-msi",
+          "url": "https://dl.google.com/go/go1.22.5.windows-amd64.msi",
+          "format": "file",
+          "license": "BSD-3-Clause",
+          "project": "Go 1.22.5 Windows installer (an OLE2 compound file)"
+        }
+      ]
+    },
+    "S1": {
+      "description": "Mail streams: RFC 822 messages with headers, MIME parts and attachments.",
+      "min_size": 1,
+      "max_size": 67108864,
+      "sources": [
+        {
+          "id": "spamassassin-easy-ham",
+          "url": "https://spamassassin.apache.org/old/publiccorpus/20030228_easy_ham.tar.bz2",
+          "format": "tar.bz2",
+          "license": "SpamAssassin public corpus terms (for testing mail filters; copyright stays with the senders, see README.md)",
+          "project": "SpamAssassin public corpus, easy_ham 2003-02-28"
+        },
+        {
+          "id": "spamassassin-hard-ham",
+          "url": "https://spamassassin.apache.org/old/publiccorpus/20030228_hard_ham.tar.bz2",
+          "format": "tar.bz2",
+          "license": "SpamAssassin public corpus terms (for testing mail filters; copyright stays with the senders, see README.md)",
+          "project": "SpamAssassin public corpus, hard_ham 2003-02-28"
+        }
+      ]
+    }
+  }
+}
