@@ -118,6 +118,13 @@ jobs:
           db="$RUNNER_TEMP/db"
           python3 tools/diff/realdb.py gate --db $db/main --db $db/daily --out "$RUNNER_TEMP/gate"
           python3 tools/diff/gate.py --cvd "$HOME/clamav-db/main.cvd" --cvd "$HOME/clamav-db/daily.cvd" --db $db/main --db $db/daily --tmp "$RUNNER_TEMP/gz" --show 120 "$RUNNER_TEMP/gate"
+      - name: File typing against clamscan --debug on 10,000 system files (P4.13)
+        run: |
+          db="$RUNNER_TEMP/db"
+          # System binaries, libraries, documentation and the pip/apt caches: built on the runner,
+          # never committed.
+          python3 tools/diff/ftm_check.py --ftm $db/daily/daily.ftm --work "$RUNNER_TEMP/ftmw" --limit 10000 \
+            /usr/bin /usr/lib /usr/share/doc /usr/share/perl /usr/share/python3 "$HOME/.cache/pip" /var/cache/apt /usr/share
       - name: E13, zig-regex against PCRE2 on the PCRE subsigs and a public YARA rule set
         run: |
           git clone -q --depth 1 https://github.com/Yara-Rules/rules.git "$RUNNER_TEMP/yara-rules"

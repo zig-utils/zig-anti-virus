@@ -185,8 +185,15 @@ test "overlapping magics: longest wins, rtype refines, body magics compete" {
     try std.testing.expectEqual(types.ClType.posix_tar, kind(&f, &tar));
     // No magic: text or binary.
     try std.testing.expectEqual(types.ClType.text_ascii, kind(&f, "hello\r\nworld\t!"));
-    try std.testing.expectEqual(types.ClType.text_utf8, kind(&f, "gr\xc3\xbc\xc3\x9fe"));
-    try std.testing.expectEqual(types.ClType.binary_data, kind(&f, "\x01\x02\x03"));
+    // libclamav's text detection: bytes from 0x80 up are ISO-8859 or extended ASCII, so UTF-8
+    // is ASCII text too (its UTF-8 test only runs when the ASCII test failed, on a byte its own
+    // ASCII rule also refuses); a NUL with a byte-order mark is UTF-16.
+    try std.testing.expectEqual(types.ClType.text_ascii, kind(&f, "gr\xc3\xbc\xc3\x9fe"));
+    try std.testing.expectEqual(types.ClType.text_utf16le, kind(&f, "\xff\xfeh\x00i\x00"));
+    try std.testing.expectEqual(types.ClType.text_utf16be, kind(&f, "\x00\x01<script>"));
+    // Three bytes leave no UTF-16 unit after the first to refuse, so libclamav says UTF-16BE.
+    try std.testing.expectEqual(types.ClType.text_utf16be, kind(&f, "\x01\x02\x03"));
+    try std.testing.expectEqual(types.ClType.binary_data, kind(&f, "\x00\x01\x00\x02"));
 
     // Embedded-type triggers, filtered by rtype.
     var budget: vm.Budget = .{};

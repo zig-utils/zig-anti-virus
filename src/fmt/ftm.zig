@@ -207,15 +207,82 @@ fn round(f: Ftm, head: []const u8, rtype: u16, options: Options, budget: *vm.Bud
     return best.entry;
 }
 
-fn textType(head: []const u8) types.ClType {
-    var ascii = true;
-    for (head) |b| {
-        if (b == 0) return .binary_data;
-        if (b < 0x20 and b != '\t' and b != '\n' and b != '\r' and b != 0x0c and b != 0x1b) return .binary_data;
-        if (b >= 0x80) ascii = false;
+/// libclamav's text detection (textdet.c) for a head no magic matched: plain ASCII (with
+/// ISO-8859 and the PC/Mac extended sets), else UTF-8 with at least one multi-byte sequence and
+/// no odd control bytes, else UTF-16 (big-endian unless a little-endian BOM says otherwise),
+/// else binary data.
+pub fn textType(head: []const u8) types.ClType {
+    if (isAscii(head)) return .text_ascii;
+    if (isUtf8(head)) return .text_utf8;
+    return switch (utf16(head)) {
+        1 => .text_utf16le,
+        2 => .text_utf16be,
+        else => .binary_data,
+    };
+}
+
+/// Byte classes: never in text, plain ASCII text, ISO-8859 text, non-ISO extended ASCII.
+const TextClass = enum(u2) { never, ascii, iso, extended };
+const text_class: [256]TextClass = blk: {
+    var t: [256]TextClass = @splat(.never);
+    for ([_]u8{ 7, 8, 9, 10, 12, 13, 27 }) |c| t[c] = .ascii;
+    for (0x20..0x7f) |c| t[c] = .ascii;
+    for (0x80..0xa0) |c| t[c] = .extended;
+    t[0x85] = .ascii; // NEL
+    for (0xa0..0x100) |c| t[c] = .iso;
+    break :blk t;
+};
+
+fn isAscii(buf: []const u8) bool {
+    for (buf) |b| if (text_class[b] == .never) return false;
+    return true;
+}
+
+fn isUtf8(buf: []const u8) bool {
+    var gotone = false;
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        const b = buf[i];
+        if (b & 0x80 == 0) {
+            if (text_class[b] != .ascii) return false;
+        } else if (b & 0x40 == 0) {
+            return false;
+        } else {
+            const following: usize = if (b & 0x20 == 0) 1 else if (b & 0x10 == 0) 2 else if (b & 0x08 == 0) 3 else if (b & 0x04 == 0) 4 else if (b & 0x02 == 0) 5 else return false;
+            for (0..following) |_| {
+                i += 1;
+                // A sequence cut off by the end of the head still counts what came before.
+                if (i >= buf.len) return gotone;
+                if (buf[i] & 0x80 == 0 or buf[i] & 0x40 != 0) return false;
+            }
+            gotone = true;
+        }
     }
-    if (ascii) return .text_ascii;
-    return if (std.unicode.utf8ValidateSlice(head)) .text_utf8 else .binary_data;
+    return gotone;
+}
+
+/// 0 for not UTF-16, 1 for little-endian, 2 for big-endian.
+fn utf16(buf: []const u8) u2 {
+    if (buf.len < 2) return 0;
+    var be = true;
+    var bom = true;
+    if (buf[0] == 0xff and buf[1] == 0xfe) {
+        be = false;
+    } else if (!(buf[0] == 0xfe and buf[1] == 0xff)) {
+        bom = false;
+    }
+    var bad: usize = 0;
+    var i: usize = 2;
+    while (i + 1 < buf.len) : (i += 2) {
+        const c: u16 = if (be) @as(u16, buf[i]) << 8 | buf[i + 1] else @as(u16, buf[i + 1]) << 8 | buf[i];
+        if (c == 0xfffe) return 0;
+        if (c < 128 and text_class[c] != .ascii) {
+            if (!bom) return 0;
+            bad += 1;
+        }
+    }
+    if (bom and bad >= buf.len / 2) return 0;
+    return if (be) 2 else 1;
 }
 
 /// A file type's place in libclamav's enum (filetypes.h, CL_TYPENO = 500 onwards). libclamav

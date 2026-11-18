@@ -71,6 +71,35 @@ pub const Engine = struct {
         e.database.close();
     }
 
+    /// The file type libclamav gives a whole file (cli_determine_fmap_type), from the type
+    /// magics: the first 1024 bytes classified by the magic trie (or as text or binary data),
+    /// a tar header in binary data, then text and binary data re-typed by embedded type magics,
+    /// and ASCII text by the magics over the whole file (scanraw).
+    /// Null without type magics in the database.
+    pub fn fileType(e: *const Engine, data: []const u8) ?types.ClType {
+        const magics = e.types orelse return null;
+        var budget: vm.Budget = .{};
+        const head = data[0..@min(data.len, ftm.retype_window)];
+        var t = ftm.classify(magics, head, .{ .file_size = data.len }, &budget).type;
+        if (t == .binary_data and data.len >= 512 and detect.isTar(data[0..512])) {
+            t = if (std.mem.eql(u8, data[257..262], "ustar")) .posix_tar else .old_tar;
+        }
+        switch (t) {
+            .text_ascii, .text_utf8, .text_utf16le, .text_utf16be, .binary_data => if (ftm.retype(magics, data, t, &budget)) |r| {
+                t = r;
+            },
+            else => {},
+        }
+        // scanraw: ASCII text whose type magics over the whole file settle on HTML or mail
+        // becomes that type.
+        if (t == .text_ascii) switch (ftm.embeddedType(magics, data, .any, true, &budget)) {
+            .html => t = .html,
+            .mail => t = .mail,
+            else => {},
+        };
+        return t;
+    }
+
     /// The HandlerType of the logical signature `sig`, if it has one.
     pub fn handlerOf(e: *const Engine, sig: u32) ?types.ClType {
         const table = e.body.ldb orelse return null;
@@ -253,13 +282,24 @@ pub const Scanner = struct {
             .clean => {},
         }
         if (c.kind == .text) {
-            // scanraw: ASCII text whose type magics settle on HTML is scanned as HTML too.
+            // scanraw: ASCII text whose type magics settle on HTML is scanned as HTML too (and
+            // not as text); on mail, its raw bytes are matched with the mail target as well.
+            var mail = false;
             if (e.types) |magics| if (c.retyped == null and textType(data) == .text_ascii) {
                 var budget: vm.Budget = .{};
-                if (ftm.embeddedType(magics, data, .any, true, &budget) == .html) {
-                    const r = try s.scanHtml(e, data, tracker);
-                    return if (r == .clean and limited != null) .{ .limited = limited.? } else r;
+                switch (ftm.embeddedType(magics, data, .any, true, &budget)) {
+                    .html => {
+                        const r = try s.scanHtml(e, data, tracker);
+                        return if (r == .clean and limited != null) .{ .limited = limited.? } else r;
+                    },
+                    .mail => mail = true,
+                    else => {},
                 }
+            };
+            if (mail) switch (try s.body(e, data, .{ .info = .{ .size = data.len }, .target = 4 }, tracker)) {
+                .infected => |d| return .{ .found = d.sig },
+                .limited => |ev| limited = limited orelse ev,
+                .clean => {},
             };
             // Target 7 (and type-0) signatures also run over the normalised text.
             s.norm.clearRetainingCapacity();
@@ -418,13 +458,9 @@ fn setType(c: *Classified, t: types.ClType) void {
     };
 }
 
-/// ASCII or UTF-8 text, as libclamav tells them apart for re-typing (ISO-8859 counts as ASCII).
+/// libclamav's text type of a file from its first 1024 bytes (textdet.c).
 fn textType(data: []const u8) types.ClType {
-    const head = data[0..@min(data.len, ftm.retype_window)];
-    for (head) |b| if (b >= 0x80) {
-        return if (std.unicode.utf8ValidateSlice(head)) .text_utf8 else .text_ascii;
-    };
-    return .text_ascii;
+    return ftm.textType(data[0..@min(data.len, ftm.retype_window)]);
 }
 
 // Tests --------------------------------------------------------------------------------------------

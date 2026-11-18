@@ -393,6 +393,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "rejects")) return rejects(app, rest);
     if (std.mem.eql(u8, cmd, "info")) return infoCmd(app, rest);
     if (std.mem.eql(u8, cmd, "normalize")) return normalizeCmd(app, rest);
+    if (std.mem.eql(u8, cmd, "types")) return typesCmd(app, rest);
     if (std.mem.eql(u8, cmd, "roundtrip")) return roundtripCmd(app, rest);
     return usage(app);
 }
@@ -856,6 +857,55 @@ fn normalizeCmd(app: App, args: []const []const u8) !u8 {
     norm.feed(data) catch {};
     norm.finish() catch {};
     try app.out.writeAll(sink.list.items);
+    return 0;
+}
+
+/// `types [--tmp DIR] FTM... -- PATH...` (files or directories): the CL_TYPE_* libclamav's file typing gives each file
+/// (`Engine.fileType`) with the type magics in FTM, one `NAME<TAB>TYPE` line per file (NAME is
+/// the base name, as clamscan's JSON metadata names it). For tools/diff/ftm_check.py.
+fn typesCmd(app: App, args: []const []const u8) !u8 {
+    var tmp_path: []const u8 = ".zav-diff-tmp";
+    var ftms: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--tmp") and i + 1 < args.len) {
+            i += 1;
+            tmp_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--")) {
+            i += 1;
+            break;
+        } else try ftms.append(app.arena, args[i]);
+    }
+    const cwd = Io.Dir.cwd();
+    try cwd.createDirPath(app.io, tmp_path);
+    var tmp = try cwd.openDir(app.io, tmp_path, .{});
+    defer tmp.close(app.io);
+    var c = zav.compile.compiler.Compiler.init(app.gpa);
+    defer c.deinit();
+    for (ftms.items) |f| try c.addFile(std.fs.path.basename(f), try cwd.readFileAlloc(app.io, f, app.arena, .limited(1 << 26)));
+    _ = try c.write(app.io, tmp, "types.zavdb", .{ .db_version = 1 });
+    var engine = try Engine.open(app.gpa, app.io, tmp, "types.zavdb", .{ .allow_unsigned = true });
+    defer engine.close(app.gpa);
+    var name_buf: [64]u8 = undefined;
+    // Directories stand for the files directly in them.
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (args[i..]) |path| {
+        var dir = cwd.openDir(app.io, path, .{ .iterate = true }) catch {
+            try paths.append(app.arena, path);
+            continue;
+        };
+        defer dir.close(app.io);
+        var it = dir.iterate();
+        const first = paths.items.len;
+        while (try it.next(app.io)) |entry| if (entry.kind == .file) try paths.append(app.arena, try std.fs.path.join(app.arena, &.{ path, entry.name }));
+        std.mem.sort([]const u8, paths.items[first..], {}, lessString);
+    }
+    for (paths.items) |path| {
+        const data = cwd.readFileAlloc(app.io, path, app.gpa, .limited(1 << 30)) catch continue;
+        defer app.gpa.free(data);
+        const t = engine.fileType(data) orelse .binary_data;
+        try app.out.print("{s}\t{s}\n", .{ std.fs.path.basename(path), t.name(&name_buf) catch "?" });
+    }
     return 0;
 }
 
