@@ -2,7 +2,9 @@
 //!
 //! A candidate is a position where the program's anchor part starts. Parts before the anchor are
 //! searched backwards and parts after it forwards, each inside the gap window its `part_end`
-//! carries. Searching jumps between occurrences of a part's edge literal byte with memchr, and
+//! carries. Searching jumps between occurrences of a part's longest literal at a fixed distance
+//! from the part's edge (memchr on one of its less common bytes, then the whole literal) before
+//! spending a step, and
 //! stops early when trying a later position provably cannot help (a fixed-length part followed
 //! by an unbounded gap). Every part attempt and every alternative tried costs a step; a step
 //! budget per verify call and one per file bound the work any input can cause, and running out
@@ -99,13 +101,26 @@ const Outcome = enum { here_fail, later_fail, ok };
 const max_parts = prog.max_parts;
 const unknown = std.math.maxInt(usize);
 
-/// What earlier verify calls on the same data learned: part k matches nowhere at or after
-/// `dead_from[k]`, and ends nowhere at or before `dead_upto[k]`. Whether a part's own ops match
-/// at a position does not depend on the rest of the chain, so this stays true for every later
-/// candidate and keeps unbounded-gap signatures linear over a file.
+/// What earlier verify calls on the same program and data learned: no copy of the chain of
+/// parts k, k+1, ... (to the last) starts at or after `dead_from[k]`, and no copy of the chain
+/// of parts 0 .. k ends at or before `dead_upto[k]`. Whether such a chain matches at a position
+/// depends only on the data and the program (its start window and end limit are fixed per
+/// file), never on the candidate that led there, so this stays true for every later candidate
+/// and keeps signatures with unbounded gaps linear over a file, even when a part matches often
+/// and only a later part fails.
+///
+/// A search that runs out of budget part of the way still leaves what it covered: no chain from
+/// part k starts in `[from_lo[k], from_hi[k])`, and no chain of parts 0 .. k ends in
+/// `[upto_lo[k], upto_hi[k])`. The next candidate's search skips that stretch, so a search too
+/// long for one verify budget still finishes over several candidates instead of starting
+/// again each time.
 pub const Memo = struct {
     dead_from: [max_parts]usize = undefined,
     dead_upto: [max_parts]usize = undefined,
+    from_lo: [max_parts]usize = undefined,
+    from_hi: [max_parts]usize = undefined,
+    upto_lo: [max_parts]usize = undefined,
+    upto_hi: [max_parts]usize = undefined,
     /// Entries below this are initialised.
     parts: usize = 0,
 
@@ -114,7 +129,26 @@ pub const Memo = struct {
     pub fn prepare(m: *Memo, part_count: usize) void {
         @memset(m.dead_from[0..part_count], unknown);
         @memset(m.dead_upto[0..part_count], unknown);
+        @memset(m.from_lo[0..part_count], 0);
+        @memset(m.from_hi[0..part_count], 0);
+        @memset(m.upto_lo[0..part_count], 0);
+        @memset(m.upto_hi[0..part_count], 0);
         m.parts = part_count;
+    }
+
+    /// Record that `[lo, hi)` holds no start (or end) of a chain, keeping one stretch per part:
+    /// the union when the stretches touch, otherwise the longer one.
+    fn cover(los: *[max_parts]usize, his: *[max_parts]usize, k: usize, lo: usize, hi: usize) void {
+        if (hi <= lo) return;
+        const a = los[k];
+        const b = his[k];
+        if (lo <= b and hi >= a and b > a) {
+            los[k] = @min(a, lo);
+            his[k] = @max(b, hi);
+        } else if (hi - lo > b - a) {
+            los[k] = lo;
+            his[k] = hi;
+        }
     }
 };
 
@@ -134,8 +168,10 @@ const Vm = struct {
     start: usize = 0,
     end: usize = 0,
 
-    fn init(p: prog.Program, data: []const u8, window: Window, budget: *Budget, memo: *Memo) Vm {
-        var vm: Vm = .{
+    /// Fill `vm` in place: it is about 800 bytes, and building it by value cost a copy per
+    /// verify call that dominated short verifies.
+    fn init(vm: *Vm, p: prog.Program, data: []const u8, window: Window, budget: *Budget, memo: *Memo) void {
+        vm.* = .{
             .pat = p.pattern,
             .data = data,
             .flags = p.header.flags,
@@ -162,7 +198,6 @@ const Vm = struct {
             else => {},
         };
         vm.part_first[vm.part_count] = @intCast(p.pattern.ops.len + 1);
-        return vm;
     }
 
     fn step(vm: *Vm) Error!void {
@@ -254,6 +289,103 @@ const Vm = struct {
         return pos < d.len and isAlnum(d[pos]);
     }
 
+    /// A literal of a part at a fixed distance from one end of the part, used to jump between
+    /// the places the part can match instead of trying every position.
+    const Jump = struct {
+        op: ir.Op,
+        /// Bytes from the part's start to the literal (forwards), or from the literal's end to
+        /// the part's end (backwards).
+        delta: usize,
+        /// The literal byte memchr looks for: one that is neither a letter of a folded literal
+        /// nor a byte as common as 00, ff, 20, 90 or cc, when the literal has one.
+        key: usize,
+    };
+
+    fn width(o: ir.Op) ?usize {
+        return switch (o.code) {
+            .lit, .masked => o.len,
+            .gapf => o.a,
+            .nalt => o.b & 0xffff,
+            .alt => if (o.b & 0xffff == o.b >> 16) o.b & 0xffff else null,
+            else => null,
+        };
+    }
+
+    fn keyByte(vm: *const Vm, o: ir.Op) usize {
+        const lit = vm.pat.bytes(o);
+        for (lit, 0..) |b, i| {
+            if (nocase(o) and std.ascii.isAlphabetic(b)) continue;
+            switch (b) {
+                0x00, 0xff, 0x20, 0x90, 0xcc => continue,
+                else => return i,
+            }
+        }
+        if (nocase(o)) for (lit, 0..) |b, i| if (!std.ascii.isAlphabetic(b)) return i;
+        return 0;
+    }
+
+    /// The longest literal of part k at a fixed distance from its start (ops before it all
+    /// have a fixed width), or null.
+    fn jumpForward(vm: *const Vm, k: usize) ?Jump {
+        var best: ?Jump = null;
+        var delta: usize = 0;
+        for (vm.pat.ops[vm.part_first[k]..vm.partEnd(k)]) |o| {
+            if (o.code == .lit and (best == null or o.len > best.?.op.len)) best = .{ .op = o, .delta = delta, .key = 0 };
+            delta += width(o) orelse break;
+        }
+        if (best) |*b| b.key = vm.keyByte(b.op);
+        return best;
+    }
+
+    /// The longest literal of part k at a fixed distance from its end, or null.
+    fn jumpBackward(vm: *const Vm, k: usize) ?Jump {
+        var best: ?Jump = null;
+        var delta: usize = 0;
+        var i = vm.partEnd(k);
+        while (i > vm.part_first[k]) {
+            i -= 1;
+            const o = vm.pat.ops[i];
+            if (o.code == .lit and (best == null or o.len > best.?.op.len)) best = .{ .op = o, .delta = delta, .key = 0 };
+            delta += width(o) orelse break;
+        }
+        if (best) |*b| b.key = vm.keyByte(b.op);
+        return best;
+    }
+
+    /// The literal of `j` at `at`.
+    fn literalAt(vm: *const Vm, j: Jump, at: usize) bool {
+        const lit = vm.pat.bytes(j.op);
+        if (at + lit.len > vm.data.len) return false;
+        const got = vm.data[at..][0..lit.len];
+        if (!nocase(j.op)) return std.mem.eql(u8, lit, got);
+        for (lit, got) |w, g| if (!eqByte(w, g, true)) return false;
+        return true;
+    }
+
+    /// The first position at or after `from` and at most `limit` holding the key byte of a
+    /// literal (either case for a folded letter).
+    fn findKey(d: []const u8, from: usize, limit: usize, byte: u8, fold: bool) ?usize {
+        const end = @min(d.len, limit +| 1);
+        if (from >= end) return null;
+        if (!(fold and std.ascii.isAlphabetic(byte))) return std.mem.indexOfScalarPos(u8, d[0..end], from, byte);
+        const lo = std.mem.indexOfScalarPos(u8, d[0..end], from, std.ascii.toLower(byte));
+        const up = std.mem.indexOfScalarPos(u8, d[0..end], from, std.ascii.toUpper(byte));
+        if (lo == null) return up;
+        if (up == null) return lo;
+        return @min(lo.?, up.?);
+    }
+
+    /// The last position below `end` and at least `base` holding the key byte.
+    fn findKeyBack(d: []const u8, base: usize, end: usize, byte: u8, fold: bool) ?usize {
+        if (base >= end) return null;
+        if (!(fold and std.ascii.isAlphabetic(byte))) return if (std.mem.lastIndexOfScalar(u8, d[base..end], byte)) |x| base + x else null;
+        const lo = std.mem.lastIndexOfScalar(u8, d[base..end], std.ascii.toLower(byte));
+        const up = std.mem.lastIndexOfScalar(u8, d[base..end], std.ascii.toUpper(byte));
+        if (lo == null) return if (up) |x| base + x else null;
+        if (up == null) return base + lo.?;
+        return base + @max(lo.?, up.?);
+    }
+
     // -- forwards ------------------------------------------------------------------------------
 
     /// Match part k's ops from op `i` at `pos`, then every later part.
@@ -310,33 +442,44 @@ const Vm = struct {
         const lo = from +| gap.a;
         if (lo > d.len) return false;
         const hi = if (gap.b == ir.unbounded) d.len else @min(d.len, from +| gap.b);
-        const first = vm.pat.ops[vm.part_first[k]];
         const greedy = vm.part_fixed[k] and k + 1 < vm.part_count and vm.pat.ops[vm.partEnd(k)].b == ir.unbounded;
         const to_end = hi == d.len;
         if (to_end and lo >= vm.memo.dead_from[k]) return false;
-        var any_later = false;
-        const whole = vm.part_first[k] + 1 == vm.partEnd(k) and first.code == .lit and first.flags & ir.op_nocase == 0;
+        // Positions from dead_from on are known to start no chain from this part: an unbounded
+        // search only covers what earlier calls have not, so it stays linear over the data.
+        const shi = if (to_end and vm.memo.dead_from[k] != unknown) vm.memo.dead_from[k] - 1 else hi;
+        // The part can only start where its literal sits `delta` bytes later: jump between
+        // occurrences of the literal's key byte and compare the literal before a step is spent.
+        // A mismatch there fails at once (here_fail), so only real starts cost budget.
+        const jump = vm.jumpForward(k);
+        const m = vm.memo;
         var q = lo;
-        while (q <= hi) : (q += 1) {
-            if (whole) {
-                // The part is one literal: find it whole, starting in [q, hi].
-                const lit = vm.pat.bytes(first);
-                q = std.mem.indexOfPos(u8, d[0..@min(d.len, hi +| lit.len)], q, lit) orelse break;
-            } else if (first.code == .lit and first.flags & ir.op_nocase == 0) {
-                const byte = vm.pat.bytes(first)[0];
-                q = std.mem.indexOfScalarPos(u8, d[0..@min(d.len, hi + 1)], q, byte) orelse break;
+        // Out of budget part of the way: keep what was covered for the next candidate.
+        errdefer if (to_end) Memo.cover(&m.from_lo, &m.from_hi, k, lo, q);
+        while (q <= shi) : (q += 1) {
+            if (to_end and q >= m.from_lo[k] and q < m.from_hi[k]) {
+                q = m.from_hi[k];
+                if (q > shi) break;
+            }
+            if (jump) |j| {
+                const key = vm.pat.bytes(j.op)[j.key];
+                const at = findKey(d, q + j.delta + j.key, shi +| (j.delta + j.key), key, nocase(j.op)) orelse break;
+                q = at - j.key - j.delta;
+                if (!vm.literalAt(j, q + j.delta)) continue;
             }
             try vm.step();
             switch (try vm.fwd(k, vm.part_first[k], q)) {
                 .ok => return true,
                 .later_fail => {
-                    if (greedy) return false;
-                    any_later = true;
+                    // A fixed part before an unbounded gap: a later start only searches a
+                    // subset of what this one did, so no chain starts from here on.
+                    if (greedy) break;
                 },
                 .here_fail => {},
             }
         }
-        if (to_end and !any_later) vm.memo.dead_from[k] = @min(vm.memo.dead_from[k], lo);
+        // Every start in [lo, the end] failed (or provably would), whatever the reason.
+        if (to_end) vm.memo.dead_from[k] = @min(vm.memo.dead_from[k], lo);
         return false;
     }
 
@@ -403,44 +546,51 @@ const Vm = struct {
         if (pos < gap.a or gap.a > gap.b) return false;
         const hi = pos - gap.a; // latest end of part k-1
         const lo = if (gap.b == ir.unbounded or gap.b > pos) 0 else pos - gap.b;
-        const last = vm.pat.ops[vm.partEnd(k - 1) - 1];
+        const jump = vm.jumpBackward(k - 1);
         const greedy = vm.part_fixed[k - 1] and k - 1 > 0 and vm.pat.ops[vm.partEnd(k - 2)].b == ir.unbounded;
         const dead = &vm.memo.dead_upto[k - 1];
         if (lo == 0 and dead.* != unknown and hi <= dead.*) return false;
-        var any_later = false;
+        // Chains ending at or before dead_upto are known not to exist, so a search reaching
+        // back to the start of the data only covers what earlier calls have not.
+        const slo = if (lo == 0 and dead.* != unknown) dead.* + 1 else lo;
         var e = hi;
-        // A part that is one literal is found whole: one step per occurrence, not per
-        // occurrence of its last byte.
-        const whole = vm.part_first[k - 1] + 1 == vm.partEnd(k - 1) and last.code == .lit and last.flags & ir.op_nocase == 0;
+        const m = vm.memo;
+        const stretch = lo == 0;
+        errdefer if (stretch) Memo.cover(&m.upto_lo, &m.upto_hi, k - 1, e + 1, hi + 1);
         while (true) {
-            if (whole) {
-                const lit = vm.pat.bytes(last);
-                // The literal ends in [lo, e], so it starts in [lo - len, e - len].
-                if (e < lit.len) break;
-                const base = if (lo < lit.len) 0 else lo - lit.len;
-                const at = std.mem.lastIndexOf(u8, vm.data[base..e], lit) orelse break;
-                e = base + at + lit.len;
-            } else if (last.code == .lit and last.flags & ir.op_nocase == 0) {
-                // The part ends with a literal: jump to the previous occurrence of its last byte.
-                const byte = vm.pat.bytes(last)[last.len - 1];
-                // Ends lie in [lo, e], so the byte sits in [lo - 1, e - 1]; no part ends at 0.
-                const base = if (lo == 0) 0 else lo - 1;
-                const at = std.mem.lastIndexOfScalar(u8, vm.data[base..e], byte) orelse break;
-                e = base + at + 1;
+            if (stretch and e >= m.upto_lo[k - 1] and e < m.upto_hi[k - 1]) {
+                if (m.upto_lo[k - 1] <= slo) break;
+                e = m.upto_lo[k - 1] - 1;
+            }
+            if (jump) |j| {
+                // The part ends `delta` bytes after its literal: jump to the previous occurrence
+                // of the literal's key byte, and compare the literal before a step is spent.
+                const len = j.op.len;
+                const tail = len - j.key + j.delta; // from the key byte to the part's end
+                // Ends lie in [slo, e], so the key byte sits in [slo - tail, e - tail].
+                if (e < tail) break;
+                const base = if (slo < tail) 0 else slo - tail;
+                const at = findKeyBack(vm.data, base, e - tail + 1, vm.pat.bytes(j.op)[j.key], nocase(j.op)) orelse break;
+                e = at + tail;
+                if (at < j.key or !vm.literalAt(j, at - j.key)) {
+                    if (e == slo) break;
+                    e -= 1;
+                    continue;
+                }
             }
             try vm.step();
             switch (try vm.bwd(k - 1, vm.partEnd(k - 1), e)) {
                 .ok => return true,
                 .later_fail => {
-                    if (greedy) return false;
-                    any_later = true;
+                    if (greedy) break;
                 },
                 .here_fail => {},
             }
-            if (e == lo) break;
+            if (e == slo) break;
             e -= 1;
         }
-        if (lo == 0 and !any_later) dead.* = if (dead.* == unknown) hi else @max(dead.*, hi);
+        // No chain of parts 0 .. k-1 ends in [0, hi].
+        if (lo == 0) dead.* = if (dead.* == unknown) hi else @max(dead.*, hi);
         return false;
     }
 };
@@ -456,7 +606,8 @@ pub fn verify(p: prog.Program, data: []const u8, window: Window, anchor_start: u
 pub fn verifyMemo(p: prog.Program, data: []const u8, window: Window, anchor_start: usize, budget: *Budget, memo: *Memo) Error!?Match {
     if (anchor_start > data.len) return null;
     std.debug.assert(memo.parts == p.header.part_count);
-    var vm = Vm.init(p, data, window, budget, memo);
+    var vm: Vm = undefined;
+    vm.init(p, data, window, budget, memo);
     const a = p.header.anchor_part;
     try vm.step();
     // The anchor literal itself first: candidates come from its first byte only, and searching
@@ -471,8 +622,12 @@ pub fn verifyMemo(p: prog.Program, data: []const u8, window: Window, anchor_star
             if (!std.ascii.eqlIgnoreCase(want, data[at..][0..o.len])) return null;
         } else if (!std.mem.eql(u8, want, data[at..][0..o.len])) return null;
     }
-    if (!try vm.atPartStart(a, anchor_start)) return null;
+    // Forwards first: the anchor part and what follows it are usually close by, so most
+    // candidates fail there before any search back through earlier parts. The two halves of
+    // the chain are independent (each depends only on the data from the anchor part on), so
+    // the order changes the work, not the result.
     if (try vm.fwd(a, vm.part_first[a], anchor_start) != .ok) return null;
+    if (!try vm.atPartStart(a, anchor_start)) return null;
     return .{ .start = vm.start, .end = vm.end };
 }
 
