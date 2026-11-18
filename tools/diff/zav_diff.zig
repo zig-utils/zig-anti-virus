@@ -425,7 +425,7 @@ pub const Scanner = struct {
             } else |_| {},
             .macho => if (zav.fmt.macho.parse(s.io, src, s.macho_segments, s.macho_sections)) |info| {
                 out.file.target = 9;
-                out.file.info.entry_point = info.ep_offset;
+                out.file.info.entry_point = info.matchEntryPoint();
                 const n = @min(info.sections.len, s.vm_sections.len);
                 for (info.sections[0..n], s.vm_sections[0..n]) |sec, *v| v.* = .{ .offset = sec.offset, .size = sec.size };
                 out.file.info.sections = s.vm_sections[0..n];
@@ -510,6 +510,8 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "materialize")) return materialize(app, rest);
     if (std.mem.eql(u8, cmd, "scan")) return scanCmd(app, rest);
     if (std.mem.eql(u8, cmd, "rejects")) return rejects(app, rest);
+    if (std.mem.eql(u8, cmd, "info")) return infoCmd(app, rest);
+    if (std.mem.eql(u8, cmd, "normalize")) return normalizeCmd(app, rest);
     return usage(app);
 }
 
@@ -860,6 +862,82 @@ fn materialize(app: App, args: []const []const u8) !u8 {
     }
     try root.writeFile(app.io, .{ .sub_path = "cases", .data = index.items });
     try app.out.print("zav-diff: wrote {d} cases to {s}\n", .{ cases.items.len, root_path });
+    return 0;
+}
+
+/// `normalize text|html FILE`: zav's target-7 or target-3 normalised form of FILE on stdout,
+/// for comparison with libclamav's (tools/diff/norm.py).
+fn normalizeCmd(app: App, args: []const []const u8) !u8 {
+    if (args.len != 2) return usage(app);
+    const data = try Io.Dir.cwd().readFileAlloc(app.io, args[1], app.arena, .limited(1 << 30));
+    if (std.mem.eql(u8, args[0], "text")) {
+        const out = try app.arena.alloc(u8, data.len);
+        var n: zav.fmt.text_norm.Normalizer = .{};
+        try app.out.writeAll(out[0..n.feed(data, out)]);
+        return 0;
+    }
+    if (!std.mem.eql(u8, args[0], "html")) return usage(app);
+    const Sink = struct {
+        list: std.ArrayList(u8) = .empty,
+        arena: std.mem.Allocator,
+        fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.list.appendSlice(self.arena, bytes) catch return error.Stop;
+        }
+    };
+    var sink: Sink = .{ .arena = app.arena };
+    var norm = zav.fmt.html_norm.Normalizer.init(.normalized, .{ .ctx = &sink, .write = Sink.write });
+    norm.feed(data) catch {};
+    norm.finish() catch {};
+    try app.out.writeAll(sink.list.items);
+    return 0;
+}
+
+/// What zav's format parsers say about executables, one line per file, tab-separated:
+/// `PATH FORMAT EP SECTIONS` where EP is the entry point file offset (`-` for none) and
+/// SECTIONS is `offset+size,...` (PE: the loader-aligned raw ranges). For tools/diff/formats.py.
+fn infoCmd(app: App, args: []const []const u8) !u8 {
+    const scanner = try Scanner.init(app.gpa, app.io);
+    defer scanner.deinit();
+    for (args) |path| {
+        const data = Io.Dir.cwd().readFileAlloc(app.io, path, app.arena, .limited(1 << 30)) catch |e| {
+            try app.out.print("{s}\terror\t{t}\t\n", .{ path, e });
+            continue;
+        };
+        const src: zav.engine.source.Source = .{ .memory = data };
+        const format = zav.fmt.detect.detect(data[0..@min(data.len, zav.fmt.detect.head_len)]);
+        var ep: ?u64 = null;
+        var secs: std.ArrayList(u8) = .empty;
+        var ok = true;
+        switch (format) {
+            .pe => if (zav.fmt.pe.parse(app.io, src, scanner.pe_sections)) |info| {
+                ep = info.ep_offset;
+                for (info.sections) |sec| try secs.print(app.arena, "{d}+{d},", .{ sec.raw_off, sec.raw_size });
+            } else |_| {
+                ok = false;
+            },
+            .elf => if (zav.fmt.elf.parse(app.io, src, scanner.elf_segments, scanner.elf_sections)) |info| {
+                ep = info.ep_offset;
+                for (info.sections) |sec| try secs.print(app.arena, "{d}+{d},", .{ sec.offset, sec.size });
+            } else |_| {
+                ok = false;
+            },
+            .macho => if (zav.fmt.macho.parse(app.io, src, scanner.macho_segments, scanner.macho_sections)) |info| {
+                ep = info.matchEntryPoint();
+                for (info.sections) |sec| try secs.print(app.arena, "{d}+{d},", .{ sec.offset, sec.size });
+            } else |_| {
+                ok = false;
+            },
+            else => {},
+        }
+        if (!ok) {
+            try app.out.print("{s}\t{t}\tbroken\t\n", .{ path, format });
+            continue;
+        }
+        if (ep) |e| {
+            try app.out.print("{s}\t{t}\t{d}\t{s}\n", .{ path, format, e, secs.items });
+        } else try app.out.print("{s}\t{t}\t-\t{s}\n", .{ path, format, secs.items });
+    }
     return 0;
 }
 

@@ -115,3 +115,61 @@ jobs:
           db="$RUNNER_TEMP/db"
           python3 tools/diff/realdb.py corpus --db $db/main --db $db/daily --yara "$RUNNER_TEMP/yara-rules" --out "$RUNNER_TEMP/e13.txt"
           zig build e13 -Doptimize=ReleaseSafe -- "$RUNNER_TEMP/e13.txt" --show 60
+
+  formats:
+    name: Executable layouts and normalisers against libclamav (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install ClamAV ${{ env.CLAMAV_VERSION }} (Linux)
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
+          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb"
+          echo "CLAMSCAN=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')" >> "$GITHUB_ENV"
+          echo "CLAMAV_CERTS=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")" >> "$GITHUB_ENV"
+      # The official macOS package, unpacked rather than installed: its binaries get an rpath to
+      # their libraries and an ad hoc signature.
+      - name: Install ClamAV ${{ env.CLAMAV_VERSION }} (macOS)
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.macos.universal.pkg" -D "$RUNNER_TEMP"
+          pkgutil --expand-full "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.macos.universal.pkg" "$RUNNER_TEMP/pkg"
+          root="$RUNNER_TEMP/clamav"
+          mkdir -p "$root"
+          cp -R "$RUNNER_TEMP"/pkg/*programs.pkg/Payload/usr/local/clamav/. "$RUNNER_TEMP"/pkg/*libraries.pkg/Payload/usr/local/clamav/. "$root/"
+          for f in "$root/bin/clamscan" "$root"/lib/*.dylib; do
+            [ -L "$f" ] && continue
+            install_name_tool -add_rpath "$root/lib" "$f" 2>/dev/null || true
+            codesign -f -s - "$f"
+          done
+          echo "CLAMSCAN=$root/bin/clamscan" >> "$GITHUB_ENV"
+          echo "CLAMAV_CERTS=$root/etc/certs" >> "$GITHUB_ENV"
+      - run: zig build diff-tool -Doptimize=ReleaseSafe
+      - name: Entry points and sections
+        run: |
+          corpus="$RUNNER_TEMP/corpus"
+          tools/diff/build_corpus.sh "$corpus/zig"
+          python3 tools/diff/gen_pe.py "$corpus/pe-edge"
+          dirs="$corpus"
+          if [ "$RUNNER_OS" = Linux ]; then dirs="$dirs /usr/bin /usr/lib/x86_64-linux-gnu"; fi
+          if [ "$RUNNER_OS" = macOS ]; then dirs="$dirs /opt/homebrew/bin /opt/homebrew/lib"; fi
+          python3 tools/diff/formats.py --work "$RUNNER_TEMP/fwork" $dirs
+      - name: Text and HTML normalisers
+        run: |
+          py=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')
+          mkdir -p "$RUNNER_TEMP/text"
+          find "$py" -name '*.py' -size -256k | head -1500 | while read -r f; do cp "$f" "$RUNNER_TEMP/text/$(echo "$f" | tr '/' '_')"; done
+          # HTML parity is incomplete (#45): counted, not enforced.
+          python3 tools/diff/norm.py --html-report-only --work "$RUNNER_TEMP/nwork" "$RUNNER_TEMP/text"

@@ -60,9 +60,19 @@ pub const Info = struct {
     ncmds: u32,
     /// Entry point as a file offset within this image, when one is declared and maps.
     ep_offset: ?u64,
+    /// The entry point came from LC_MAIN. libclamav resolves entry points only from thread
+    /// states (LC_UNIXTHREAD), so EP-relative signatures do not apply to LC_MAIN binaries there
+    /// (tools/diff/formats.py); `matchEntryPoint` is the entry point signatures see.
+    ep_from_main: bool = false,
     segments: []Segment,
     sections: []Section,
     anomalies: Anomalies,
+
+    /// The entry point EP-relative signatures resolve against, as libclamav does: none for an
+    /// LC_MAIN binary.
+    pub fn matchEntryPoint(info: *const Info) ?u64 {
+        return if (info.ep_from_main) null else info.ep_offset;
+    }
 
     pub fn vmToOffset(info: *const Info, addr: u64) ?u64 {
         for (info.segments) |s| {
@@ -197,6 +207,7 @@ pub fn parse(io: Io, src: Source, segments: []Segment, sections: []Section) Erro
     info.sections = sections[0..nsect];
     if (main_off) |m| {
         info.ep_offset = if (m < file_size) m else null;
+        info.ep_from_main = true;
     } else if (thread_pc) |pc| {
         info.ep_offset = info.vmToOffset(pc);
     }
