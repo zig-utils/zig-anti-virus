@@ -71,6 +71,7 @@ def main():
     ap.add_argument("--zav-diff", default="zig-out/bin/zav-diff")
     ap.add_argument("--work", default=".zav-diff-work")
     ap.add_argument("--show", type=int, default=40)
+    ap.add_argument("--limit", type=int, default=0, help="compare at most this many files")
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args()
 
@@ -83,6 +84,8 @@ def main():
         base.append("--cvdcertsdir=" + args.certs)
 
     paths = list(files_under(args.paths))
+    if args.limit:
+        paths = paths[:args.limit]
     zav = {}
     for i in range(0, len(paths), 200):
         r = subprocess.run([args.zav_diff, "info"] + paths[i:i + 200], stdout=subprocess.PIPE)

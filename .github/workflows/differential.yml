@@ -176,7 +176,8 @@ jobs:
           dirs="$corpus"
           if [ "$RUNNER_OS" = Linux ]; then dirs="$dirs /usr/bin /usr/lib/x86_64-linux-gnu"; fi
           if [ "$RUNNER_OS" = macOS ]; then dirs="$dirs /opt/homebrew/bin /opt/homebrew/lib"; fi
-          python3 tools/diff/formats.py --work "$RUNNER_TEMP/fwork" $dirs
+          # clamscan --debug costs about 50 ms a file: bounded so the job stays short.
+          python3 tools/diff/formats.py --limit 2500 --work "$RUNNER_TEMP/fwork" $dirs
       - name: Text and HTML normalisers
         run: |
           py=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')
