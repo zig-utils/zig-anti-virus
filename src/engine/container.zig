@@ -60,6 +60,9 @@ pub const Kind = enum(u8) {
     /// Normaliser output: the streams target types 3 and 7 match against.
     normalized_html,
     normalized_text,
+    /// The JavaScript normaliser's output (P5.13). libclamav matches normalised JavaScript with
+    /// the HTML target (type 3), so the matcher treats it like `normalized_html`.
+    normalized_js,
     /// A script extracted from HTML.
     script,
     /// An executable's unpacked image (UPX).

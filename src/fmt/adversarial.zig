@@ -274,3 +274,29 @@ test "pathological PDFs stay within bounds" {
 }
 
 const pdf = @import("pdf.zig");
+
+test "pathological scripts stay linear in the JavaScript normaliser" {
+    const gpa = std.testing.allocator;
+    const size = 2 * 1024 * 1024;
+    const patterns = [_][]const u8{
+        "var v", // more declarations than the name table holds (each "var vvar v..." word differs)
+        "'a'+", // one endless fold
+        "unescape('%u", // call folds that never complete
+        "String.fromCharCode(1,", // argument lists past the cap
+        "/[", // regex classes that never close
+        "((((", // deep nesting
+    };
+    for (patterns) |p| {
+        const buf = try gpa.alloc(u8, size);
+        defer gpa.free(buf);
+        @memcpy(buf[0..8], "<script>");
+        for (buf[8..], 0..) |*b, i| b.* = p[i % p.len];
+        try run(.{ .name = "s.html", .bytes = buf, .expect = .nothing, .max_ms = 10_000, .lim = tight });
+    }
+    // Distinct identifiers: v0, v1, ... past the table.
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(gpa);
+    try b.appendSlice(gpa, "<script>");
+    for (0..200_000) |i| try b.print(gpa, "var v{d}=v{d};", .{ i, i / 2 });
+    try run(.{ .name = "names.html", .bytes = b.items, .expect = .nothing, .max_ms = 10_000, .lim = tight });
+}

@@ -36,6 +36,7 @@ const mime = @import("mime.zig");
 const pdf = @import("pdf.zig");
 const upx = @import("unpack/upx.zig");
 const html_norm = @import("html_norm.zig");
+const js_norm = @import("js_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
 
@@ -104,7 +105,44 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
             }
         },
     }
+    if (obj.kind == .script and (obj.format == .text or obj.format == .binary or obj.format == .html)) try normalizeJs(w, src);
 }
+
+/// The normalised JavaScript of an extracted script (a PDF /JS value), as a derived child "js".
+/// Input past MaxScriptNormalize is reported and left unnormalised.
+fn normalizeJs(w: *Walker, src: Source) Error!void {
+    const total = src.len() orelse return;
+    const j = w.scratch.allocator().create(js_norm.Normalizer) catch return w.limit(.memory);
+    const buf = w.alloc(u8, container.block_len) orelse return;
+    var sink: JsSink = .{ .w = w };
+    try w.beginDerived(&sink.obj, "js", .normalized_js);
+    defer w.endDerived(&sink.obj);
+    j.* = .init(.{ .ctx = &sink, .write = JsSink.write });
+    const max = w.tracker.limits.max_script_normalize;
+    var off: u64 = 0;
+    while (off < total) {
+        if (off >= max) {
+            w.limit(.script_normalize);
+            break;
+        }
+        const want: usize = @intCast(@min(buf.len, max - off));
+        const got = src.readAt(w.io, off, buf[0..want]) catch break;
+        if (got == 0) break;
+        j.feed(buf[0..got]) catch return error.Halted;
+        off += got;
+    }
+    j.finish() catch return error.Halted;
+}
+
+const JsSink = struct {
+    w: *Walker,
+    obj: Object = undefined,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+        const s: *JsSink = @ptrCast(@alignCast(ctx));
+        s.w.feed(&s.obj, bytes) catch return error.Stop;
+    }
+};
 
 fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     const r = st.reader;
@@ -119,6 +157,23 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     const tee_buf = w.alloc(u8, container.block_len) orelse return w.drain(r);
     var tee: container.Tee = .init(w, obj, r, tee_buf);
     defer tee.interface = undefined;
+    if (obj.kind == .script and (obj.format == .text or obj.format == .binary or obj.format == .html)) {
+        // An extracted script gets its text or HTML stream and its normalised JavaScript: two
+        // passes, so it is materialised first (scripts are bounded by MaxScriptNormalize).
+        var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
+        defer mat.deinit(w.io);
+        try w.drain(&tee.interface);
+        switch (obj.format) {
+            .text => {
+                const buf = w.alloc(u8, container.block_len) orelse return;
+                var sr: container.SourceReader = .init(w.io, mat.source, buf);
+                try normalizeText(w, &sr.interface);
+            },
+            .html => try normalizeHtml(w, mat.source),
+            else => {},
+        }
+        return normalizeJs(w, mat.source);
+    }
     switch (obj.format) {
         .gzip, .bzip2, .xz, .zstd => try decompress(w, obj, &tee.interface, &tee.pulled),
         .tar => {
@@ -247,15 +302,19 @@ fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
 }
 
 /// The target type 3 stream of an HTML object (derived child "html"), then each script body as
-/// a derived child "script/<n>". Two passes over a positional source, bounded state, no
-/// whole-document buffer; input past MaxHTMLNormalize is reported and left unnormalised.
+/// a derived child "script/<n>", then each script's normalised JavaScript as "js/<n>". Three
+/// passes over a positional source, bounded state, no whole-document buffer; input past
+/// MaxHTMLNormalize is reported and left unnormalised.
 fn normalizeHtml(w: *Walker, src: Source) Error!void {
     const buf = w.alloc(u8, container.block_len) orelse return;
-    inline for (.{ html_norm.Mode.normalized, html_norm.Mode.scripts }) |mode| {
+    const Pass = enum { normalized, scripts, js };
+    inline for (.{ Pass.normalized, Pass.scripts, Pass.js }) |pass| {
+        const mode: html_norm.Mode = if (pass == .normalized) .normalized else .scripts;
         var sink: HtmlSink = .{ .w = w, .mode = mode };
         defer sink.close();
-        if (mode == .normalized) try w.beginDerived(&sink.obj, "html", .normalized_html);
-        sink.open = mode == .normalized;
+        if (pass == .js) sink.js = w.scratch.allocator().create(js_norm.Normalizer) catch return w.limit(.memory);
+        if (pass == .normalized) try w.beginDerived(&sink.obj, "html", .normalized_html);
+        sink.open = pass == .normalized;
         var n = html_norm.Normalizer.init(mode, .{ .ctx = &sink, .write = HtmlSink.write, .boundary = HtmlSink.boundary });
         var off: u64 = 0;
         const total = src.len().?;
@@ -273,11 +332,12 @@ fn normalizeHtml(w: *Walker, src: Source) Error!void {
             off += got;
         }
         n.finish() catch return sink.failure();
-        if (limited and mode == .normalized) w.limit(.html_normalize);
-        if (mode == .scripts) {
+        if (limited and pass == .normalized) w.limit(.html_normalize);
+        if (pass == .scripts) {
             sink.close();
             reportScript(w, &sink.markers);
         }
+        if (pass == .js) sink.close();
     }
 }
 
@@ -289,10 +349,13 @@ const HtmlSink = struct {
     scripts: u32 = 0,
     name_buf: [24]u8 = undefined,
     markers: heuristics.ScriptScanner = .{},
+    /// The JavaScript pass: script bodies go through this normaliser into "js/<n>".
+    js: ?*js_norm.Normalizer = null,
 
     fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
         const s: *HtmlSink = @ptrCast(@alignCast(ctx));
         if (!s.open) return;
+        if (s.js) |j| return j.feed(bytes);
         if (s.mode == .scripts) s.markers.update(bytes);
         s.w.feed(&s.obj, bytes) catch return error.Stop;
     }
@@ -300,15 +363,23 @@ const HtmlSink = struct {
     fn boundary(ctx: *anyopaque, begin: bool) error{Stop}!void {
         const s: *HtmlSink = @ptrCast(@alignCast(ctx));
         if (begin) {
-            const name = std.fmt.bufPrint(&s.name_buf, "script/{d}", .{s.scripts}) catch "script";
+            const name = std.fmt.bufPrint(&s.name_buf, "{s}/{d}", .{ if (s.js != null) "js" else "script", s.scripts }) catch "script";
             s.scripts += 1;
-            s.w.beginDerived(&s.obj, name, .script) catch return error.Stop;
+            s.w.beginDerived(&s.obj, name, if (s.js != null) .normalized_js else .script) catch return error.Stop;
             s.open = true;
+            if (s.js) |j| j.* = .init(.{ .ctx = s, .write = jsWrite });
         } else s.close();
+    }
+
+    /// Normalised JavaScript out of the JS pass's normaliser.
+    fn jsWrite(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        s.w.feed(&s.obj, bytes) catch return error.Stop;
     }
 
     fn close(s: *HtmlSink) void {
         if (!s.open) return;
+        if (s.js) |j| j.finish() catch {};
         s.w.endDerived(&s.obj);
         s.open = false;
     }

