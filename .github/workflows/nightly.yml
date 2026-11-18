@@ -21,8 +21,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Format parsers and decoders: every fmt.* target each iteration.
-          - { target: fmt., iterations: 2000000 }
+          # Format parsers and decoders: one job per fmt.* target, so each gets its own
+          # two-hour budget (all of them in one job stopped fitting at about 25 targets). Keep
+          # this list in step with the Formats targets in tools/fuzz.zig.
+          - { target: fmt.7z, iterations: 2000000 }
+          - { target: fmt.bomb, iterations: 2000000 }
+          - { target: fmt.bzip2, iterations: 2000000 }
+          - { target: fmt.cab, iterations: 2000000 }
+          - { target: fmt.chm, iterations: 2000000 }
+          - { target: fmt.cpio, iterations: 2000000 }
+          - { target: fmt.dmg, iterations: 2000000 }
+          - { target: fmt.elf, iterations: 2000000 }
+          - { target: fmt.gzip, iterations: 2000000 }
+          - { target: fmt.html, iterations: 2000000 }
+          - { target: fmt.iso9660, iterations: 2000000 }
+          - { target: fmt.js, iterations: 2000000 }
+          - { target: fmt.macho, iterations: 2000000 }
+          - { target: fmt.mime, iterations: 2000000 }
+          - { target: fmt.nsis, iterations: 2000000 }
+          - { target: fmt.ole2, iterations: 2000000 }
+          - { target: fmt.ooxml, iterations: 2000000 }
+          - { target: fmt.pdf, iterations: 2000000 }
+          - { target: fmt.pe, iterations: 2000000 }
+          - { target: fmt.rtf, iterations: 2000000 }
+          - { target: fmt.tar, iterations: 2000000 }
+          - { target: fmt.text, iterations: 2000000 }
+          - { target: fmt.upx, iterations: 2000000 }
+          - { target: fmt.xz, iterations: 2000000 }
+          - { target: fmt.zip, iterations: 2000000 }
+          - { target: fmt.zstd, iterations: 2000000 }
           # Everything else in rotation.
           - { target: all, iterations: 5000000 }
     steps:
