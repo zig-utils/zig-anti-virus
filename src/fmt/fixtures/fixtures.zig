@@ -212,4 +212,18 @@ pub const exes = [_]Exe{
     .{ .name = "pe-overlap.exe", .bytes = @embedFile("exe-pe-overlap.exe.bin"), .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
     .{ .name = "pe-truncated.exe", .bytes = @embedFile("exe-pe-truncated.exe.bin"), .entry = 528, .sections = 3, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
     .{ .name = "pe-many-sections.exe", .bytes = @embedFile("exe-pe-many-sections.exe.bin"), .entry = 528, .sections = 12, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+    .{ .name = "x86_64.elf", .bytes = @embedFile("exe-x86_64.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ppc32-be.elf", .bytes = @embedFile("exe-ppc32-be.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "i386-32.elf", .bytes = @embedFile("exe-i386-32.elf.bin"), .entry = 256, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "relocatable.elf", .bytes = @embedFile("exe-relocatable.elf.bin"), .entry = null, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ep-outside.elf", .bytes = @embedFile("exe-ep-outside.elf.bin"), .entry = null, .sections = 4, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "truncated.elf", .bytes = @embedFile("exe-truncated.elf.bin"), .entry = 256, .sections = 0, .imphash = "", .impsize = 0, .malformed = true, .members = &.{} },
+    .{ .name = "x86_64-main.macho", .bytes = @embedFile("exe-x86_64-main.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "arm64-thread.macho", .bytes = @embedFile("exe-arm64-thread.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "i386-thread.macho", .bytes = @embedFile("exe-i386-thread.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "ppc-be-thread.macho", .bytes = @embedFile("exe-ppc-be-thread.macho.bin"), .entry = 768, .sections = 1, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "universal.fat", .bytes = @embedFile("exe-universal.fat.bin"), .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "slice/x86_64", .len = 1024, .crc = 0x6bc6c5db },
+        .{ .path = "slice/arm64", .len = 1024, .crc = 0xcc4180cc },
+    } },
 };

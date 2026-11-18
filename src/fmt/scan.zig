@@ -24,6 +24,8 @@ const tar = @import("tar.zig");
 const cpio = @import("cpio.zig");
 const zip = @import("zip.zig");
 const pe = @import("pe.zig");
+const elf = @import("elf.zig");
+const macho = @import("macho.zig");
 
 pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
     switch (src) {
@@ -54,6 +56,9 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         },
         .zip => try zip.walk(w, src),
         .pe => try pe.walk(w, src),
+        .elf => try elf.walk(w, src),
+        .macho => try macho.walk(w, src),
+        .macho_fat => try macho.walkFat(w, src),
         .binary, .text => if (zip.hasTrailer(w, src)) {
             // Data with a zip appended (a self-extractor stub, a polyglot): walk the zip too.
             w.notice(.mismatch, "zip: archive appended to other data");
@@ -84,7 +89,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
             var cursor: archive.Cursor = .{ .w = w, .reader = &tee.interface };
             try cpio.walk(w, &cursor);
         },
-        .zip, .pe => {
+        .zip, .pe, .elf, .macho, .macho_fat => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             try randomAccess(w, obj.format, mat.source);
@@ -99,6 +104,9 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
     switch (format) {
         .zip => try zip.walk(w, src),
         .pe => try pe.walk(w, src),
+        .elf => try elf.walk(w, src),
+        .macho => try macho.walk(w, src),
+        .macho_fat => try macho.walkFat(w, src),
         else => unreachable,
     }
 }

@@ -739,6 +739,201 @@ exe('pe-overlap.exe', buildPe({ overlapSections: true }), { entry: 0x210, sectio
 exe('pe-truncated.exe', buildPe({ truncateAt: 0x300 }), { entry: 0x210, sections: 3, malformed: true })
 exe('pe-many-sections.exe', buildPe({ sectionCount: 0xffff }), { entry: 0x210, sections: 12, malformed: true })
 
+/** An ELF executable: PT_LOAD text (R+X) at 0x400000, PT_LOAD data (R+W), four sections. */
+function buildElf(o: { is64?: boolean, big?: boolean, entry?: number, relocatable?: boolean, truncateAt?: number } = {}): Uint8Array {
+  const is64 = o.is64 ?? true
+  const le = !(o.big ?? false)
+  const b = new Uint8Array(0x480)
+  const v = new DataView(b.buffer)
+  const w16 = (off: number, x: number) => v.setUint16(off, x, le)
+  const w32 = (off: number, x: number) => v.setUint32(off, x, le)
+  const wA = (off: number, x: number) => is64 ? v.setBigUint64(off, BigInt(x), le) : v.setUint32(off, x, le)
+  b.set([0x7f, 0x45, 0x4c, 0x46, is64 ? 2 : 1, le ? 1 : 2, 1, 0])
+  const relocatable = o.relocatable ?? false
+  w16(16, relocatable ? 1 : 2)
+  w16(18, is64 ? 62 : 20)
+  w32(20, 1)
+  const A = is64 ? 8 : 4
+  const ehsize = is64 ? 64 : 52
+  const phsize = is64 ? 56 : 32
+  const shsize = is64 ? 64 : 40
+  const entryOff = 24
+  wA(entryOff, relocatable ? 0 : (o.entry ?? 0x400100))
+  const phoff = ehsize
+  const shoff = 0x340
+  wA(entryOff + A, relocatable ? 0 : phoff)
+  wA(entryOff + 2 * A, shoff)
+  const tail = entryOff + 3 * A
+  w32(tail, 0)
+  w16(tail + 4, ehsize)
+  w16(tail + 6, phsize)
+  w16(tail + 8, relocatable ? 0 : 2)
+  w16(tail + 10, shsize)
+  w16(tail + 12, 4)
+  w16(tail + 14, 3)
+  const phdr = (i: number, flags: number, off: number, vaddr: number, size: number) => {
+    const p = phoff + i * phsize
+    w32(p, 1)
+    if (is64) {
+      w32(p + 4, flags)
+      wA(p + 8, off)
+      wA(p + 16, vaddr)
+      wA(p + 24, vaddr)
+      wA(p + 32, size)
+      wA(p + 40, size)
+      wA(p + 48, 0x1000)
+    } else {
+      w32(p + 4, off)
+      w32(p + 8, vaddr)
+      w32(p + 12, vaddr)
+      w32(p + 16, size)
+      w32(p + 20, size)
+      w32(p + 24, flags)
+      w32(p + 28, 0x1000)
+    }
+  }
+  if (!relocatable) {
+    phdr(0, 5, 0, 0x400000, 0x200)
+    phdr(1, 6, 0x200, 0x600200, 0x100)
+  }
+  b.set([0x48, 0x31, 0xff, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05], 0x100)
+  const strtab = enc.encode('\0.text\0.data\0.shstrtab\0')
+  b.set(strtab, 0x300)
+  const shdr = (i: number, name: number, type: number, flags: number, addr: number, off: number, size: number) => {
+    const p = shoff + i * shsize
+    w32(p, name)
+    w32(p + 4, type)
+    wA(p + 8, flags)
+    wA(p + 8 + A, addr)
+    wA(p + 8 + 2 * A, off)
+    wA(p + 8 + 3 * A, size)
+  }
+  shdr(1, 1, 1, 6, relocatable ? 0 : 0x400100, 0x100, 0x40)
+  shdr(2, 7, 1, 3, relocatable ? 0 : 0x600200, 0x200, 0x100)
+  shdr(3, 13, 3, 0, 0, 0x300, strtab.length)
+  return o.truncateAt ? b.slice(0, o.truncateAt) : b
+}
+exe('x86_64.elf', buildElf(), { entry: 0x100, sections: 4 })
+exe('ppc32-be.elf', buildElf({ is64: false, big: true }), { entry: 0x100, sections: 4 })
+exe('i386-32.elf', buildElf({ is64: false }), { entry: 0x100, sections: 4 })
+exe('relocatable.elf', buildElf({ relocatable: true }), { entry: null, sections: 4 })
+exe('ep-outside.elf', buildElf({ entry: 0x900000 }), { entry: null, sections: 4 })
+exe('truncated.elf', buildElf({ truncateAt: 0x90 }), { entry: 0x100, sections: 0, malformed: true })
+
+/**
+ * A thin Mach-O: one text segment (file 0..0x400 at `vmaddr`) with a __text section at 0x300,
+ * entered through LC_MAIN or an LC_UNIXTHREAD thread state whose PC is vmaddr + 0x300.
+ */
+function buildMachO(o: { cpu: 'x86_64' | 'i386' | 'arm64' | 'ppc', main?: boolean }): Uint8Array {
+  const is64 = o.cpu === 'x86_64' || o.cpu === 'arm64'
+  const le = o.cpu !== 'ppc'
+  const cputype = { x86_64: 0x01000007, i386: 7, arm64: 0x0100000c, ppc: 18 }[o.cpu]
+  const vmaddr = is64 ? 0x100000000 : 0x1000
+  const b = new Uint8Array(0x400)
+  const v = new DataView(b.buffer)
+  const w32 = (off: number, x: number) => v.setUint32(off, x >>> 0, le)
+  const w64 = (off: number, x: number) => v.setBigUint64(off, BigInt(x), le)
+  w32(0, is64 ? 0xfeedfacf : 0xfeedface)
+  w32(4, cputype)
+  w32(12, 2)
+  let off = is64 ? 32 : 28
+  const start = off
+  // Segment with one section.
+  const segLen = is64 ? 72 : 56
+  const sectLen = is64 ? 80 : 68
+  w32(off, is64 ? 0x19 : 0x1)
+  w32(off + 4, segLen + sectLen)
+  b.set(enc.encode('__TEXT'), off + 8)
+  if (is64) {
+    w64(off + 24, vmaddr)
+    w64(off + 32, 0x1000)
+    w64(off + 40, 0)
+    w64(off + 48, 0x400)
+    w32(off + 56, 5)
+    w32(off + 60, 5)
+    w32(off + 64, 1)
+  } else {
+    w32(off + 24, vmaddr)
+    w32(off + 28, 0x1000)
+    w32(off + 32, 0)
+    w32(off + 36, 0x400)
+    w32(off + 40, 5)
+    w32(off + 44, 5)
+    w32(off + 48, 1)
+  }
+  const sect = off + segLen
+  b.set(enc.encode('__text'), sect)
+  b.set(enc.encode('__TEXT'), sect + 16)
+  if (is64) {
+    w64(sect + 32, vmaddr + 0x300)
+    w64(sect + 40, 0x80)
+    w32(sect + 48, 0x300)
+  } else {
+    w32(sect + 32, vmaddr + 0x300)
+    w32(sect + 36, 0x80)
+    w32(sect + 40, 0x300)
+  }
+  off += segLen + sectLen
+  let ncmds = 1
+  if (o.main) {
+    w32(off, 0x80000028)
+    w32(off + 4, 24)
+    w64(off + 8, 0x300)
+    off += 24
+  } else {
+    const flavor = { x86_64: 4, i386: 1, arm64: 6, ppc: 1 }[o.cpu]
+    const words = { x86_64: 42, i386: 16, arm64: 68, ppc: 40 }[o.cpu]
+    w32(off, 0x5)
+    w32(off + 4, 16 + words * 4)
+    w32(off + 8, flavor)
+    w32(off + 12, words)
+    const pc = vmaddr + 0x300
+    const state = off + 16
+    if (o.cpu === 'x86_64') w64(state + 16 * 8, pc)
+    if (o.cpu === 'arm64') w64(state + 32 * 8, pc)
+    if (o.cpu === 'i386') w32(state + 10 * 4, pc)
+    if (o.cpu === 'ppc') w32(state, pc)
+    off += 16 + words * 4
+  }
+  ncmds++
+  w32(16, ncmds)
+  w32(20, off - start)
+  b.set([0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3], 0x300)
+  return b
+}
+const machoX64 = buildMachO({ cpu: 'x86_64', main: true })
+const machoArm64 = buildMachO({ cpu: 'arm64' })
+exe('x86_64-main.macho', machoX64, { entry: 0x300, sections: 1 })
+exe('arm64-thread.macho', machoArm64, { entry: 0x300, sections: 1 })
+exe('i386-thread.macho', buildMachO({ cpu: 'i386' }), { entry: 0x300, sections: 1 })
+exe('ppc-be-thread.macho', buildMachO({ cpu: 'ppc' }), { entry: 0x300, sections: 1 })
+
+function fat(slicesIn: { cpu: number, data: Uint8Array }[]): Uint8Array {
+  const head = new Uint8Array(0x1000)
+  const v = new DataView(head.buffer)
+  v.setUint32(0, 0xcafebabe)
+  v.setUint32(4, slicesIn.length)
+  const parts: Uint8Array[] = [head]
+  let off = 0x1000
+  slicesIn.forEach((sl, i) => {
+    const e = 8 + i * 20
+    v.setUint32(e, sl.cpu)
+    v.setUint32(e + 8, off)
+    v.setUint32(e + 12, sl.data.length)
+    v.setUint32(e + 16, 12)
+    const padded = concat(sl.data, new Uint8Array((0x1000 - (sl.data.length % 0x1000)) % 0x1000))
+    parts.push(padded)
+    off += padded.length
+  })
+  return concat(...parts)
+}
+const evilMacho = concat(machoArm64.slice(0, 0x380), evil, new Uint8Array(0x400 - 0x380 - evil.length))
+exe('universal.fat', fat([{ cpu: 0x01000007, data: machoX64 }, { cpu: 0x0100000c, data: evilMacho }]), {
+  entry: null,
+  sections: 0,
+  members: [{ path: 'slice/x86_64', data: machoX64 }, { path: 'slice/arm64', data: evilMacho }],
+})
+
 // ---------------------------------------------------------------------------------------------
 // fixtures.zig
 

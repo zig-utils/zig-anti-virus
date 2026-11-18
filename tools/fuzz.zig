@@ -800,6 +800,8 @@ const Formats = struct {
         .{ .name = "fmt.cpio", .inputs = archives(".cpio") },
         .{ .name = "fmt.zip", .inputs = archives(".zip") },
         .{ .name = "fmt.pe", .inputs = exes(".exe") },
+        .{ .name = "fmt.elf", .inputs = exes(".elf") },
+        .{ .name = "fmt.macho", .inputs = exes(".macho") ++ exes(".fat") },
     };
 
     fn vectors(comptime vs: []const fixtures.Vector) []const []const u8 {

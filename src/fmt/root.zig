@@ -15,6 +15,8 @@ pub const tar = @import("tar.zig");
 pub const cpio = @import("cpio.zig");
 pub const zip = @import("zip.zig");
 pub const pe = @import("pe.zig");
+pub const elf = @import("elf.zig");
+pub const macho = @import("macho.zig");
 /// Reference vectors (tests, fuzzing, benchmarks).
 pub const fixtures = @import("fixtures/fixtures.zig");
 
@@ -33,4 +35,6 @@ test {
     _ = cpio;
     _ = zip;
     _ = pe;
+    _ = elf;
+    _ = macho;
 }
