@@ -13,6 +13,7 @@ const coverage_mod = @import("coverage.zig");
 const hash_build = @import("hash_build.zig");
 const cvd = @import("cvd.zig");
 const mbazaar = @import("mbazaar.zig");
+const builtin_rules = @import("builtin.zig");
 const hashidx = @import("../match/hashidx.zig");
 const writer = @import("../db/writer.zig");
 const format = @import("../db/format.zig");
@@ -75,6 +76,11 @@ pub const Compiler = struct {
                 try c.coverage.skip(c.gpa, owned_name, reason);
             }
         }
+    }
+
+    /// Add the signatures every database carries (EICAR).
+    pub fn addBuiltin(c: *Compiler) !void {
+        for (builtin_rules.rules()) |rule| try c.rules.append(c.gpa, rule);
     }
 
     /// Add a MalwareBazaar CSV export (opt-in feed).
