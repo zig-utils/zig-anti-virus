@@ -288,6 +288,27 @@ pub const archives = [_]Archive{
     .{ .name = "damaged.dmg", .bytes = @embedFile("archive-damaged.dmg.bin"), .malformed = true, .members = &.{} },
     .{ .name = "no-xml.dmg", .bytes = @embedFile("archive-no-xml.dmg.bin"), .malformed = false, .members = &.{} },
     .{ .name = "zeros-bomb.dmg", .bytes = @embedFile("archive-zeros-bomb.dmg.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "lzx.chm", .bytes = @embedFile("archive-lzx.chm.bin"), .malformed = false, .members = &.{
+        .{ .path = "#SYSTEM", .len = 300, .crc = 0xa93cb15e },
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "index.html", .len = 83, .crc = 0xc6f74002 },
+        .{ .path = "big.bin", .len = 150000, .crc = 0xf7a79eba },
+        .{ .path = "eicar.htm", .len = 68, .crc = 0x6851cf3c },
+        .{ .path = "b.bin", .len = 3000, .crc = 0xdb24f08b },
+    } },
+    .{ .name = "window21.chm", .bytes = @embedFile("archive-window21.chm.bin"), .malformed = false, .members = &.{
+        .{ .path = "#SYSTEM", .len = 300, .crc = 0xa93cb15e },
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "index.html", .len = 83, .crc = 0xc6f74002 },
+    } },
+    .{ .name = "dupes.chm", .bytes = @embedFile("archive-dupes.chm.bin"), .malformed = false, .members = &.{
+        .{ .path = "#SYSTEM", .len = 300, .crc = 0xa93cb15e },
+        .{ .path = "readme.txt", .len = 13, .crc = 0x0a85f4a7 },
+        .{ .path = "index.html", .len = 83, .crc = 0xc6f74002 },
+        .{ .path = "big.bin", .len = 150000, .crc = 0xf7a79eba },
+        .{ .path = "eicar.htm", .len = 68, .crc = 0x6851cf3c },
+        .{ .path = "b.bin", .len = 3000, .crc = 0xdb24f08b },
+    } },
     .{ .name = "dag-bomb.iso", .bytes = @embedFile("archive-dag-bomb.iso.bin"), .malformed = false, .members = &.{} },
 };
 

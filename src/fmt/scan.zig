@@ -31,6 +31,7 @@ const iso9660 = @import("iso9660.zig");
 const cab = @import("cab.zig");
 const dmg = @import("dmg.zig");
 const nsis = @import("nsis.zig");
+const chm = @import("chm.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
@@ -74,6 +75,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .cab => try cab.walk(w, src),
         .dmg => try dmg.walk(w, src),
         .nsis => try nsis.walk(w, src),
+        .chm => try chm.walk(w, src),
         .html => try normalizeHtml(w, src),
         .binary, .text => {
             if (obj.format == .text) {
@@ -115,7 +117,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
         .text => try normalizeText(w, &tee.interface),
-        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .html => {
+        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .chm, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             checkEntropy(w, obj.format, mat.source);
@@ -187,6 +189,7 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
         .cab => try cab.walk(w, src),
         .dmg => try dmg.walk(w, src),
         .nsis => try nsis.walk(w, src),
+        .chm => try chm.walk(w, src),
         .html => try normalizeHtml(w, src),
         else => unreachable,
     }
@@ -494,6 +497,7 @@ test "archives: every tar, cpio and zip variant, positional and streamed" {
             .{ .name = "macro.docm", .what = .embedded },
             .{ .name = "quantum.cab", .what = .unsupported },
             .{ .name = "overlap.cab", .what = .overlap },
+            .{ .name = "dupes.chm", .what = .overlap },
         }) |x| if (std.mem.eql(u8, a.name, x.name) and !rig.rec.has(x.what)) {
             std.debug.print("{s}: expected a {t} notice\n", .{ a.name, x.what });
             rig.rec.dump();

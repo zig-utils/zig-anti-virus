@@ -445,13 +445,15 @@ function e8Forward(data: Uint8Array, size: number): Uint8Array {
 
 interface LzxSym { lit?: number, len?: number, slot?: number, extra?: number, extraBits?: number }
 
-export function lzxCompress(input: Uint8Array, windowBits: number, o: { e8?: number, blockTypes?: number[] } = {}): Uint8Array {
+export function lzxCompress(input: Uint8Array, windowBits: number, o: { e8?: number, blockTypes?: number[], resetInterval?: number } = {}): Uint8Array {
   return lzxFrames(input, windowBits, o).bytes
 }
 
 /** The stream and the byte offset where each frame's data ends. */
-export function lzxFrames(input: Uint8Array, windowBits: number, o: { e8?: number, blockTypes?: number[] } = {}): { bytes: Uint8Array, ends: number[] } {
+export function lzxFrames(input: Uint8Array, windowBits: number, o: { e8?: number, blockTypes?: number[], resetInterval?: number } = {}): { bytes: Uint8Array, ends: number[], resets: number[] } {
   const ends: number[] = []
+  const resets: number[] = [0]
+  let resetBase = 0
   const data = o.e8 ? e8Forward(input, o.e8) : input
   const slots = { 15: 30, 16: 32, 17: 34, 18: 36, 19: 38, 20: 42, 21: 50 }[windowBits]!
   const mainSyms = 256 + slots * 8
@@ -473,6 +475,20 @@ export function lzxFrames(input: Uint8Array, windowBits: number, o: { e8?: numbe
   const head = new Map<number, number[]>()
   const types = o.blockTypes ?? [1, 2, 3]
   for (let f = 0, frame = 0; f < data.length; f += 32768, frame++) {
+    if (o.resetInterval && frame > 0 && frame % o.resetInterval === 0) {
+      // A reset point (CHM): fresh state and header; nothing before it is referenced.
+      R[0] = R[1] = R[2] = 1
+      prevMain.fill(0)
+      prevLen.fill(0)
+      head.clear()
+      resetBase = f
+      resets.push(out.length)
+      if (o.e8) {
+        bw.bits(1, 1)
+        bw.bits(o.e8 >>> 16, 16)
+        bw.bits(o.e8 & 0xffff, 16)
+      } else bw.bits(0, 1)
+    }
     const end = Math.min(f + 32768, data.length)
     const type = types[frame % types.length]
     if (type === 3) {
@@ -499,7 +515,7 @@ export function lzxFrames(input: Uint8Array, windowBits: number, o: { e8?: numbe
       let bestLen = 0
       let bestOff = 0
       for (const rOff of R) {
-        if (rOff > i || rOff > windowSize) continue
+        if (rOff > i - resetBase || rOff > windowSize) continue
         let l = 0
         while (l < 257 && i + l < end && data[i + l] === data[i + l - rOff]) l++
         if (l > bestLen) {
@@ -608,7 +624,7 @@ export function lzxFrames(input: Uint8Array, windowBits: number, o: { e8?: numbe
     ends.push(out.length)
   }
   flushBits()
-  return { bytes: new Uint8Array(out), ends }
+  return { bytes: new Uint8Array(out), ends, resets }
 }
 
 function writeLengths(bw: BitWriter, prev: number[], cur: number[]): void {
@@ -1003,6 +1019,124 @@ export function nsisData(h: Helpers, method: NsisMethod, solid: boolean, header:
   return o.truncate ? out.slice(0, o.truncate) : out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Compiled HTML Help (ITSF version 3): the header, the header section, an ITSP directory of
+// PMGL chunks (ENCINT-coded entries), and content section 0 holding the uncompressed files plus
+// the MSCompressed section's control data, reset table and LZX content.
+
+function encint(v: number): number[] {
+  const out = [v & 0x7f]
+  v = Math.floor(v / 128)
+  while (v > 0) {
+    out.unshift(0x80 | (v & 0x7f))
+    v = Math.floor(v / 128)
+  }
+  return out
+}
+
+function le64(v: number): number[] {
+  return [...le32(v >>> 0), ...le32(Math.floor(v / 0x100000000))]
+}
+
+function guid(s: string): number[] {
+  const p = s.split('-')
+  const b = (h: string) => h.match(/../g)!.map(x => Number.parseInt(x, 16))
+  return [...b(p[0]).reverse(), ...b(p[1]).reverse(), ...b(p[2]).reverse(), ...b(p[3]), ...b(p[4])]
+}
+
+export function chmFile(h: Helpers, plainFiles: Member[], compressedFiles: Member[], o: { windowBits?: number, resetFrames?: number, dupes?: number } = {}): Uint8Array {
+  const windowBits = o.windowBits ?? 16
+  const resetFrames = o.resetFrames ?? 2
+  // Section 1: the compressed files back to back.
+  const sec1Parts: Uint8Array[] = []
+  const entries: { name: string, section: number, offset: number, length: number }[] = []
+  let off1 = 0
+  for (const f of compressedFiles) {
+    entries.push({ name: f.path, section: 1, offset: off1, length: f.data.length })
+    sec1Parts.push(f.data)
+    off1 += f.data.length
+  }
+  // Extra names for the first compressed file's bytes, sorted after it (the first listed wins).
+  for (let i = 0; i < (o.dupes ?? 0); i++) entries.push({ name: `/zdup${i}.html`, section: 1, offset: 0, length: compressedFiles[0].data.length })
+  const sec1 = h.concat(...sec1Parts)
+  const { bytes: content, ends } = lzxFrames(sec1, windowBits, { resetInterval: resetFrames, e8: 0x1000000 })
+  // The reset table has one entry per 32 KiB frame: where its compressed data starts.
+  const resets = [0, ...ends.slice(0, -1)]
+  // ControlData version 2: reset interval and window in 32 KiB frames, then the cache size.
+  const control = new Uint8Array([...le32(6), ...enc.encode('LZXC'), ...le32(2), ...le32(resetFrames), ...le32((1 << windowBits) / 32768), ...le32((1 << windowBits) / 32768), ...le32(0)])
+  const resetTable = new Uint8Array([...le32(2), ...le32(resets.length), ...le32(8), ...le32(0x28), ...le64(sec1.length), ...le64(content.length), ...le64(0x8000), ...resets.flatMap(r => le64(r))])
+  const nameList = (() => {
+    const names = ['Uncompressed', 'MSCompressed']
+    const words: number[] = [0, names.length]
+    for (const n of names) {
+      words.push(n.length)
+      for (const ch of n) words.push(ch.charCodeAt(0))
+      words.push(0)
+    }
+    words[0] = words.length
+    return new Uint8Array(words.flatMap(wd => le16(wd)))
+  })()
+  const sec0: Member[] = [
+    { path: '::DataSpace/NameList', data: nameList },
+    { path: '::DataSpace/Storage/MSCompressed/ControlData', data: control },
+    { path: '::DataSpace/Storage/MSCompressed/SpanInfo', data: new Uint8Array(le64(sec1.length)) },
+    // The transform list names the LZX transform by its GUID, as UTF-16LE text.
+    { path: '::DataSpace/Storage/MSCompressed/Transform/List', data: new Uint8Array([...'{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}'].flatMap(ch => le16(ch.charCodeAt(0))).concat([0, 0, 0, 0])) },
+    { path: '::DataSpace/Storage/MSCompressed/Transform/{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}/InstanceData/ResetTable', data: resetTable },
+    ...plainFiles,
+    { path: '::DataSpace/Storage/MSCompressed/Content', data: content },
+  ]
+  const sec0Parts: Uint8Array[] = []
+  let off0 = 0
+  for (const f of sec0) {
+    entries.push({ name: f.path, section: 0, offset: off0, length: f.data.length })
+    sec0Parts.push(f.data)
+    off0 += f.data.length
+  }
+  entries.push({ name: '/', section: 0, offset: 0, length: 0 })
+  entries.sort((a, b) => a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0)
+  // PMGL chunks of 4096 bytes.
+  const chunkSize = 0x1000
+  const chunks: number[][] = []
+  let cur: number[] = []
+  for (const e of entries) {
+    const name = enc.encode(e.name)
+    const rec = [...encint(name.length), ...name, ...encint(e.section), ...encint(e.offset), ...encint(e.length)]
+    if (20 + cur.length + rec.length > chunkSize - 2) {
+      chunks.push(cur)
+      cur = []
+    }
+    cur.push(...rec)
+  }
+  chunks.push(cur)
+  const dirChunks = chunks.map((c, i) => {
+    const b = new Uint8Array(chunkSize)
+    b.set(enc.encode('PMGL'), 0)
+    b.set(le32(chunkSize - 20 - c.length), 4)
+    b.set(le32(0), 8)
+    b.set(le32(i === 0 ? 0xffffffff : i - 1), 12)
+    b.set(le32(i === chunks.length - 1 ? 0xffffffff : i + 1), 16)
+    b.set(c, 20)
+    return b
+  })
+  const itsp = new Uint8Array([
+    ...enc.encode('ITSP'), ...le32(1), ...le32(0x54), ...le32(0x0a), ...le32(chunkSize), ...le32(2), ...le32(1), ...le32(0xffffffff),
+    ...le32(0), ...le32(chunks.length - 1), ...le32(0xffffffff), ...le32(chunks.length), ...le32(0x409),
+    ...guid('5D02926A-212E-11D0-9DF9-00A0C922E6EC'), ...le32(0x54), ...le32(0xffffffff), ...le32(0xffffffff), ...le32(0xffffffff),
+  ])
+  const dir = h.concat(itsp, ...dirChunks)
+  const dirOff = 0x60 + 0x18
+  const contentOff = dirOff + dir.length
+  const total = contentOff + off0
+  const itsf = new Uint8Array([
+    ...enc.encode('ITSF'), ...le32(3), ...le32(0x60), ...le32(1), ...be32(0x12345678), ...le32(0x409),
+    ...guid('7C01FD10-7BAA-11D0-9E0C-00A0C922E6EC'), ...guid('7C01FD11-7BAA-11D0-9E0C-00A0C922E6EC'),
+    ...le64(0x60), ...le64(0x18), ...le64(dirOff), ...le64(dir.length), ...le64(contentOff),
+  ])
+  const hs0 = new Uint8Array([...le32(0x1fe), ...le32(0), ...le64(total), ...le32(0), ...le32(0)])
+  return h.concat(itsf, hs0, dir, ...sec0Parts)
+}
+
 /** Apple's LZFSE encoder (macOS compression_tool): the reference for the lzfse vectors. */
 export function lzfse(h: Helpers, data: Uint8Array): Uint8Array {
   return h.run('compression_tool', ['-encode', '-a', 'lzfse'], data)
@@ -1127,5 +1261,13 @@ export function build(h: Helpers): void {
   }
   const cut = nsisData(h, 'deflate', false, nsisHeader, nsisFiles, { noCrc: true })
   h.exe('nsis-truncated.exe', h.pe(cut.slice(0, cut.length - 3000)), { entry: 0x210, sections: 3, malformed: true, members: [{ path: 'overlay', data: cut.slice(0, cut.length - 3000) }] })
+  // Compiled HTML Help.
+  const page = enc.encode('<html><head><title>Help</title></head><body>Hello from the help file</body></html>\n')
+  const chmPlain: Member[] = [{ path: '/#SYSTEM', data: h.plain(300, 71) }, { path: '/readme.txt', data: fileA }]
+  const chmPacked: Member[] = [{ path: '/index.html', data: page }, { path: '/big.bin', data: h.plain(150_000, 73) }, { path: '/eicar.htm', data: evil }, { path: '/b.bin', data: fileB }]
+  const chmMembers = [...chmPlain, ...chmPacked].map(m => ({ path: m.path.slice(1), data: m.data }))
+  archive('lzx.chm', chmFile(h, chmPlain, chmPacked), chmMembers)
+  archive('window21.chm', chmFile(h, chmPlain, chmPacked.slice(0, 1), { windowBits: 21, resetFrames: 4 }), chmMembers.slice(0, 3))
+  archive('dupes.chm', chmFile(h, chmPlain, chmPacked, { dupes: 30 }), chmMembers)
   archive('dag-bomb.iso', isoImage([{ path: 'x.txt', data: fileA }], { joliet: true, dagDepth: 24 }), [])
 }
