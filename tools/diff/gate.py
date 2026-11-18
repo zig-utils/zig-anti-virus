@@ -34,8 +34,17 @@ def main():
     cmd = [args.clamscan, "--no-summary", "--allmatch", "--bytecode=no", "--detect-pua=yes"]
     if args.certs:
         cmd.append("--cvdcertsdir=" + args.certs)
+    # One database directory, as clamd and freshclam use: libclamav then takes the ignore lists
+    # (daily.ign2) before the signatures they name. Loading main.cvd with its own -d before
+    # daily.cvd would apply daily.ign2 too late.
+    dbdir = os.path.join(args.tmp, "clamav-db")
+    os.makedirs(dbdir, exist_ok=True)
     for c in args.cvd:
-        cmd += ["-d", c]
+        for f in (c, c + ".sign"):
+            link = os.path.join(dbdir, os.path.basename(f))
+            if os.path.exists(f) and not os.path.exists(link):
+                os.symlink(os.path.abspath(f), link)
+    cmd += ["-d", dbdir]
     r = subprocess.run(cmd + [args.samples], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, LC_ALL="C"))
     clam = collections.defaultdict(set)
     for line in r.stdout.decode("utf-8", "replace").splitlines():

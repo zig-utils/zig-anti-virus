@@ -4,8 +4,10 @@
 //!
 //! The target description block is `Key:Value` pairs separated by commas: Engine, Target,
 //! FileSize, EntryPoint, NumberOfSections, Container and Intermediates are compiled; IconGroup1,
-//! IconGroup2 and HandlerType are rejected with their own reasons until icons and rescans exist.
-//! The expression compiles to RPN (`ir.RpnOp`); `&` binds tighter than `|`, parentheses group,
+//! IconGroup2 are rejected with their own reason until icons exist; HandlerType is accepted (the
+//! match is a detection; the re-scan as that type belongs to the scan pipeline).
+//! The expression compiles to RPN (`ir.RpnOp`); `&` and `|` share one precedence and group to
+//! the right (as libclamav reads them), parentheses group,
 //! and `=X`, `>X`, `<X` (each with an optional `,Y` distinct count) apply to the subsig or block
 //! before them. Subsignatures are hex bodies with an optional `Offset:` prefix and `::iwfa`
 //! modifiers, byte compares (`trigger(>>offset#options#comparisons)`) or PCRE subsigs
@@ -244,7 +246,10 @@ pub fn parseTdb(text: []const u8, flevel_min: *u16, flevel_max: *u16) LineError!
                 }
             },
             7, 8 => return error.IconUnsupported,
-            9 => return error.HandlerTypeUnsupported,
+            // HandlerType: when the signature matches, libclamav also hands the file to that
+            // type's handler; the match itself is reported as a detection, which is what zav
+            // does. The type must be known; the re-scan is the scan pipeline's (P5).
+            9 => _ = try fileType(value),
             else => unreachable,
         }
     }
@@ -724,7 +729,7 @@ test "target description blocks" {
         .{ "Container:CL_TYPE_NOPE", error.UnknownFileType },
         .{ "Container:CL_TYPE_ZIP,Intermediates:CL_TYPE_ZIP", error.BadTdb },
         .{ "Target:1,IconGroup1:EVIL", error.IconUnsupported },
-        .{ "HandlerType:CL_TYPE_MSEXE", error.HandlerTypeUnsupported },
+        .{ "Target:0,HandlerType:CL_TYPE_NOPE", error.UnknownFileType },
     }) |c| try testing.expectError(c[1], parseTdb(c[0], &lo, &hi));
 }
 
