@@ -710,6 +710,200 @@ function lzma2Raw(d: Uint8Array, bcj = false): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A zip quine: a zip whose only member decompresses to the zip itself, after Russ Cox's
+// construction ("Zip Files All The Way Down"). Deflate is used as a two-instruction machine:
+// Ln, a stored block of n tokens, and Rn, a fixed-Huffman block copying the last n tokens. Every
+// token is exactly 5 bytes, so each R block is padded to 40 bits by splitting its copy. The CRC
+// of the member is the CRC of the file that contains it; the CRC is affine in its own 32 bits,
+// so the fixed point is found by Gaussian elimination over GF(2).
+
+const lenTable: [number, number, number][] = [] // [symbol, base, extra]
+{
+  const bases = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+  const extras = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+  bases.forEach((b, i) => lenTable.push([257 + i, b, extras[i]]))
+}
+const distBases = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+const distExtras = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+function lenSym(len: number): [number, number, number] {
+  for (let i = lenTable.length - 1; i >= 0; i--) if (len >= lenTable[i][1]) return lenTable[i]
+  throw new Error('length')
+}
+function distSym(d: number): [number, number, number] {
+  for (let i = distBases.length - 1; i >= 0; i--) if (d >= distBases[i]) return [i, distBases[i], distExtras[i]]
+  throw new Error('distance')
+}
+const lenBits = (len: number) => (lenSym(len)[0] >= 280 ? 8 : 7) + lenSym(len)[2]
+const distBits = (d: number) => 5 + distSym(d)[2]
+
+class Bits {
+  out: number[] = []
+  acc = 0
+  n = 0
+  put(v: number, len: number) {
+    for (let i = 0; i < len; i++) {
+      this.acc |= ((v >> i) & 1) << this.n
+      if (++this.n === 8) {
+        this.out.push(this.acc)
+        this.acc = 0
+        this.n = 0
+      }
+    }
+  }
+  /** Huffman codes go most significant bit first. */
+  code(v: number, len: number) {
+    for (let i = len - 1; i >= 0; i--) this.put((v >> i) & 1, 1)
+  }
+}
+
+/** Copy lengths summing to `total` at distance `total` whose symbols take exactly `bits`. */
+function splitCopy(total: number, bits: number): number[] | null {
+  const db = distBits(total)
+  const search = (left: number, budget: number, depth: number): number[] | null => {
+    if (left === 0) return budget === 0 ? [] : null
+    if (depth === 0) return null
+    for (let len = Math.min(258, left); len >= 3; len--) {
+      if (left - len !== 0 && left - len < 3) continue
+      const cost = lenBits(len) + db
+      if (cost > budget) continue
+      const rest = search(left - len, budget - cost, depth - 1)
+      if (rest) return [len, ...rest]
+    }
+    return null
+  }
+  return search(total, bits, 3)
+}
+
+/** Rn as exactly 5 bytes. The block (or a copy block and an empty block) may end up to two
+ * bits early: the next token is a stored block whose first header bits are zeros, so its header
+ * then spills into the next byte, which is exactly that token's own first byte (0x00). The
+ * final block may end anywhere in the fifth byte. */
+function repeatToken(n: number, final: boolean): Uint8Array | null {
+  const total = 5 * n
+  const slack = final ? 7 : 2
+  for (const empty of [false, true]) {
+    for (let spare = 0; spare <= slack; spare++) {
+      const lens = splitCopy(total, (empty ? 20 : 30) - spare)
+      if (!lens) continue
+      const b = new Bits()
+      b.put(final && !empty ? 1 : 0, 1)
+      b.put(1, 2)
+      for (const len of lens) {
+        const [sym, base, extra] = lenSym(len)
+        if (sym >= 280) b.code(0xc0 + sym - 280, 8)
+        else b.code(sym - 256, 7)
+        b.put(len - base, extra)
+        const [dsym, dbase, dextra] = distSym(total)
+        b.code(dsym, 5)
+        b.put(total - dbase, dextra)
+      }
+      b.code(0, 7)
+      if (empty) {
+        b.put(final ? 1 : 0, 1)
+        b.put(1, 2)
+        b.code(0, 7)
+      }
+      b.put(0, spare)
+      if (b.n !== 0 || b.out.length !== 5) throw new Error('repeat token is not 5 bytes')
+      return new Uint8Array(b.out)
+    }
+  }
+  return null
+}
+function literalToken(n: number): Uint8Array {
+  const len = 5 * n
+  return new Uint8Array([0, len & 0xff, len >> 8, ~len & 0xff, (~len >> 8) & 0xff])
+}
+
+function zipQuine(): Uint8Array {
+  // Pick name and comment lengths so that R(p+1) and R(s+1) fit in 5 bytes and P and S are
+  // whole tokens.
+  for (let nameLen = 5; nameLen < 60; nameLen += 5) {
+    const pLen = 30 + nameLen
+    const p = pLen / 5
+    if (!Number.isInteger(p) || !repeatToken(p + 1, false)) continue
+    for (let commentLen = 2; commentLen < 400; commentLen++) {
+      const sLen = 46 + nameLen + 22 + commentLen
+      if (sLen % 5 !== 0) continue
+      const sTok = sLen / 5
+      if (!repeatToken(sTok + 1, true)) continue
+      return buildQuine(nameLen, commentLen)
+    }
+  }
+  throw new Error('no quine layout')
+}
+
+function buildQuine(nameLen: number, commentLen: number): Uint8Array {
+  const name = 'r'.repeat(nameLen - 4) + '.zip'
+  const pLen = 30 + nameLen
+  const sLen = 46 + nameLen + 22 + commentLen
+  const p = pLen / 5
+  const sN = sLen / 5
+  const L = literalToken
+  const R = (n: number) => repeatToken(n, false)!
+  const codeTokens = (P: Uint8Array, S: Uint8Array): Uint8Array[] => [
+    L(p + 1), P, L(p + 1),
+    R(p + 1),
+    L(1), R(p + 1),
+    L(1), L(1),
+    L(4), R(p + 1), L(1), L(1), L(4),
+    R(4),
+    L(4), R(4), L(4), R(4), L(4),
+    R(4),
+    L(4), R(4), L(0), L(0), L(sN + 1),
+    R(4),
+    L(0), L(0),
+    // The payload copy of the final repeat is the final repeat's own bytes.
+    L(sN + 1), repeatToken(sN + 1, true)!, S,
+    repeatToken(sN + 1, true)!,
+  ]
+  // Tokens: 2 + p, then 1, 2, 2, 5, 1, 5, 1, 5, 1, 2, then 2 + s, then 1.
+  const codeLen = (p + sN + 30) * 5
+  const fileLen = pLen + codeLen + sLen
+  const make = (crc: number): Uint8Array => {
+    const P = concat(u32le(0x04034b50), new Uint8Array([20, 0, 0, 0, 8, 0, 0, 0, 0x21, 0x00]), u32le(crc), u32le(codeLen), u32le(fileLen), new Uint8Array([nameLen, 0, 0, 0]), name)
+    const cd = concat(u32le(0x02014b50), new Uint8Array([20, 0, 20, 0, 0, 0, 8, 0, 0, 0, 0x21, 0x00]), u32le(crc), u32le(codeLen), u32le(fileLen), new Uint8Array([nameLen, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), name)
+    const eocd = concat(u32le(0x06054b50), new Uint8Array([0, 0, 0, 0, 1, 0, 1, 0]), u32le(cd.length), u32le(pLen + codeLen), new Uint8Array([commentLen, 0]), 'q'.repeat(commentLen))
+    const S = concat(cd, eocd)
+    if (P.length !== pLen || S.length !== sLen) throw new Error('quine layout')
+    const file = concat(P, ...codeTokens(P, S), S)
+    if (file.length !== fileLen) throw new Error(`quine length ${file.length} != ${fileLen}`)
+    return file
+  }
+  // crc(make(c)) = M c + b over GF(2): solve (M + I) c = b.
+  const b = crc32(make(0))
+  const cols: number[] = []
+  for (let i = 0; i < 32; i++) cols.push((crc32(make((1 << i) >>> 0)) ^ b) >>> 0)
+  // Rows of the augmented system: for each output bit j, sum_i (M[j][i] + I[j][i]) c_i = b_j.
+  const rows: number[][] = []
+  for (let j = 0; j < 32; j++) {
+    const row: number[] = []
+    for (let i = 0; i < 32; i++) row.push(((cols[i] >>> j) & 1) ^ (i === j ? 1 : 0))
+    row.push((b >>> j) & 1)
+    rows.push(row)
+  }
+  for (let col = 0, r = 0; col < 32; col++, r++) {
+    const piv = rows.findIndex((row, k) => k >= r && row[col] === 1)
+    if (piv < 0) throw new Error('quine CRC system is singular')
+    ;[rows[r], rows[piv]] = [rows[piv], rows[r]]
+    for (let k = 0; k < 32; k++) if (k !== r && rows[k][col]) rows[k] = rows[k].map((v, i) => v ^ rows[r][i])
+  }
+  let crc = 0
+  for (let i = 0; i < 32; i++) if (rows[i][32]) crc |= 1 << i
+  const file = make(crc >>> 0)
+  if (crc32(file) !== crc >>> 0) throw new Error('quine CRC fixed point failed')
+  // The member must inflate to the file itself.
+  const member = file.slice(pLen, pLen + codeLen)
+  const inflated = new Uint8Array(zlib.inflateRawSync(member))
+  if (Buffer.compare(Buffer.from(inflated), Buffer.from(file)) !== 0) throw new Error('not a quine')
+  return file
+}
+{
+  const quine = zipQuine()
+  doc('quine.zip', quine, [], ['limit'])
+}
+
+// ---------------------------------------------------------------------------------------------
 // docs.zig
 
 const lines = [

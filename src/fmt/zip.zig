@@ -467,3 +467,7 @@ fn member(w: *Walker, src: Source, name: []const u8, data_off: u64, csize: u64, 
         },
     }
 }
+
+test "a zip quine stops at the recursion limit" {
+    try @import("pdf.zig").checkDocs(".zip");
+}

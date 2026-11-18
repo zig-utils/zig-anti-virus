@@ -1120,7 +1120,7 @@ const Formats = struct {
         .{ .name = "fmt.bomb", .inputs = vectors(&fixtures.bomb_vectors) },
         .{ .name = "fmt.tar", .inputs = archives(".tar") },
         .{ .name = "fmt.cpio", .inputs = archives(".cpio") },
-        .{ .name = "fmt.zip", .inputs = archives(".zip") },
+        .{ .name = "fmt.zip", .inputs = archives(".zip") ++ documents(".zip") },
         .{ .name = "fmt.ole2", .inputs = archives(".doc") },
         .{ .name = "fmt.ooxml", .inputs = archives(".docx") ++ archives(".docm") },
         .{ .name = "fmt.pe", .inputs = exes(".exe") },

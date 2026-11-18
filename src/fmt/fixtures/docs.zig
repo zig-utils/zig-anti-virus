@@ -80,4 +80,5 @@ pub const docs = [_]Doc{
         .{ .path = "stored.com", .len = 68, .crc = 0x6851cf3c },
     } },
     .{ .name = "encrypted.7z", .bytes = @embedFile("docs/encrypted.7z.bin"), .notices = &.{"encrypted"}, .members = &.{} },
+    .{ .name = "quine.zip", .bytes = @embedFile("docs/quine.zip.bin"), .notices = &.{"limit"}, .members = &.{} },
 };

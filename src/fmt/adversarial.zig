@@ -132,6 +132,10 @@ test "bombs and nesting stop at their limits within bounds" {
         .{ .name = "zeros-bomb.dmg", .bytes = archive("zeros-bomb.dmg"), .expect = .{ .limit = .ratio }, .max_ms = 5_000, .lim = tight, .positional_only = true },
     };
     for (cases) |c| try run(c);
+    // A zip quine (fixtures/documents.ts): its member is the zip itself, all the way down.
+    for (@import("fixtures/docs.zig").docs) |d| if (std.mem.eql(u8, d.name, "quine.zip")) {
+        try run(.{ .name = "quine.zip", .bytes = d.bytes, .expect = .{ .limit = .recursion }, .max_ms = 5_000, .lim = tight });
+    };
     for (fixtures.bomb_vectors) |v| try run(.{ .name = v.name, .bytes = v.compressed, .expect = .{ .limit = .ratio }, .max_ms = 10_000, .lim = tight });
 }
 
