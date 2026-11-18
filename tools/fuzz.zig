@@ -1115,7 +1115,7 @@ const Formats = struct {
     const targets = [_]Target{
         .{ .name = "fmt.gzip", .inputs = vectors(&fixtures.gzip_vectors) },
         .{ .name = "fmt.bzip2", .inputs = vectors(&fixtures.bzip2_vectors) },
-        .{ .name = "fmt.xz", .inputs = vectors(&fixtures.xz_vectors ++ fixtures.lzma_vectors) },
+        .{ .name = "fmt.xz", .inputs = vectors(&fixtures.xz_vectors ++ fixtures.lzma_vectors) ++ documents(".xz") },
         .{ .name = "fmt.zstd", .inputs = vectors(&fixtures.zstd_vectors) },
         .{ .name = "fmt.bomb", .inputs = vectors(&fixtures.bomb_vectors) },
         .{ .name = "fmt.tar", .inputs = archives(".tar") },

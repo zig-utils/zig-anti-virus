@@ -705,6 +705,10 @@ function lzma2Raw(d: Uint8Array, bcj = false): Uint8Array {
     { path: 'bzip2.txt', data: b },
     { path: 'stored.com', data: eicar },
   ])
+  // The same code in .xz with the x86 BCJ filter (two blocks, so the filter restarts), and with
+  // a BCJ start offset.
+  const bcjXz = py('sys.stdout.buffer.write(lzma.compress(data[:3000], filters=[{"id": lzma.FILTER_X86}, {"id": lzma.FILTER_LZMA2}]) + lzma.compress(data[3000:], filters=[{"id": lzma.FILTER_X86, "start_offset": 4096}, {"id": lzma.FILTER_LZMA2}]))', code)
+  doc('code.bin.xz', bcjXz, [{ path: 'code.bin', data: code }])
   // AES-256: reported, not decrypted.
   doc('encrypted.7z', sevenZip([{ coders: [{ id: [0x21], props: new Uint8Array([8]) }, { id: [6, 0xf1, 7, 1], props: new Uint8Array([0x13, 0x07]) }], packed: new Uint8Array(64).fill(0x5a), sizes: [eicar.length, 64], files: [eicar.length] }], [{ name: 'secret.com' }]), [], ['encrypted'])
 }

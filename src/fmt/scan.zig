@@ -485,7 +485,6 @@ test "every compression vector scans end to end, positional and streamed" {
             const name = group ++ ".bin";
             try rig.scanBoth(v.compressed, name);
             const limited = std.mem.eql(u8, v.name, "dict-64m") or std.mem.eql(u8, v.name, "window-128m");
-            const unsupported = std.mem.eql(u8, v.name, "bcj-x86");
             var children: usize = 0;
             for (rig.rec.objects.items) |e| {
                 if (e.kind != .decompressed) continue;
@@ -497,8 +496,6 @@ test "every compression vector scans end to end, positional and streamed" {
             if (limited) {
                 try std.testing.expect(rig.rec.hasLimit(.window_size));
                 try std.testing.expectEqual(@as(usize, 0), children);
-            } else if (unsupported) {
-                try std.testing.expect(rig.rec.has(.unsupported));
             } else {
                 if (rig.rec.notices.items.len != 0) {
                     std.debug.print("{s} {s}:\n", .{ group, v.name });

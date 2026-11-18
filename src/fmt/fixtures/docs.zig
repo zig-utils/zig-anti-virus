@@ -79,6 +79,9 @@ pub const docs = [_]Doc{
         .{ .path = "bzip2.txt", .len = 3568, .crc = 0xcc653372 },
         .{ .path = "stored.com", .len = 68, .crc = 0x6851cf3c },
     } },
+    .{ .name = "code.bin.xz", .bytes = @embedFile("docs/code.bin.xz.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "code.bin", .len = 6000, .crc = 0x5b283a8e },
+    } },
     .{ .name = "encrypted.7z", .bytes = @embedFile("docs/encrypted.7z.bin"), .notices = &.{"encrypted"}, .members = &.{} },
     .{ .name = "quine.zip", .bytes = @embedFile("docs/quine.zip.bin"), .notices = &.{"limit"}, .members = &.{} },
 };

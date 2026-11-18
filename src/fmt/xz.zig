@@ -2,12 +2,14 @@
 //! a filter chain, index, stream footer, stream padding and concatenated streams. Blocks decode
 //! through our own streaming LZMA2 (lzma.zig) with one dictionary per stream.
 //!
-//! Supported filter chain: LZMA2 alone. BCJ and delta filters are reported as unsupported (the
-//! block's raw bytes are still scanned by the parent). Integrity checks are parsed and skipped,
+//! Supported filter chains: LZMA2 alone, and the x86 BCJ filter before LZMA2 (bcj.zig). Other
+//! BCJ variants and delta are reported as unsupported (the block's raw bytes are still scanned
+//! by the parent). Integrity checks are parsed and skipped,
 //! as std does: a scanner reads damaged data anyway, and checks would only cost throughput.
 const std = @import("std");
 const Io = std.Io;
 const lzma = @import("lzma.zig");
+const bcj = @import("bcj.zig");
 const Crc32 = std.hash.crc.@"CRC-32/ISO-HDLC";
 
 pub const Error = error{ Corrupt, Unsupported, DictTooLarge, ReadFailed, EndOfStream };
@@ -34,6 +36,8 @@ const BlockHeader = struct {
     compressed: ?u64,
     uncompressed: ?u64,
     dict_size: u64,
+    /// An x86 BCJ filter runs on the LZMA2 output, from this start offset.
+    bcj: ?u32 = null,
 
     /// The dictionary actually needed: no larger than the block's declared output.
     fn dictCap(b: BlockHeader) u64 {
@@ -80,6 +84,13 @@ fn parseBlockHeader(h: []const u8) Error!BlockHeader {
             if (i != n_filters - 1 or props.len != 1) return error.Corrupt;
             out.dict_size = lzma.Lzma2.dictSize(props[0]) catch return error.Corrupt;
             lzma2_seen = true;
+        } else if (id == 0x04 and i == 0 and n_filters == 2) {
+            // x86 BCJ, optionally with a 4-byte start offset.
+            out.bcj = switch (props.len) {
+                0 => 0,
+                4 => std.mem.readInt(u32, props[0..4], .little),
+                else => return error.Corrupt,
+            };
         } else if (i == n_filters - 1) return error.Corrupt else return error.Unsupported;
     }
     if (!lzma2_seen) return error.Corrupt;
@@ -111,6 +122,17 @@ pub const Decoder = struct {
     /// dictionary larger than the output can never be referenced, so a block declaring one is
     /// decoded with `dict_buf` as long as that holds the whole output.
     output_bound: ?u64 = null,
+    /// The x86 BCJ stage of the current block: LZMA2 output is converted in `bcj_buf`, of
+    /// which `[bcj_start, bcj_done)` is final and waiting, and `[bcj_done, bcj_len)` is a tail
+    /// that may start an instruction.
+    bcj_on: bool = false,
+    bcj_buf: [8192]u8 = undefined,
+    bcj_start: usize = 0,
+    bcj_done: usize = 0,
+    bcj_len: usize = 0,
+    bcj_pos: u32 = 0,
+    bcj_mask: u32 = 0,
+    bcj_end: bool = false,
     err: ?Error = null,
     interface: Io.Reader,
 
@@ -164,10 +186,17 @@ pub const Decoder = struct {
                 if (block.dictCap() > d.dict.buf.len and !bounded) return error.DictTooLarge;
                 d.block_header_len = hdr_len;
                 d.lz2.reset(d.in);
+                d.bcj_on = block.bcj != null;
+                d.bcj_pos = block.bcj orelse 0;
+                d.bcj_start = 0;
+                d.bcj_done = 0;
+                d.bcj_len = 0;
+                d.bcj_mask = 0;
+                d.bcj_end = false;
                 d.state = .block_data;
             },
             .block_data => {
-                const n = try d.lz2.decodeInto(dest);
+                const n = if (d.bcj_on) try d.bcjFill(dest) else try d.lz2.decodeInto(dest);
                 if (n != 0) return n;
                 // Block done: padding to a multiple of four, then the check.
                 d.blocks += 1;
@@ -178,6 +207,37 @@ pub const Decoder = struct {
                 d.state = .block_header;
             },
         };
+    }
+
+    /// LZMA2 output through the x86 BCJ converter; 0 at the end of the block.
+    fn bcjFill(d: *Decoder, dest: []u8) Error!usize {
+        while (d.bcj_start == d.bcj_done) {
+            if (d.bcj_end) {
+                // The final few bytes are never an instruction: pass them on as they are.
+                if (d.bcj_done == d.bcj_len) return 0;
+                d.bcj_done = d.bcj_len;
+                break;
+            }
+            const tail = d.bcj_len - d.bcj_done;
+            std.mem.copyForwards(u8, d.bcj_buf[0..tail], d.bcj_buf[d.bcj_done..d.bcj_len]);
+            d.bcj_start = 0;
+            d.bcj_done = 0;
+            d.bcj_len = tail;
+            while (d.bcj_len < d.bcj_buf.len) {
+                const n = try d.lz2.decodeInto(d.bcj_buf[d.bcj_len..]);
+                if (n == 0) {
+                    d.bcj_end = true;
+                    break;
+                }
+                d.bcj_len += n;
+            }
+            d.bcj_done = bcj.x86(d.bcj_buf[0..d.bcj_len], d.bcj_pos, &d.bcj_mask);
+            d.bcj_pos +%= @truncate(d.bcj_done);
+        }
+        const n = @min(d.bcj_done - d.bcj_start, dest.len);
+        @memcpy(dest[0..n], d.bcj_buf[d.bcj_start..][0..n]);
+        d.bcj_start += n;
+        return n;
     }
 
     /// Index, stream footer, stream padding; then either another stream or the end.
@@ -259,13 +319,13 @@ fn decodeAll(gpa: std.mem.Allocator, compressed: []const u8, dict_max: u64) !str
     return .{ .len = total, .crc = crc.final() };
 }
 
+test "x86 BCJ blocks decode (liblzma's encoder over x86-like code)" {
+    try @import("pdf.zig").checkDocs(".xz");
+}
+
 test "decodes reference xz streams" {
     const gpa = std.testing.allocator;
     for (fixtures.xz_vectors) |v| {
-        if (std.mem.eql(u8, v.name, "bcj-x86")) {
-            try std.testing.expectError(error.Unsupported, decodeAll(gpa, v.compressed, 8 << 20));
-            continue;
-        }
         if (std.mem.eql(u8, v.name, "dict-64m")) {
             try std.testing.expectError(error.DictTooLarge, decodeAll(gpa, v.compressed, 8 << 20));
             continue;
