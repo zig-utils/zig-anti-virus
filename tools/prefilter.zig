@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 3) return usage();
     const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "compile")) return compileVariant(gpa, io, args[2..]);
     const database = try zav.db.reader.open(io, std.Io.Dir.cwd(), args[2], .{ .allow_unsigned = true });
     defer database.close();
     index_db = database;
@@ -48,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
         } else try dirs.append(arena, args[i]);
     }
     var corpus: Corpus = .{};
-    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "vmprog")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
+    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
 
     if (std.mem.eql(u8, cmd, "census")) return census(database, index);
     if (std.mem.eql(u8, cmd, "scan")) return scan(gpa, io, index, corpus, if (reference) .reference else .auto);
@@ -57,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "prefix")) return prefix(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "top")) return top(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "grams")) return grams(gpa, io, index, corpus);
+    if (std.mem.eql(u8, cmd, "kernel")) return kernelDiff(gpa, io, index, corpus);
+    if (std.mem.eql(u8, cmd, "planted")) return planted(gpa, io, index, limit);
     if (std.mem.eql(u8, cmd, "vmprog")) {
         // vmprog <db> <prog> <file>: verify one program at every anchor occurrence, with one
         // memo for the whole file, and report steps and time.
@@ -99,6 +102,43 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     return usage();
+}
+
+/// compile <out.zavdb> <cvd>... [--prefix] [--penalty-scale X]: a database with atom selection
+/// varied, for E2 and E3 (prefix selection; the stride penalties scaled).
+fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.spill", .{args[0]});
+    defer gpa.free(tmp);
+    try cwd.createDirPath(io, tmp);
+    defer cwd.deleteTree(io, tmp) catch {};
+    var spill_dir = try cwd.openDir(io, tmp, .{});
+    defer spill_dir.close(io);
+    var spill = zav.compile.spill.Spill.init(io, spill_dir);
+    var c = zav.compile.compiler.Compiler.initOptions(gpa, .{ .spill = &spill });
+    defer c.deinit();
+    for (args[1..]) |a| if (std.mem.endsWith(u8, a, ".cvd")) try c.preloadIgnores(io, cwd, a, .{ .kind = .cvd, .allow_unverified = true });
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--prefix")) {
+            c.atom_costs.prefix = true;
+        } else if (std.mem.eql(u8, a, "--no-defer")) {
+            c.atom_costs.no_defer = true;
+        } else if (std.mem.eql(u8, a, "--penalty-scale")) {
+            i += 1;
+            const k = try std.fmt.parseFloat(f64, args[i]);
+            for (&c.atom_costs.stride_penalty) |*x| x.* *= k;
+            c.atom_costs.q3_penalty *= k;
+            c.atom_costs.q2_penalty *= k;
+        }
+    }
+    for (args[1..]) |a| if (std.mem.endsWith(u8, a, ".cvd")) {
+        _ = try c.addContainer(io, cwd, a, .{ .kind = .cvd, .allow_unverified = true });
+    };
+    try c.addBuiltin();
+    const summary = try c.write(io, cwd, args[0], .{ .db_version = 1 });
+    std.debug.print("{s}: {d} programs\n", .{ args[0], summary.programs });
 }
 
 fn usage() void {
@@ -423,27 +463,144 @@ fn grams(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: 
     }
 }
 
-fn census(database: zav.db.reader.Database, index: bodyscan.BodyIndex) void {
-    if (database.section(.prefilter, 0)) |s| std.debug.print("PREFILTER section: {d} bytes\n", .{s.len});
-    for (index.prefilters, 0..) |slot, p| {
-        const part = slot orelse continue;
-        var filter_bytes: usize = 0;
-        for (part.filters[0..part.filter_count]) |f| filter_bytes += f.sbbf.blocks.len * 32;
-        const table_size = part.slots.len * @sizeOf(pf.Slot) + part.entries.len * @sizeOf(pf.Entry);
-        std.debug.print("partition {d}: filters {d} bytes, atom table {d} bytes ({d} slots, {d} entries), {d} programs without an atom\n", .{ p, filter_bytes, table_size, part.slots.len, part.entries.len, part.short.len });
-        var buf: [200]u8 = undefined;
-        if (p == 1) for (part.short) |k| {
-            var wr: std.Io.Writer = .fixed(&buf);
-            zav.compile.hexsig.format(index.programs.?.get(k).pattern, &wr) catch {};
-            std.debug.print("  no atom: prog {d} {s}\n", .{ k, wr.buffered() });
-        };
-        for (part.filters[0..part.filter_count]) |f| {
-            std.debug.print("  stride {d} q {d}: {d} atoms, {d} grams, {d} blocks ({d} KiB), {d:.2} bits/gram, expected FPR {d:.4}%\n", .{
-                f.stride,                                                                                    f.q,
-                f.atoms,                                                                                     f.sbbf.num_keys,
-                f.sbbf.blocks.len,                                                                           f.sbbf.blocks.len * 32 / 1024,
-                @as(f64, @floatFromInt(f.sbbf.blocks.len * 256)) / @as(f64, @floatFromInt(f.sbbf.num_keys)), f.sbbf.expectedFalsePositiveRate() * 100,
-            });
+/// The stage-one kernel against the scalar reference, file by file, plus as much random data.
+fn kernelDiff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
+    var ring: [pf.ring_len]pf.Candidate = undefined;
+    var want: std.ArrayList(pf.Candidate) = .empty;
+    defer want.deinit(gpa);
+    var got: std.ArrayList(pf.Candidate) = .empty;
+    defer got.deinit(gpa);
+    var bytes: u64 = 0;
+    var cands: u64 = 0;
+    var prng = std.Random.DefaultPrng.init(1);
+    const lt = struct {
+        fn less(_: void, a: pf.Candidate, b: pf.Candidate) bool {
+            return @as(u64, @bitCast(a)) < @as(u64, @bitCast(b));
         }
+    }.less;
+    for (0..2 * corpus.paths.items.len) |k| {
+        const random_round = k >= corpus.paths.items.len;
+        const p = corpus.paths.items[k % corpus.paths.items.len];
+        const d = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31));
+        defer gpa.free(d);
+        if (random_round) prng.random().bytes(d);
+        const part = index.partitionFor(targetOf(d)) orelse continue;
+        want.clearRetainingCapacity();
+        got.clearRetainingCapacity();
+        try pf.stage1Reference(part, d, &want, gpa);
+        var pos: usize = 0;
+        while (pos < d.len) {
+            const n, const next = pf.stage1(part, d, pos, &ring);
+            try got.appendSlice(gpa, ring[0..n]);
+            pos = next;
+        }
+        std.mem.sort(pf.Candidate, want.items, {}, lt);
+        std.mem.sort(pf.Candidate, got.items, {}, lt);
+        if (!std.mem.eql(u64, @ptrCast(want.items), @ptrCast(got.items))) {
+            std.debug.print("MISMATCH {s}{s}: kernel {d}, reference {d}\n", .{ p, if (random_round) " (random)" else "", got.items.len, want.items.len });
+            return error.KernelMismatch;
+        }
+        bytes += d.len;
+        cands += got.items.len;
     }
+    std.debug.print("kernel = reference on {d} files and as many random buffers: {d:.1} MB, {d} candidates\n", .{ corpus.paths.items.len, @as(f64, @floatFromInt(bytes)) / 1e6, cands });
+}
+
+/// Logical signatures planted one per file, prefiltered (with deferral) against reference
+/// verdicts: each hex subsig's first variant is synthesised (shortest gaps, first
+/// alternatives) and the subsigs are concatenated with filler between them.
+fn planted(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, limit: usize) !void {
+    _ = io;
+    const progs = index.programs.?;
+    const table = index.ldb.?;
+    const w = try Worker.init(gpa, &index);
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var tested: usize = 0;
+    var detected_both: usize = 0;
+    var deferred_rules: usize = 0;
+    var inconclusive: usize = 0;
+    var detected_prefilter_only_limited: usize = 0;
+    var mismatches: usize = 0;
+    const n = @min(limit, table.records.len);
+    const step = @max(1, table.records.len / n);
+    var rec_i: usize = 0;
+    while (rec_i < table.records.len and tested < n) : (rec_i += step) {
+        const rec = table.records[rec_i];
+        if (rec.prog_count == 0) continue;
+        buf.clearRetainingCapacity();
+        for (0..64) |_| try buf.append(gpa, ' ');
+        var last_subsig: i32 = -1;
+        var any_deferred = false;
+        var target: u8 = 0;
+        var pinned = false;
+        for (rec.prog_first..rec.prog_first + rec.prog_count) |i| {
+            const p = progs.get(i);
+            if (@as(i32, p.header.subsig) == last_subsig) continue;
+            last_subsig = p.header.subsig;
+            target = p.header.target;
+            if (p.header.off_kind != .any) pinned = true;
+            any_deferred = any_deferred or p.header.flags & prog.flag_deferred != 0;
+            try sample(gpa, &buf, p, r);
+            for (0..16) |_| try buf.append(gpa, ' ');
+        }
+        if (pinned) continue;
+        tested += 1;
+        if (any_deferred) deferred_rules += 1;
+        w.state.reset();
+        var budget: vm.Budget = .{};
+        var tracker = zav.engine.limits.Tracker.init(.{});
+        const file: bodyscan.File = .{ .info = .{ .size = buf.items.len }, .target = target };
+        const a = try bodyscan.scanBufferScratch(&index, buf.items, file, &budget, &tracker, &w.state, .auto, null, w.scan);
+        w.state.reset();
+        budget = .{};
+        const b = try bodyscan.scanBufferScratch(&index, buf.items, file, &budget, &tracker, &w.state, .reference, null, w.scan);
+        // The reference path searches every program, so its logical state can overflow
+        // where the prefiltered one does not: such a file decides nothing.
+        if (b == .limited) {
+            inconclusive += 1;
+            if (a == .infected) detected_prefilter_only_limited += 1;
+            continue;
+        }
+        const same = std.meta.activeTag(a) == std.meta.activeTag(b) and (a != .infected or a.infected.sig == b.infected.sig);
+        if (!same) {
+            std.debug.print("MISMATCH record {d}: prefiltered {any}, reference {any}\n", .{ rec_i, a, b });
+            mismatches += 1;
+            continue;
+        }
+        if (a == .infected) detected_both += 1;
+    }
+    std.debug.print("{d} logical signatures planted ({d} with deferred subsigs): {d} mismatches, {d} detected by both, {d} where the reference ran out of logical state ({d} of them detected by the prefiltered path)\n", .{ tested, deferred_rules, mismatches, detected_both, inconclusive, detected_prefilter_only_limited });
+    if (mismatches > 0) return error.Mismatch;
+}
+
+fn sample(gpa: std.mem.Allocator, out: *std.ArrayList(u8), p: prog.Program, r: std.Random) !void {
+    for (p.pattern.ops) |o| switch (o.code) {
+        .lit => try out.appendSlice(gpa, p.pattern.bytes(o)),
+        .masked => for (p.pattern.bytes(o), p.pattern.masks(o)) |v, m| {
+            if (o.flags & zav.compile.ir.op_negate != 0) {
+                try out.append(gpa, (v & m) ^ m ^ 0xff);
+            } else try out.append(gpa, (r.int(u8) & ~m) | (v & m));
+        },
+        .gapf => for (0..o.a) |_| try out.append(gpa, 'x'),
+        .alt => for (p.pattern.altOps(p.pattern.alternatives(o)[0])) |x| switch (x.code) {
+            .lit, .masked => try out.appendSlice(gpa, p.pattern.bytes(x)),
+            else => for (0..x.a) |_| try out.append(gpa, 'x'),
+        },
+        .nalt => for (0..o.b & 0xffff) |_| try out.append(gpa, 0xa5),
+        .bound => try out.append(gpa, ' '),
+        .part_end => for (0..o.a) |_| try out.append(gpa, 'x'),
+        else => {},
+    };
+}
+
+fn census(database: zav.db.reader.Database, index: bodyscan.BodyIndex) !void {
+    if (database.section(.prefilter, 0)) |sec| std.debug.print("PREFILTER section: {d} bytes\n", .{sec.len});
+    var buf: [4096]u8 = undefined;
+    var w = std.debug.lockStderr(&buf).terminal().writer;
+    defer std.debug.unlockStderr();
+    try zav.match.prefilter.describe(&index.prefilters, w);
+    try w.flush();
 }

@@ -806,3 +806,68 @@ test "YARA rules end to end: text, hex and regex strings, offsets, reads, always
         };
     }
 }
+
+test "the prefiltered scan allocates nothing: worker memory comes from a counting allocator once" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Compiler = @import("../compile/compiler.zig").Compiler;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = Compiler.init(gpa);
+    defer c.deinit();
+    try c.addFile("t.ndb", "T.A-1-0:0:*:13a7c95be2f1408d77e3b1aa\nT.C-2-0:0:*:c95be2f1\nT.D-3-0:0:*:ff25a4{3}00000000\n");
+    try c.addFile("t.ldb", "T.L-4-0;Target:0;0&1;6576616c28756e65;6162\n");
+    _ = try c.write(io, tmp.dir, "a.zavdb", .{ .db_version = 1 });
+    const database = try db.reader.open(io, tmp.dir, "a.zavdb", .{ .allow_unsigned = true });
+    defer database.close();
+    const index = try BodyIndex.load(database);
+    try std.testing.expect(index.prefilters[0] != null);
+
+    const Counting = struct {
+        parent: std.mem.Allocator,
+        allocs: usize = 0,
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.allocs += 1;
+            return self.parent.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.allocs += 1;
+            return self.parent.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.allocs += 1;
+            return self.parent.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.parent.rawFree(m, a, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+    };
+    var counting: Counting = .{ .parent = gpa };
+    const ca = counting.allocator();
+    var arena: std.heap.ArenaAllocator = .init(ca);
+    defer arena.deinit();
+    var state = try logical.State.init(arena.allocator());
+    const worker = try arena.allocator().create(Scratch);
+    const before = counting.allocs;
+
+    var prng = std.Random.DefaultPrng.init(3);
+    var data: [1 << 16]u8 = undefined;
+    var tracker = limits_mod.Tracker.init(.{});
+    for (0..8) |round| {
+        prng.random().bytes(&data);
+        @memcpy(data[100..][0..12], "\x13\xa7\xc9\x5b\xe2\xf1\x40\x8d\x77\xe3\xb1\xaa");
+        @memcpy(data[5000..][0..11], "eval(une ab");
+        state.reset();
+        var budget: vm.Budget = .{};
+        const v = try scanBufferScratch(&index, &data, .{ .info = .{ .size = data.len } }, &budget, &tracker, &state, .auto, null, worker);
+        if (round == 0) try std.testing.expect(v == .infected);
+    }
+    try std.testing.expectEqual(before, counting.allocs);
+}

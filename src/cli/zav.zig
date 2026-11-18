@@ -239,6 +239,16 @@ fn infoAction(ctx: *Command.ParseContext) !u8 {
     for (database.sections()) |s| {
         try app.out.print("    {t:<16} variant {d:<3} offset {d:<10} size {d}{s}\n", .{ s.kind, s.variant, s.offset, s.size, if (s.flags.hot) " (hot)" else "" });
     }
+    // The byte-pattern prefilter: filter sizes and loads per partition.
+    if (database.section(.prefilter, 0)) |section| if (database.section(.subsig_prog, 0)) |progs_bytes| {
+        const progs = zav.match.prog.Programs.init(progs_bytes) catch return 0;
+        const parts = zav.match.prefilter.loadAll(section, progs) catch |e| {
+            try app.out.print("  prefilter    invalid: {t}\n", .{e});
+            return 0;
+        };
+        try app.out.writeAll("  prefilter\n");
+        try zav.match.prefilter.describe(&parts, app.out);
+    };
     return 0;
 }
 

@@ -82,6 +82,8 @@ pub const Costs = struct {
     /// Prefix selection (E3): the first 4-byte window of the first literal, stride 1, and no
     /// deferral.
     prefix: bool = false,
+    /// Search every subsig (the non-deferred path the deferred one is checked against).
+    no_defer: bool = false,
 };
 
 /// Cost of a program with no atom at all (the reference scanner finds it): avoided whenever a
@@ -435,7 +437,7 @@ pub fn plan(gpa: std.mem.Allocator, model: gm.Model, costs: Costs, inputs: []con
     for (inputs, out) |in, *o| {
         o.* = .{ .choice = chooseFor(model, costs, in) };
     }
-    if (costs.prefix) return out;
+    if (costs.prefix or costs.no_defer) return out;
     var sub_costs: [ir.max_subsigs]?f64 = undefined;
     for (logicals) |l| {
         const rule = l.rule orelse continue;

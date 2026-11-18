@@ -300,6 +300,41 @@ pub const Partition = struct {
     }
 };
 
+/// Print each partition's filters (size, grams, bits per gram, share of bits set, expected
+/// false-positive rate) and the shared atom table's load, for `zav info` and E2.
+pub fn describe(parts: *const [partitions]?Partition, w: *std.Io.Writer) !void {
+    var table_done = false;
+    for (parts, 0..) |slot, p| {
+        const part = slot orelse continue;
+        if (!table_done) {
+            table_done = true;
+            var used: usize = 0;
+            for (part.slots) |sl| used += @intFromBool(sl.first != empty_slot);
+            try w.print("  atom table   {d} slots ({d:.1}% used), {d} entries, {d} checks, {d} bytes\n", .{
+                part.slots.len,
+                100 * @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(part.slots.len)),
+                part.entries.len,
+                part.checks.len,
+                part.slots.len * @sizeOf(Slot) + part.entries.len * @sizeOf(Entry) + part.checks.len * @sizeOf(Check),
+            });
+        }
+        try w.print("  partition {d:<2} {d} programs without an atom{s}\n", .{ p, part.short.len, if (part.gate.len > 0) ", stride-one gate" else "" });
+        for (part.filters[0..part.filter_count]) |f| {
+            var set: u64 = 0;
+            for (f.sbbf.blocks) |b| for (b) |word| {
+                set += @popCount(word);
+            };
+            const bits = f.sbbf.blocks.len * 256;
+            try w.print("    stride {d} q {d}: {d} atoms, {d} grams, {d} bytes, {d:.1} bits/gram, {d:.1}% bits set, expected FPR {d:.3}%\n", .{
+                f.stride,                                                                         f.q,
+                f.atoms,                                                                          f.sbbf.num_keys,
+                f.sbbf.blocks.len * 32,                                                           @as(f64, @floatFromInt(bits)) / @as(f64, @floatFromInt(@max(f.sbbf.num_keys, 1))),
+                100 * @as(f64, @floatFromInt(set)) / @as(f64, @floatFromInt(bits)), f.sbbf.expectedFalsePositiveRate() * 100,
+            });
+        }
+    }
+}
+
 /// The home slot of `key` in a table of `n` slots (a power of two).
 pub inline fn slotOf(key: u32, n: usize) usize {
     const h = (@as(u64, key) *% 0x9E37_79B9_7F4A_7C15) >> 32;
