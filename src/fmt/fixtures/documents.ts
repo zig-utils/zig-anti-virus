@@ -501,6 +501,60 @@ for (const sec of [undefined, { revision: 3, user: '', owner: 'owner' }, { revis
 }
 
 // ---------------------------------------------------------------------------------------------
+// RTF with embedded objects ([MS-OLEDS] OLE1 ObjectHeader, the OLE Packager).
+
+function u32le(v: number): Uint8Array {
+  const b = new Uint8Array(4)
+  new DataView(b.buffer).setUint32(0, v, true)
+  return b
+}
+function lpstr(s: string): Uint8Array {
+  return s.length === 0 ? u32le(0) : concat(u32le(s.length + 1), s, new Uint8Array(1))
+}
+function ole1(cls: string, native: Uint8Array): Uint8Array {
+  return concat(u32le(0x501), u32le(2), lpstr(cls), lpstr(''), lpstr(''), u32le(native.length), native)
+}
+function packager(label: string, data: Uint8Array): Uint8Array {
+  const path = `C:\\Users\\x\\${label}`
+  const tmp = `C:\\Temp\\${label}\0`
+  return concat(new Uint8Array([2, 0]), `${label}\0${path}\0`, new Uint8Array([0, 0, 3, 0]), u32le(tmp.length), tmp, u32le(data.length), data, new Uint8Array(8))
+}
+/** Hex with the obfuscations Word tolerates: mixed case, line breaks, spaces, ignored groups. */
+function rtfHex(d: Uint8Array): string {
+  let s = ''
+  for (let i = 0; i < d.length; i++) {
+    const h = d[i].toString(16).padStart(2, '0')
+    s += i % 3 === 0 ? h.toUpperCase() : h
+    if (i % 29 === 28) s += '\r\n'
+    if (i === 10) s += ' {\\*\\zavjunk 4142} '
+    if (i === 20) s += '\\par '
+  }
+  return s
+}
+{
+  const obj = ole1('Package', packager('eicar.com', eicar))
+  doc('package.rtf', latin1(`{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}\\pard Hello {\\b world}\\par\n{\\object\\objemb\\objw100\\objh100{\\*\\objclass Package}{\\*\\objdata\n${rtfHex(obj)}\n}}\n}`), [
+    { path: 'object/0/eicar.com', data: eicar },
+  ])
+}
+{
+  // \bin: raw bytes inside objdata, then more hex.
+  const native = concat(enc.encode('native '), eicar)
+  const obj = ole1('Word.Document.8', native)
+  const cut = 30
+  doc('bin.rtf', concat(`{\\rtf1{\\object\\objemb{\\*\\objdata ${hex(obj.slice(0, cut))}\\bin${obj.length - cut - 4} `, obj.slice(cut, obj.length - 4), `${hex(obj.slice(obj.length - 4))}}}}`), [
+    { path: 'object/0', data: native },
+  ])
+}
+{
+  // Not OLE1: scanned whole. The second object is never closed; an odd last digit is dropped.
+  doc('raw.rtf', latin1(`{\\rtf1{\\*\\objdata ${hex(eicar)}}{\\object{\\*\\objdata ${hex(eicar)}f`), [
+    { path: 'objdata/0', data: eicar },
+    { path: 'objdata/1', data: eicar },
+  ])
+}
+
+// ---------------------------------------------------------------------------------------------
 // docs.zig
 
 const lines = [

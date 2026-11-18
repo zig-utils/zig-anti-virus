@@ -300,3 +300,21 @@ test "pathological scripts stay linear in the JavaScript normaliser" {
     for (0..200_000) |i| try b.print(gpa, "var v{d}=v{d};", .{ i, i / 2 });
     try run(.{ .name = "names.html", .bytes = b.items, .expect = .nothing, .max_ms = 10_000, .lim = tight });
 }
+
+test "pathological RTF stays linear" {
+    const gpa = std.testing.allocator;
+    const size = 2 * 1024 * 1024;
+    const Pat = struct { []const u8, Expect };
+    for ([_]Pat{
+        .{ "{", .nothing }, // nesting
+        .{ "{\\*\\objdata 41}", .{ .limit = .files } }, // more objects than MaxFiles
+        .{ "\\bin99999999 ", .nothing }, // \bin lengths past the end
+        .{ "\\objdata 0", .nothing }, // one object that never closes
+    }) |c| {
+        const buf = try gpa.alloc(u8, size);
+        defer gpa.free(buf);
+        @memcpy(buf[0..6], "{\\rtf1");
+        for (buf[6..], 0..) |*b, i| b.* = c[0][i % c[0].len];
+        try run(.{ .name = "a.rtf", .bytes = buf, .expect = c[1], .max_ms = 10_000, .lim = tight });
+    }
+}

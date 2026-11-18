@@ -55,4 +55,14 @@ pub const docs = [_]Doc{
         .{ .path = "js/s0", .len = 77, .crc = 0x4fb27b77 },
         .{ .path = "js/s1", .len = 16, .crc = 0x83c57210 },
     } },
+    .{ .name = "package.rtf", .bytes = @embedFile("docs/package.rtf.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "object/0/eicar.com", .len = 68, .crc = 0x6851cf3c },
+    } },
+    .{ .name = "bin.rtf", .bytes = @embedFile("docs/bin.rtf.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "object/0", .len = 75, .crc = 0xee93fed4 },
+    } },
+    .{ .name = "raw.rtf", .bytes = @embedFile("docs/raw.rtf.bin"), .notices = &.{}, .members = &.{
+        .{ .path = "objdata/0", .len = 68, .crc = 0x6851cf3c },
+        .{ .path = "objdata/1", .len = 68, .crc = 0x6851cf3c },
+    } },
 };

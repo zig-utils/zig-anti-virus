@@ -4,6 +4,7 @@
 const std = @import("std");
 const mime = @import("mime.zig");
 const pdf = @import("pdf.zig");
+const rtf = @import("rtf.zig");
 
 /// Bytes a detector looks at. tar needs 512 (the header block), HTML sniffing likes more.
 pub const head_len = 4096;
@@ -37,11 +38,13 @@ pub const Format = enum(u8) {
     mail,
     /// PDF (P5.12); target type 10.
     pdf,
+    /// RTF (P5.14).
+    rtf,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
         return switch (f) {
-            .gzip, .bzip2, .xz, .zstd, .tar, .cpio => true,
+            .gzip, .bzip2, .xz, .zstd, .tar, .cpio, .rtf => true,
             else => false,
         };
     }
@@ -87,6 +90,7 @@ pub fn detect(head: []const u8) Format {
     if (pdf.headerOffset(head) != null) return .pdf;
     if (isCpio(head)) return .cpio;
     if (isTar(head)) return .tar;
+    if (rtf.isRtf(head)) return .rtf;
     if (mime.isMail(head)) return .mail;
     if (isHtml(head)) return .html;
     if (isText(head)) return .text;

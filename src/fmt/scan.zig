@@ -34,6 +34,7 @@ const nsis = @import("nsis.zig");
 const chm = @import("chm.zig");
 const mime = @import("mime.zig");
 const pdf = @import("pdf.zig");
+const rtf = @import("rtf.zig");
 const upx = @import("unpack/upx.zig");
 const html_norm = @import("html_norm.zig");
 const js_norm = @import("js_norm.zig");
@@ -91,6 +92,11 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .chm => try chm.walk(w, src),
         .mail => try mime.walk(w, src),
         .pdf => try pdf.walk(w, src),
+        .rtf => {
+            const buf = w.alloc(u8, container.block_len) orelse return;
+            var sr: container.SourceReader = .init(w.io, src, buf);
+            try rtf.walk(w, &sr.interface);
+        },
         .html => try normalizeHtml(w, src),
         .binary, .text => {
             if (obj.format == .text) {
@@ -186,6 +192,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
         .text => try normalizeText(w, &tee.interface),
+        .rtf => try rtf.walk(w, &tee.interface),
         .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .chm, .mail, .pdf, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
