@@ -118,6 +118,7 @@ pub fn parseLine(format: Format, line: []const u8) LineError!ir.HashRule {
         .flevel_max = flevel_max,
         .source = format.source,
         .flags = .{ .pua = format.pua },
+        .line = line,
     };
 }
 

@@ -67,6 +67,8 @@ pub const HashRule = struct {
     flevel_max: u16 = 0,
     source: Source,
     flags: Flags = .{},
+    /// The database line the rule came from, for `.ign2` entries that pin a line's MD5.
+    line: []const u8 = "",
 
     pub fn digestBytes(rule: *const HashRule) []const u8 {
         return rule.digest[0..rule.algo.digestLen()];

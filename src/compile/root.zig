@@ -5,11 +5,17 @@ pub const cvd = @import("cvd.zig");
 pub const ir = @import("ir.zig");
 pub const hashsig = @import("hashsig.zig");
 pub const hash_build = @import("hash_build.zig");
+pub const filters = @import("filters.zig");
+pub const coverage = @import("coverage.zig");
+pub const compiler = @import("compiler.zig");
 
 test {
     _ = cvd;
     _ = ir;
     _ = hashsig;
     _ = hash_build;
+    _ = filters;
+    _ = coverage;
+    _ = compiler;
     _ = @This();
 }
