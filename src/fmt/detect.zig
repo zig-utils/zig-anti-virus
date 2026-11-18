@@ -26,6 +26,8 @@ pub const Format = enum(u8) {
     /// Phase-three containers (P5.18).
     iso9660,
     cab,
+    /// Recognised by its trailer (dmg.hasTrailer), positional sources only.
+    dmg,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
@@ -38,7 +40,7 @@ pub const Format = enum(u8) {
     /// Formats parsed with positional reads (central directories, section tables).
     pub fn needsRandomAccess(f: Format) bool {
         return switch (f) {
-            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab => true,
+            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg => true,
             else => false,
         };
     }

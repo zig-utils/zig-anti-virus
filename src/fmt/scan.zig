@@ -29,6 +29,7 @@ const macho = @import("macho.zig");
 const ole2 = @import("ole2.zig");
 const iso9660 = @import("iso9660.zig");
 const cab = @import("cab.zig");
+const dmg = @import("dmg.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
 const heuristics = @import("../engine/heuristics.zig");
@@ -43,8 +44,7 @@ pub fn parse(w: *Walker, obj: *Object, src: Source) Error!void {
 fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
     var head: [detect.head_len]u8 = undefined;
     const n = src.readAt(w.io, 0, &head) catch 0;
-    obj.format = detect.detect(head[0..n]);
-    if (obj.format == .binary) obj.format = deepPositional(w, src);
+    obj.format = deepPositional(w, src, detect.detect(head[0..n]));
     try w.begin(obj);
     try w.feedSource(obj, src);
     checkName(w, obj);
@@ -71,6 +71,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .ole2 => try ole2.walk(w, src),
         .iso9660 => try iso9660.walk(w, src),
         .cab => try cab.walk(w, src),
+        .dmg => try dmg.walk(w, src),
         .html => try normalizeHtml(w, src),
         .binary, .text => {
             if (obj.format == .text) {
@@ -112,7 +113,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
         .text => try normalizeText(w, &tee.interface),
-        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .html => {
+        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             checkEntropy(w, obj.format, mat.source);
@@ -123,8 +124,16 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     try w.drain(&tee.interface);
 }
 
-/// Formats recognised past the detection head (see `detect.detectDeep`), for positional sources.
-fn deepPositional(w: *Walker, src: Source) Format {
+/// Formats recognised past the detection head, for positional sources: ISO 9660 by its volume
+/// descriptor (`detect.detectDeep`), and disk images by their trailer. A disk image's data fork
+/// starts with its first chunk, so its head can look like raw data or a compression wrapper.
+fn deepPositional(w: *Walker, src: Source, head_format: Format) Format {
+    switch (head_format) {
+        .binary, .gzip, .bzip2, .xz, .zstd => {},
+        else => return head_format,
+    }
+    if (dmg.hasTrailer(w, src)) return .dmg;
+    if (head_format != .binary) return head_format;
     var probe: [detect.deep_probe_end - detect.deep_probe_off]u8 = undefined;
     src.readAllAt(w.io, detect.deep_probe_off, &probe) catch return .binary;
     return detect.detectDeep(&probe) orelse .binary;
@@ -174,6 +183,7 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
         .ole2 => try ole2.walk(w, src),
         .iso9660 => try iso9660.walk(w, src),
         .cab => try cab.walk(w, src),
+        .dmg => try dmg.walk(w, src),
         .html => try normalizeHtml(w, src),
         else => unreachable,
     }
@@ -456,8 +466,9 @@ test "archives: every tar, cpio and zip variant, positional and streamed" {
                 };
                 try std.testing.expectEqual(m.crc, e.crc);
             };
-            // Appended zips are found by their trailer, which only positional sources can reach.
-            const want: usize = if (std.mem.eql(u8, a.name, "sfx.zip")) 1 else 2;
+            // Appended zips and disk images are found by their trailers, which only positional
+            // sources can reach.
+            const want: usize = if (std.mem.eql(u8, a.name, "sfx.zip") or std.mem.endsWith(u8, a.name, ".dmg")) 1 else 2;
             if (seen != want) {
                 std.debug.print("{s}: member {s} seen {d} times\n", .{ a.name, path, seen });
                 rig.rec.dump();

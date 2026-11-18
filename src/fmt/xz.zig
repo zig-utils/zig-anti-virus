@@ -107,6 +107,10 @@ pub const Decoder = struct {
     state: enum { stream_header, block_header, block_data, after_streams } = .stream_header,
     /// Compressed bytes of the current block, to compute padding.
     block_header_len: usize = 0,
+    /// Set by a caller that reads at most this many bytes of output (a disk image chunk): a
+    /// dictionary larger than the output can never be referenced, so a block declaring one is
+    /// decoded with `dict_buf` as long as that holds the whole output.
+    output_bound: ?u64 = null,
     err: ?Error = null,
     interface: Io.Reader,
 
@@ -156,7 +160,8 @@ pub const Decoder = struct {
                 const hdr_len = (@as(usize, first) + 1) * 4;
                 const hb = try d.in.take(hdr_len);
                 const block = try parseBlockHeader(hb);
-                if (block.dictCap() > d.dict.buf.len) return error.DictTooLarge;
+                const bounded = if (d.output_bound) |b| b <= d.dict.buf.len else false;
+                if (block.dictCap() > d.dict.buf.len and !bounded) return error.DictTooLarge;
                 d.block_header_len = hdr_len;
                 d.lz2.reset(d.in);
                 d.state = .block_data;

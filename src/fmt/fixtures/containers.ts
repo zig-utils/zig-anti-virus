@@ -15,6 +15,7 @@ export interface Helpers {
   run: (cmd: string, args: string[], input: Uint8Array) => Uint8Array
   py: (code: string, input: Uint8Array) => Uint8Array
   deflateRaw: (data: Uint8Array) => Uint8Array
+  vector: (group: string, name: string, compressed: Uint8Array, data: Uint8Array) => void
   evil: Uint8Array
   fileA: Uint8Array
   fileB: Uint8Array
@@ -760,8 +761,173 @@ function dataBlock(c: Uint8Array, u: number, reserve: number, bad: boolean): Uin
   return b
 }
 
+// ---------------------------------------------------------------------------------------------
+// Apple disk images (UDIF): data fork of chunks, an XML property list whose resource-fork/blkx
+// entries carry base64 "mish" block tables, and the 512-byte "koly" trailer. Big-endian.
+
+/** Apple Data Compression, greedy: literal runs, 2-byte and 3-byte match codes. */
+export function adcCompress(data: Uint8Array): Uint8Array {
+  const out: number[] = []
+  let lit: number[] = []
+  const flush = () => {
+    while (lit.length) {
+      const n = Math.min(lit.length, 128)
+      out.push(0x80 | (n - 1), ...lit.slice(0, n))
+      lit = lit.slice(n)
+    }
+  }
+  const last = new Map<number, number[]>()
+  for (let i = 0; i < data.length;) {
+    let bestLen = 0
+    let bestDist = 0
+    if (i + 2 < data.length) {
+      const k = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16)
+      for (const p of (last.get(k) ?? []).slice(-16)) {
+        const dist = i - p
+        if (dist > 65536) continue
+        let l = 0
+        while (l < 67 && i + l < data.length && data[p + l] === data[i + l]) l++
+        if (l > bestLen) {
+          bestLen = l
+          bestDist = dist
+        }
+      }
+    }
+    const short = bestLen >= 3 && bestDist <= 1024
+    if (bestLen >= 4 || short) {
+      flush()
+      if (short && bestLen <= 18) {
+        const d = bestDist - 1
+        out.push(((bestLen - 3) << 2) | (d >> 8), d & 0xff)
+      } else {
+        const len = Math.max(4, bestLen)
+        const d = bestDist - 1
+        out.push(0x40 | (len - 4), d >> 8, d & 0xff)
+        bestLen = len
+      }
+    } else bestLen = 1
+    for (let j = i; j < i + bestLen && j + 2 < data.length; j++) {
+      const k = data[j] | (data[j + 1] << 8) | (data[j + 2] << 16)
+      let a = last.get(k)
+      if (!a) last.set(k, a = [])
+      a.push(j)
+    }
+    if (bestLen === 1) lit.push(data[i])
+    i += bestLen
+  }
+  flush()
+  return new Uint8Array(out)
+}
+
+interface DmgChunk {
+  /** 'zero', 'ignore', 'raw', 'zlib', 'bzip2', 'adc', 'xz', 'lzfse', 'comment'. */
+  kind: string
+  sectors: number
+  data?: Uint8Array
+  /** Start sector, when it should leave a gap after the previous chunk. */
+  at?: number
+  /** Replace the compressed bytes (a damaged chunk). */
+  packed?: Uint8Array
+}
+
+const dmgTypes: Record<string, number> = { zero: 0, raw: 1, ignore: 2, adc: 0x80000004, zlib: 0x80000005, bzip2: 0x80000006, lzfse: 0x80000007, xz: 0x80000008, comment: 0x7ffffffe }
+
+export function dmgImage(h: Helpers, partitions: { name: string, chunks: DmgChunk[] }[], o: { noXml?: boolean } = {}): { image: Uint8Array, contents: Uint8Array[] } {
+  const fork: Uint8Array[] = []
+  let forkLen = 0
+  const contents: Uint8Array[] = []
+  const entries: string[] = []
+  let sectorBase = 0
+  for (const [pi, part] of partitions.entries()) {
+    const records: number[][] = []
+    let sec = 0
+    for (const c of part.chunks) {
+      const start = c.at ?? sec
+      const plain = new Uint8Array(c.sectors * 512)
+      if (c.data) plain.set(c.data.slice(0, plain.length))
+      let packed = new Uint8Array(0)
+      switch (c.kind) {
+        case 'raw': packed = plain; break
+        case 'zlib': packed = new Uint8Array(zlib.deflateSync(plain)); break
+        case 'bzip2': packed = h.run('bzip2', ['-c'], plain); break
+        case 'xz': packed = h.py('sys.stdout.buffer.write(lzma.compress(data, check=lzma.CHECK_NONE))', plain); break
+        case 'adc': packed = adcCompress(plain); break
+        case 'lzfse': packed = lzfse(h, plain); break
+      }
+      if (c.packed) packed = c.packed
+      records.push([dmgTypes[c.kind], 0, start, c.kind === 'comment' ? 0 : c.sectors, forkLen, packed.length])
+      fork.push(packed)
+      forkLen += packed.length
+      if (c.kind !== 'comment') sec = start + c.sectors
+    }
+    records.push([0xffffffff, 0, sec, 0, forkLen, 0])
+    const content = new Uint8Array(sec * 512)
+    for (const [ci, c] of part.chunks.entries()) {
+      if (c.kind === 'comment' || c.kind === 'zero' || c.kind === 'ignore' || !c.data) continue
+      content.set(c.data.slice(0, c.sectors * 512), records[ci][2] * 512)
+    }
+    contents.push(content)
+    const mish = new Uint8Array(204 + 40 * records.length)
+    const dv = new DataView(mish.buffer)
+    mish.set(enc.encode('mish'), 0)
+    dv.setUint32(4, 1)
+    dv.setBigUint64(8, BigInt(sectorBase))
+    dv.setBigUint64(16, BigInt(sec))
+    dv.setBigUint64(24, 0n)
+    dv.setUint32(32, 0x208)
+    dv.setUint32(36, 0)
+    // CRC-32 of the partition's bytes (checksum type 2, 32 bits).
+    dv.setUint32(64, 2)
+    dv.setUint32(68, 32)
+    dv.setUint32(72, h.crc32(content))
+    dv.setUint32(200, records.length)
+    for (const [i, r] of records.entries()) {
+      const b = 204 + 40 * i
+      dv.setUint32(b, r[0])
+      dv.setUint32(b + 4, r[1])
+      dv.setBigUint64(b + 8, BigInt(r[2]))
+      dv.setBigUint64(b + 16, BigInt(r[3]))
+      dv.setBigUint64(b + 24, BigInt(r[4]))
+      dv.setBigUint64(b + 32, BigInt(r[5]))
+    }
+    const b64 = Buffer.from(mish).toString('base64').replace(/.{1,52}/g, l => `\t\t\t\t${l}\n`)
+    entries.push(`\t\t\t<dict>\n\t\t\t\t<key>Attributes</key>\n\t\t\t\t<string>0x0050</string>\n\t\t\t\t<key>CFName</key>\n\t\t\t\t<string>${part.name}</string>\n\t\t\t\t<key>Data</key>\n\t\t\t\t<data>\n${b64}\t\t\t\t</data>\n\t\t\t\t<key>ID</key>\n\t\t\t\t<string>${pi - 1}</string>\n\t\t\t\t<key>Name</key>\n\t\t\t\t<string>${part.name}</string>\n\t\t\t</dict>\n`)
+    sectorBase += sec
+  }
+  const plist = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n\t<key>resource-fork</key>\n\t<dict>\n\t\t<key>blkx</key>\n\t\t<array>\n${entries.join('')}\t\t</array>\n\t\t<key>plst</key>\n\t\t<array>\n\t\t\t<dict>\n\t\t\t\t<key>Data</key>\n\t\t\t\t<data>AAAA</data>\n\t\t\t</dict>\n\t\t</array>\n\t</dict>\n</dict>\n</plist>\n`)
+  const koly = new Uint8Array(512)
+  const kv = new DataView(koly.buffer)
+  koly.set(enc.encode('koly'), 0)
+  kv.setUint32(4, 4)
+  kv.setUint32(8, 512)
+  kv.setUint32(12, 1)
+  kv.setBigUint64(24, 0n)
+  kv.setBigUint64(32, BigInt(forkLen))
+
+  kv.setBigUint64(216, BigInt(o.noXml ? 0 : forkLen))
+  kv.setBigUint64(224, BigInt(o.noXml ? 0 : plist.length))
+  kv.setUint32(488, 1)
+  kv.setBigUint64(492, BigInt(sectorBase))
+  return { image: h.concat(...fork, o.noXml ? new Uint8Array(0) : plist, koly), contents }
+}
+
+/** Apple's LZFSE encoder (macOS compression_tool): the reference for the lzfse vectors. */
+export function lzfse(h: Helpers, data: Uint8Array): Uint8Array {
+  return h.run('compression_tool', ['-encode', '-a', 'lzfse'], data)
+}
+
 export function build(h: Helpers): void {
   const { archive, evil, fileA, fileB } = h
+  // LZFSE and LZVN reference vectors.
+  const text = h.plain(300_000, 41)
+  h.vector('lzfse', 'lzvn-small', lzfse(h, text.slice(0, 3000)), text.slice(0, 3000))
+  h.vector('lzfse', 'bvx2-multi-block', lzfse(h, text), text)
+  let x = 0x9e3779b9
+  const noise = new Uint8Array(5000).map(() => {
+    x = (Math.imul(x, 1664525) + 1013904223) >>> 0
+    return x >>> 24
+  })
+  h.vector('lzfse', 'stored', lzfse(h, noise), noise)
   // ISO 9660.
   const isoFiles: Member[] = [
     { path: 'readme.txt', data: fileA },
@@ -815,5 +981,44 @@ export function build(h: Helpers): void {
   }), cabFiles, true)
   // 64 MiB of zeros in 2048 MSZIP blocks.
   archive('zeros-bomb.cab', cabBytes([{ type: 1, files: [{ path: 'zeros.bin', data: new Uint8Array(64 * 1024 * 1024) }] }]), [])
+  // Disk images.
+  const mbr = h.concat(new Uint8Array(446), new Uint8Array([0x80, 0, 2, 0, 0x0b, 0, 0, 0, 1, 0, 0, 0, 0xff, 0x0f, 0, 0]), new Uint8Array(48), new Uint8Array([0x55, 0xaa]))
+  const volText = h.plain(40_000, 51)
+  const vol = (n: number) => volText.slice(n * 4096, n * 4096 + 5120)
+  const udif = dmgImage(h, [
+    { name: 'Master Boot Record (MBR : 0)', chunks: [{ kind: 'zlib', sectors: 1, data: mbr }] },
+    {
+      name: 'disk image (Apple_HFS : 1)',
+      chunks: [
+        { kind: 'zlib', sectors: 8, data: h.concat(evil, vol(0)) },
+        { kind: 'raw', sectors: 6, data: fileB },
+        { kind: 'zero', sectors: 4 },
+        { kind: 'comment', sectors: 0 },
+        { kind: 'bzip2', sectors: 10, data: vol(1) },
+        { kind: 'adc', sectors: 10, data: vol(2) },
+        { kind: 'ignore', sectors: 2 },
+        { kind: 'xz', sectors: 10, data: vol(3) },
+        { kind: 'lzfse', sectors: 10, data: vol(4) },
+        { kind: 'lzfse', sectors: 2, data: vol(5) },
+      ],
+    },
+  ])
+  archive('udif.dmg', udif.image, [
+    { path: 'partition/0', data: udif.contents[0] },
+    { path: 'partition/1', data: udif.contents[1] },
+  ])
+  const damaged = dmgImage(h, [{
+    name: 'disk image',
+    chunks: [
+      { kind: 'raw', sectors: 1, data: evil },
+      { kind: 'zlib', sectors: 4, data: vol(6), packed: new Uint8Array([0x78, 0x9c, 0xff, 0xff, 0xff]) },
+      { kind: 'raw', sectors: 1, data: fileA, at: 2 },
+      { kind: 'raw', sectors: 2, data: fileA, at: 9 },
+    ],
+  }])
+  archive('damaged.dmg', damaged.image, [], true)
+  archive('no-xml.dmg', dmgImage(h, [{ name: 'x', chunks: [{ kind: 'raw', sectors: 1, data: evil }] }], { noXml: true }).image, [])
+  // 64 MiB of zeros in 64 zlib chunks.
+  archive('zeros-bomb.dmg', dmgImage(h, [{ name: 'zeros', chunks: Array.from({ length: 64 }, () => ({ kind: 'zlib', sectors: 2048 })) }]).image, [])
   archive('dag-bomb.iso', isoImage([{ path: 'x.txt', data: fileA }], { joliet: true, dagDepth: 24 }), [])
 }

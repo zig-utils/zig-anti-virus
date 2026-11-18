@@ -54,6 +54,8 @@ const Case = struct {
     max_ms: i64,
     max_scratch: usize = 40 * 1024 * 1024,
     lim: limits.Limits = .{},
+    /// Formats only recognised on positional sources (disk images, by their trailer).
+    positional_only: bool = false,
 };
 
 fn run(case: Case) !void {
@@ -64,6 +66,7 @@ fn run(case: Case) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_]bool{ true, false }) |positional| {
+        if (!positional and case.positional_only) continue;
         var tracker = limits.Tracker.init(case.lim);
         var counter: Counter = .{};
         var w: container.Walker = .{
@@ -124,6 +127,9 @@ test "bombs and nesting stop at their limits within bounds" {
         .{ .name = "dag-bomb.iso", .bytes = archive("dag-bomb.iso"), .expect = .{ .notice = .overlap }, .max_ms = 2_000, .lim = tight },
         // A cabinet folder of 2048 MSZIP blocks, 64 MiB of zeros.
         .{ .name = "zeros-bomb.cab", .bytes = archive("zeros-bomb.cab"), .expect = .{ .limit = .ratio }, .max_ms = 5_000, .lim = tight },
+        // A disk image partition of 64 zlib chunks, 64 MiB of zeros (positional only: a disk image
+        // is found by its trailer).
+        .{ .name = "zeros-bomb.dmg", .bytes = archive("zeros-bomb.dmg"), .expect = .{ .limit = .ratio }, .max_ms = 5_000, .lim = tight, .positional_only = true },
     };
     for (cases) |c| try run(c);
     for (fixtures.bomb_vectors) |v| try run(.{ .name = v.name, .bytes = v.compressed, .expect = .{ .limit = .ratio }, .max_ms = 10_000, .lim = tight });

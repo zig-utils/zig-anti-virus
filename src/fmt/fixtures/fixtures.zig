@@ -50,6 +50,12 @@ pub const bomb_vectors = [_]Vector{
     .{ .name = "zstd", .compressed = @embedFile("bomb-zstd.bin"), .plain_len = 67108864, .plain_crc = 0xb2eb30ed },
 };
 
+pub const lzfse_vectors = [_]Vector{
+    .{ .name = "lzvn-small", .compressed = @embedFile("lzfse-lzvn-small.bin"), .plain_len = 3000, .plain_crc = 0xeb6a668e },
+    .{ .name = "bvx2-multi-block", .compressed = @embedFile("lzfse-bvx2-multi-block.bin"), .plain_len = 300000, .plain_crc = 0xd5b4cea5 },
+    .{ .name = "stored", .compressed = @embedFile("lzfse-stored.bin"), .plain_len = 5000, .plain_crc = 0x48a32596 },
+};
+
 pub const Member = struct { path: []const u8, len: usize, crc: u32 };
 pub const Archive = struct { name: []const u8, bytes: []const u8, members: []const Member, malformed: bool };
 
@@ -275,6 +281,13 @@ pub const archives = [_]Archive{
         .{ .path = "eicar.com", .len = 68, .crc = 0x6851cf3c },
     } },
     .{ .name = "zeros-bomb.cab", .bytes = @embedFile("archive-zeros-bomb.cab.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "udif.dmg", .bytes = @embedFile("archive-udif.dmg.bin"), .malformed = false, .members = &.{
+        .{ .path = "partition/0", .len = 512, .crc = 0x4240481c },
+        .{ .path = "partition/1", .len = 31744, .crc = 0x6a150fde },
+    } },
+    .{ .name = "damaged.dmg", .bytes = @embedFile("archive-damaged.dmg.bin"), .malformed = true, .members = &.{} },
+    .{ .name = "no-xml.dmg", .bytes = @embedFile("archive-no-xml.dmg.bin"), .malformed = false, .members = &.{} },
+    .{ .name = "zeros-bomb.dmg", .bytes = @embedFile("archive-zeros-bomb.dmg.bin"), .malformed = false, .members = &.{} },
     .{ .name = "dag-bomb.iso", .bytes = @embedFile("archive-dag-bomb.iso.bin"), .malformed = false, .members = &.{} },
 };
 

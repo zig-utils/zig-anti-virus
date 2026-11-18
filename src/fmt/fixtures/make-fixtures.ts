@@ -1203,7 +1203,7 @@ exe('universal.fat', fat([{ cpu: 0x01000007, data: machoX64 }, { cpu: 0x0100000c
 // ---------------------------------------------------------------------------------------------
 // Phase-three containers and unpackers (P5.18, P5.19): see containers.ts.
 
-containers.build({ archive, exe, concat, plain, crc32, run, py, deflateRaw: d => zlib.deflateRawSync(d), evil, fileA, fileB })
+containers.build({ archive, exe, vector, concat, plain, crc32, run, py, deflateRaw: d => zlib.deflateRawSync(d), evil, fileA, fileB })
 
 // ---------------------------------------------------------------------------------------------
 // fixtures.zig

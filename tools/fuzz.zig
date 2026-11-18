@@ -97,6 +97,10 @@ pub fn main(init: std.process.Init) !void {
             yaraCond(random);
             cases += 1;
         }
+        if (selected(only, "lzfseDecode")) {
+            lzfseDecode(random);
+            cases += 1;
+        }
         // Host and CVE parsers live in fuzz_host.zig; each name selects one target.
         cases += try host_fuzz.run(gpa.allocator(), random, only);
         // Format parsers and decoders (fmt/): one per iteration in rotation, or every target whose
@@ -974,6 +978,24 @@ fn multihashDiff(random: std.Random) void {
     }
 }
 
+var lzfse_in: [256 * 1024]u8 = undefined;
+var lzfse_out: [512 * 1024]u8 = undefined;
+var lzfse_scratch: zav.fmt.lzfse.Scratch = undefined;
+
+/// LZFSE and LZVN streams (disk image chunks): mutated reference vectors decoded into a buffer
+/// that is sometimes too small; errors are fine, out-of-bounds access is not.
+fn lzfseDecode(random: std.Random) void {
+    const vs = zav.fmt.fixtures.lzfse_vectors;
+    const v = vs[random.uintLessThan(usize, vs.len)];
+    const len = @min(v.compressed.len, lzfse_in.len);
+    @memcpy(lzfse_in[0..len], v.compressed[0..len]);
+    var input = lzfse_in[0..len];
+    for (0..random.uintLessThan(usize, 8)) |_| input[random.uintLessThan(usize, input.len)] = random.int(u8);
+    if (random.uintLessThan(u8, 4) == 0) input = input[0..random.uintLessThan(usize, input.len + 1)];
+    const out_len = if (random.boolean()) @min(v.plain_len, lzfse_out.len) else random.uintLessThan(usize, lzfse_out.len);
+    _ = zav.fmt.lzfse.decode(input, lzfse_out[0..out_len], &lzfse_scratch) catch {};
+}
+
 /// Format parsers and decoders: one target per format, taken in turn, each mutating that
 /// format's fixtures and scanning the result through the real dispatcher, positionally or as a
 /// stream. Limits are tight so a case stays cheap; the invariants are no crash, no hang, and
@@ -1003,6 +1025,7 @@ const Formats = struct {
         .{ .name = "fmt.macho", .inputs = exes(".macho") ++ exes(".fat") },
         .{ .name = "fmt.iso9660", .inputs = archives(".iso") },
         .{ .name = "fmt.cab", .inputs = archives(".cab") },
+        .{ .name = "fmt.dmg", .inputs = archives(".dmg") },
         .{ .name = "fmt.html", .inputs = &.{
             "<!DOCTYPE html><HTML><head><title>T</title><script>var a = '<b>' + 1;</script></head>" ++
                 "<body onload=\"go()\" class='x y'>Hello &amp; &#x41;&#65;&nbsp;<!-- c --> <a href=x>l</a></body></HTML>",
