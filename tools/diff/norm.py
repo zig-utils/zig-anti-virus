@@ -75,11 +75,6 @@ def main():
             if got == want:
                 c[1] += 1
                 continue
-            # libclamav's text normaliser restarts whitespace collapsing at its internal buffer
-            # seams (hundreds of KiB apart), leaving one extra space there; zav collapses throughout.
-            if kind == "text" and want.replace(b"  ", b" ") == got:
-                c[2] += 1
-                continue
             if kind in ("html", "notags") and args.html_report_only:
                 continue
             if kind == "js" and not args.strict_js:
@@ -90,8 +85,7 @@ def main():
                 i = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]), min(len(got), len(want)))
                 print("DIFF %s (%s) at byte %d:\n  libclamav %r\n  zav       %r" % (path, kind, i, want[max(0, i - 30):i + 50], got[max(0, i - 30):i + 50]))
     for kind, c in sorted(counts.items()):
-        extra = ", %d differ only by libclamav's buffer seams" % c[2] if kind == "text" else ""
-        print("norm.py: %s: %d files, %d byte-identical%s" % (kind, c[0], c[1], extra))
+        print("norm.py: %s: %d files, %d byte-identical" % (kind, c[0], c[1]))
     return 0 if failures == 0 else 1
 
 
