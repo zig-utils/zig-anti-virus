@@ -32,6 +32,7 @@ const cab = @import("cab.zig");
 const dmg = @import("dmg.zig");
 const nsis = @import("nsis.zig");
 const chm = @import("chm.zig");
+const mime = @import("mime.zig");
 const upx = @import("unpack/upx.zig");
 const html_norm = @import("html_norm.zig");
 const text_norm = @import("text_norm.zig");
@@ -86,6 +87,7 @@ fn parsePositional(w: *Walker, obj: *Object, src: Source) Error!void {
         .dmg => try dmg.walk(w, src),
         .nsis => try nsis.walk(w, src),
         .chm => try chm.walk(w, src),
+        .mail => try mime.walk(w, src),
         .html => try normalizeHtml(w, src),
         .binary, .text => {
             if (obj.format == .text) {
@@ -127,7 +129,7 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
         },
         // Normalised text is produced in the same pass that feeds the raw bytes.
         .text => try normalizeText(w, &tee.interface),
-        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .chm, .html => {
+        .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .chm, .mail, .html => {
             var mat = try w.materialize(&tee.interface, st.len_hint) orelse return w.drain(&tee.interface);
             defer mat.deinit(w.io);
             checkEntropy(w, obj.format, mat.source);
@@ -209,6 +211,7 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
         .dmg => try dmg.walk(w, src),
         .nsis => try nsis.walk(w, src),
         .chm => try chm.walk(w, src),
+        .mail => try mime.walk(w, src),
         .html => try normalizeHtml(w, src),
         else => unreachable,
     }

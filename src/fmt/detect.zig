@@ -2,6 +2,7 @@
 //! checks: the decision has to be made from a short head (`head_len` bytes) so streams can be
 //! classified with a peek, before anything is consumed.
 const std = @import("std");
+const mime = @import("mime.zig");
 
 /// Bytes a detector looks at. tar needs 512 (the header block), HTML sniffing likes more.
 pub const head_len = 4096;
@@ -31,6 +32,8 @@ pub const Format = enum(u8) {
     /// NSIS installer data (the firstheader), usually a PE overlay.
     nsis,
     chm,
+    /// An RFC 822 message or an mbox file (P5.09); target type 4.
+    mail,
 
     /// Containers whose members are read in order, so they work over a forward-only stream.
     pub fn streamable(f: Format) bool {
@@ -43,7 +46,7 @@ pub const Format = enum(u8) {
     /// Formats parsed with positional reads (central directories, section tables).
     pub fn needsRandomAccess(f: Format) bool {
         return switch (f) {
-            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .chm => true,
+            .zip, .pe, .elf, .macho, .macho_fat, .ole2, .iso9660, .cab, .dmg, .nsis, .chm, .mail => true,
             else => false,
         };
     }
@@ -80,6 +83,7 @@ pub fn detect(head: []const u8) Format {
     if (std.mem.startsWith(u8, head, "MZ")) return .pe;
     if (isCpio(head)) return .cpio;
     if (isTar(head)) return .tar;
+    if (mime.isMail(head)) return .mail;
     if (isHtml(head)) return .html;
     if (isText(head)) return .text;
     return .binary;

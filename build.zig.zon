@@ -23,6 +23,10 @@
             .url = "https://pantry.dev/zig/packages/zig-xml/0.2.0/tarball",
             .hash = "zig_xml-0.2.0-Lvy3xeipAgCUrrv8lGeXgv0isfW9cht6cYZgdeNoi8zx",
         },
+        .mime = .{
+            .url = "https://pantry.dev/zig/packages/zig-mime/0.1.0/tarball",
+            .hash = "zig_mime-0.1.0-Hf4nP-Y7AgC8Q-HbcHTUNNDK14bs0dXTxEkeKsRR-AY1",
+        },
     },
 
     .paths = .{

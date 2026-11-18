@@ -18,6 +18,9 @@ pub fn build(b: *std.Build) void {
     // zig-regex byte-mode programs: .cdb filename regexes, PCRE subsigs, YARA regex strings.
     const regex = b.dependency("regex", .{ .target = target, .optimize = optimize }).module("regex");
     zav.addImport("regex", regex);
+    // zig-mime walks email messages (src/fmt/mime.zig).
+    const mime = b.dependency("mime", .{ .target = target, .optimize = optimize }).module("mime");
+    zav.addImport("mime", mime);
 
     const zig_cli = b.dependency("cli", .{ .target = target, .optimize = optimize }).module("zig_cli");
 
@@ -63,6 +66,7 @@ pub fn build(b: *std.Build) void {
     addHashVariants(b, tree_tests, target, optimize);
     tree_tests.addImport("xml", xml);
     tree_tests.addImport("regex", regex);
+    tree_tests.addImport("mime", mime);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_tests })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = capiModule(b, target, optimize, zav) })).step);
 
@@ -214,6 +218,7 @@ pub fn build(b: *std.Build) void {
         addHashVariants(b, zav_fast, target, .fast);
         zav_fast.addImport("xml", b.dependency("xml", .{ .target = target, .optimize = .fast }).module("xml"));
         zav_fast.addImport("regex", b.dependency("regex", .{ .target = target, .optimize = .fast }).module("regex"));
+        zav_fast.addImport("mime", b.dependency("mime", .{ .target = target, .optimize = .fast }).module("mime"));
         const bench_exe = b.addExecutable(.{
             .name = "bench",
             .root_module = b.createModule(.{

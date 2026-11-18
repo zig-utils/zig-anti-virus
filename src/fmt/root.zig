@@ -32,6 +32,8 @@ pub const ooxml = @import("ooxml.zig");
 pub const vba = @import("vba.zig");
 pub const html_norm = @import("html_norm.zig");
 pub const text_norm = @import("text_norm.zig");
+pub const mime = @import("mime.zig");
+pub const collect = @import("collect.zig");
 /// Reference vectors (tests, fuzzing, benchmarks).
 pub const fixtures = @import("fixtures/fixtures.zig");
 
@@ -67,5 +69,7 @@ test {
     _ = vba;
     _ = html_norm;
     _ = text_norm;
+    _ = mime;
+    _ = collect;
     _ = @import("adversarial.zig");
 }
