@@ -121,5 +121,21 @@ that pass stage two and fail in the verifier. What would bound it, for the follo
 - Cheaper verifies: the check stage already removes most (E3); the remaining cost is the VM's
   setup per call.
 
-The inputs are not in CI yet: they need the ClamAV databases, which only the Differential
-workflow fetches. `zig build prefilter -- worst <db>` regenerates them.
+At the time of the initial run, these inputs were not in CI. The follow-up added them to the
+Differential workflow, which fetches the ClamAV databases and regenerates the inputs with
+`zig build prefilter -- worst <db> --max-ms 50`.
+
+## CI qualification
+
+The [ab208d5 real-database job](https://github.com/zig-utils/zig-anti-virus/actions/runs/44441441981/job/135282985567)
+passed the enforced 50 ms/MB gate with freshly compiled main and daily databases:
+
+| Input | ms/MB | VM steps/MB | Verdict |
+|---|---:|---:|---|
+| anchors | 32.88 | 78,187 | limited: regex_steps |
+| unbounded | 25.56 | 7,263 | clean |
+| subsigs | 26.89 | 78,222 | limited: verify_count |
+| zeros/opcodes | 8.22 | 152,855 | limited: verify_count |
+
+Limits remain explicit verdicts. These results qualify the four generated A1 inputs and the
+documented budget choices; they do not replace the later full-pipeline or real-malware gates.

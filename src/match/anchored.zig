@@ -226,3 +226,100 @@ fn verifyOne(p: prog.Program, data: []const u8, w: vm.Window, at: usize, budget:
         return null;
     };
 }
+
+const testing = std.testing;
+
+const TestHits = struct {
+    hits: [2048]Hit = undefined,
+    len: usize = 0,
+
+    fn add(out: *TestHits, hit: Hit) bool {
+        out.hits[out.len] = hit;
+        out.len += 1;
+        return true;
+    }
+};
+
+/// Independently resolve each program's full offset and enumerate its VM matches. Keep the
+/// index's observable group/member ordering, but do not use scan's window or literal search.
+fn referenceHits(index: Index, programs: prog.Programs, data: []const u8, info: vm.FileInfo, out: *TestHits) !void {
+    var budget: vm.Budget = .{};
+    for (index.groups) |grp| {
+        const window = vm.startWindow(grp.offset(), info) orelse continue;
+        if (grp.keyed_count > 0 and window.lo + 4 <= data.len) {
+            const at: usize = @intCast(window.lo);
+            const key = std.mem.readInt(u32, data[at..][0..4], .little);
+            for (index.lookup(grp, key)) |e| {
+                var scanner = vm.Scanner.init(programs.get(e.prog), data, info, &budget);
+                while (try scanner.next()) |m| _ = TestHits.add(out, .{ .prog = e.prog, .match = m });
+            }
+        }
+        for (index.groupList(grp)) |i| {
+            var scanner = vm.Scanner.init(programs.get(i), data, info, &budget);
+            while (try scanner.next()) |m| _ = TestHits.add(out, .{ .prog = i, .match = m });
+        }
+    }
+}
+
+test "anchored scan preserves every ordered match across offset windows" {
+    const hexsig = @import("../compile/hexsig.zig");
+    const prog_build = @import("../compile/prog_build.zig");
+    const anchored_build = @import("../compile/anchored_build.zig");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var inputs: std.ArrayList(prog_build.Input) = .empty;
+    const offsets: []const ir.Offset = &.{
+        .{ .kind = .absolute, .a = 0 },
+        .{ .kind = .absolute, .a = -1 },
+        .{ .kind = .absolute, .a = 20 },
+        .{ .kind = .eof_minus, .a = 8 },
+        .{ .kind = .eof_minus, .a = 21 },
+        .{ .kind = .entry_point, .a = -4 },
+        .{ .kind = .entry_point, .a = 0 },
+        .{ .kind = .section_start, .section = 0, .a = 0 },
+        .{ .kind = .section_start, .section = 1, .a = -4 },
+        .{ .kind = .section_start, .section = 2, .a = 0 },
+        .{ .kind = .section_entire, .section = 0 },
+        .{ .kind = .section_entire, .section = 1 },
+        .{ .kind = .section_entire, .section = 2 },
+        .{ .kind = .last_section, .a = -4 },
+        .{ .kind = .last_section, .a = 0 },
+    };
+    for (offsets) |offset| {
+        // The same group has keyed and listed members, and different inclusive shift limits.
+        for ([_]u32{ 0, 1, 4, std.math.maxInt(u32) }) |shift| {
+            var off = offset;
+            off.shift = shift;
+            for ([_][]const u8{ "41424344", "41??4344", "??4142" }) |body| {
+                var diag: hexsig.Diag = .{};
+                try inputs.append(a, .{ .pattern = try hexsig.parse(a, body, &diag), .offset = off, .sig = @intCast(inputs.items.len) });
+            }
+        }
+    }
+    const bytes = try prog_build.build(a, inputs.items);
+    const aligned = try a.alignedAlloc(u8, .@"4", bytes.len);
+    @memcpy(aligned, bytes);
+    const programs = try prog.Programs.init(aligned);
+    const section = (try anchored_build.build(a, programs, 0)).?;
+    const image = try a.alignedAlloc(u8, .@"4", section.len);
+    @memcpy(image, section);
+    const index = try Index.init(image, programs);
+    const data = "ABCDABCDABCDABCDABCD";
+    const cases: []const vm.FileInfo = &.{
+        .{ .size = data.len, .entry_point = 4, .sections = &.{ .{ .offset = 0, .size = 4 }, .{ .offset = 12, .size = 4 } } },
+        .{ .size = data.len }, // Missing EP and sections.
+        .{ .size = data.len, .entry_point = 0, .sections = &.{ .{ .offset = 0, .size = 0 }, .{ .offset = 20, .size = 4 } } },
+        .{ .size = data.len, .entry_point = 20, .sections = &.{ .{ .offset = 4, .size = std.math.maxInt(u64) }, .{ .offset = 24, .size = 4 } } },
+    };
+    for (cases) |info| {
+        var expected: TestHits = .{};
+        try referenceHits(index, programs, data, info, &expected);
+        try testing.expect(expected.len > 0);
+        var actual: TestHits = .{};
+        var budget: vm.Budget = .{};
+        try scan(index, programs, data, info, &budget, &actual, TestHits.add);
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected.hits[0..expected.len], actual.hits[0..actual.len]) |want, got| try testing.expectEqualDeep(want, got);
+    }
+}
