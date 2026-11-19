@@ -137,19 +137,20 @@ pub const Memo = struct {
     from_hi: [max_parts]usize = undefined,
     upto_lo: [max_parts]usize = undefined,
     upto_hi: [max_parts]usize = undefined,
-    /// Entries below this are initialised.
+    /// Number of parts in the program this memo is prepared for.
     parts: usize = 0,
 
-    /// Forget everything and size the memo for a program with `part_count` parts. Only the
-    /// entries in use are touched, so a one-part program pays nothing.
+    /// Forget everything and size the memo for a program with `part_count` parts.
     pub fn prepare(m: *Memo, part_count: usize) void {
+        m.parts = part_count;
+        // Only searches between parts read these arrays.
+        if (part_count <= 1) return;
         @memset(m.dead_from[0..part_count], unknown);
         @memset(m.dead_upto[0..part_count], unknown);
         @memset(m.from_lo[0..part_count], 0);
         @memset(m.from_hi[0..part_count], 0);
         @memset(m.upto_lo[0..part_count], 0);
         @memset(m.upto_hi[0..part_count], 0);
-        m.parts = part_count;
     }
 
     /// Record that `[lo, hi)` holds no start (or end) of a chain, keeping one stretch per part:
@@ -199,8 +200,12 @@ const Vm = struct {
             .budget = budget,
             .memo = memo,
         };
-        var part: usize = 0;
         vm.part_first[0] = 0;
+        vm.part_first[vm.part_count] = @intCast(p.pattern.ops.len + 1);
+        // A single part has no neighbors and never uses the fixed-length table.
+        if (vm.part_count == 1) return;
+
+        var part: usize = 0;
         vm.part_fixed[0] = true;
         for (p.pattern.ops, 0..) |o, i| switch (o.code) {
             .part_end => {
@@ -213,7 +218,6 @@ const Vm = struct {
             },
             else => {},
         };
-        vm.part_first[vm.part_count] = @intCast(p.pattern.ops.len + 1);
     }
 
     fn step(vm: *Vm) Error!void {

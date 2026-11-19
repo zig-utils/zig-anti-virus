@@ -212,6 +212,7 @@ pub fn scan(index: Index, programs: prog.Programs, data: []const u8, info: vm.Fi
 /// The first occurrence of `lit` in `hay` at or after `from`: memchr on its first byte, then a
 /// compare.
 fn findLiteral(hay: []const u8, from: usize, lit: []const u8) ?usize {
+    if (lit.len == 1) return std.mem.findScalarPos(u8, hay, from, lit[0]);
     var at = from;
     while (at + lit.len <= hay.len) : (at += 1) {
         at = std.mem.indexOfScalarPos(u8, hay[0 .. hay.len - lit.len + 1], at, lit[0]) orelse return null;

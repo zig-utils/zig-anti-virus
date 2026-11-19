@@ -5,9 +5,9 @@ the issues' acceptance criteria. Historical benchmark observations are not new m
 
 | Issue | Proven | Remaining before closure |
 |---|---|---|
-| [#24, anchored index](https://github.com/zig-utils/zig-anti-virus/issues/24) | The compiler proves every anchored program reachable. PE and ELF offset verdict cases exist and pass the grammar differential. | Both the recorded x86_64 and fresh ARM benchmarks exceed the 2 microsecond estimate. See below. |
+| [#24, anchored index](https://github.com/zig-utils/zig-anti-virus/issues/24) | The compiler proves every anchored program reachable. PE and ELF offset verdict cases pass the grammar differential. The ARM benchmark now averages 1.67 microseconds per file. | Verify the updated build on the hosted x86_64 benchmark. |
 | [#27, tier-D deferral](https://github.com/zig-utils/zig-anti-virus/issues/27) | Required-cover analysis, deferred second pass, fallback filters and coverage counts exist. E3 measures fewer candidates on B1, B2 and S1. | E3 explicitly substitutes planted samples for the requested malware corpus. That corpus differential remains unproven. |
-| [#32, Guardian rules](https://github.com/zig-utils/zig-anti-virus/issues/32) | The generic YARA compiler and reserved Guardian source/header fields exist. | No `rules/` pack, metadata loader, Guardian tagging path, signed pack format or tamper-rejection fixtures exist. Implement and qualify the pack. |
+| [#32, Guardian rules](https://github.com/zig-utils/zig-anti-virus/issues/32) | The [signed starter pack](../rules/guardian.md) passed CLI coverage, fixture detection, benign corpus, and tamper checks. | Complete. |
 | [#35, E4](https://github.com/zig-utils/zig-anti-virus/issues/35) | E4's follow-up justifies the budgets; all four generated worst cases passed the 50 ms/MB threshold in the successful ab208d5 real-database CI job. | Qualified for the current generated A1 cases. Full-pipeline performance remains a later gate. |
 | [#109, CPU variants](https://github.com/zig-utils/zig-anti-virus/issues/109) | E2 records x86_64 v2/v3 and ARM numbers; scalar-reference tests run every supported variant in CI. Both explicit acceptance criteria have evidence. | The scope's separate gate-versus-first-byte-shuffle timing comparison is not recorded. `stages` counts possible first-byte passes but does not time an alternate shuffle gate. |
 
@@ -82,5 +82,17 @@ The fresh ReleaseFast benchmark on the same Apple M3 Pro and pinned Zig, with th
 fixture unchanged, measured mean 2,613.62 ns, minimum 2,291 ns, median 2,417 ns and p99
 5,667 ns over 10,000 iterations (`zig-out/anchored-reused-window-bench.json`). Compared with
 the preceding mean 2,575.40 ns, minimum 2,292 ns and median 2,417 ns, this establishes no
-improvement. Both observations were on a shared machine. The runtime change was discarded;
-the complete-hit regression remains. The under-2-microsecond criterion is still unmet.
+improvement. Both observations were on a shared machine. The runtime change was discarded,
+and the complete-hit regression remains.
+
+## Anchored verification setup (#24)
+
+Single-part programs have no neighboring parts to search. They now skip
+clearing the search memo and building the table of fixed-length parts. The
+anchored search uses the single-byte search directly for one-byte literals.
+The index layout, scan order, and verify budgets remain the same.
+
+Using the original 20,000-signature fixture and 10,000 iterations on the Apple
+M3 Pro, the ReleaseFast mean fell from 2,638 ns to 1,667 ns per file. The
+median fell from 2,375 ns to 1,666 ns, and p99 from 5,334 ns to 1,750 ns.
+Both measurements used Zig `0.17.0-dev.1857+3c46da14d`.
