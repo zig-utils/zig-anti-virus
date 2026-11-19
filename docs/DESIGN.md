@@ -336,8 +336,8 @@ peak) and within one page in the focused test (260 before and 261 at peak).
 - macOS: `getattrlistbulk`.
 
 **I/O:**
-- Files up to 1 MiB: one pread into a reused 1 MiB buffer.
-- Larger files: 256 KiB streaming with sequential advice.
+- The positional walker reads files up to 1 MiB into reused scan scratch. Format detection and parsing share that copy.
+- Larger root files are read in 256 KiB blocks, with sequential advice on Linux. The matcher still receives 64 KiB chunks for consistent limit accounting.
 - mmap only for large random access.
 - Optional page-cache hygiene for bulk scans.
 - On Linux 5.19+, io_uring with linked openat, statx, read and close for small files.

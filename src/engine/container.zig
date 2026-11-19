@@ -18,6 +18,7 @@ const Spill = source_mod.Spill;
 const Scratch = @import("scratch.zig").Scratch;
 const limits = @import("limits.zig");
 const Budget = @import("budget.zig").Budget;
+const io_small = @import("../rt/io_small.zig");
 const detect = @import("../fmt/detect.zig");
 pub const Format = detect.Format;
 const cdb_match = @import("../match/container.zig");
@@ -184,7 +185,7 @@ pub const Walker = struct {
         defer w.scratch.release(mark);
         var obj: Object = .{ .path = w.path.get(), .name = name, .depth = 0, .kind = .root, .size = src.len() };
         defer w.end(&obj);
-        try w.parse(w, &obj, src);
+        try w.parse(w, &obj, io_small.prepare(w.io, w.scratch.allocator(), src));
     }
 
     /// Scan a child of the object being parsed. Recursion, file count and size limits are checked
@@ -271,8 +272,14 @@ pub const Walker = struct {
 
     /// Feed every byte of a positional source.
     pub fn feedSource(w: *Walker, obj: *const Object, src: Source) Error!void {
+        if (src == .memory) return w.feedBlocks(obj, src.memory);
         const total = src.len() orelse return;
-        const block = w.alloc(u8, @intCast(@min(block_len, @max(total, 1)))) orelse return;
+        const size: usize = @intCast(@min(block_len, @max(total, 1)));
+        const preferred: usize = @intCast(@min(io_small.stream_block_len, @max(total, 1)));
+        const block = if (obj.kind == .root and preferred > size)
+            w.scratch.allocator().alloc(u8, preferred) catch (w.alloc(u8, size) orelse return)
+        else
+            w.alloc(u8, size) orelse return;
         defer w.free(block);
         var off: u64 = 0;
         while (off < total) {
@@ -281,8 +288,18 @@ pub const Walker = struct {
                 return;
             };
             if (n == 0) break;
-            try w.feed(obj, block[0..n]);
+            try w.feedBlocks(obj, block[0..n]);
             off += n;
+        }
+    }
+
+    /// Keep matcher and limit accounting at the same block size as stream scans.
+    fn feedBlocks(w: *Walker, obj: *const Object, bytes: []const u8) Error!void {
+        var rest = bytes;
+        while (rest.len != 0) {
+            const chunk = rest[0..@min(rest.len, block_len)];
+            try w.feed(obj, chunk);
+            rest = rest[chunk.len..];
         }
     }
 
