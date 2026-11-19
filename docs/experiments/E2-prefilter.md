@@ -153,6 +153,14 @@ Earlier tables include the cost of collecting those counters during the timed
 pass. The workflow uploads measurements only. Compare CVD checksums when
 interpreting results from the two runners.
 
+The same workflow can time raw `SCAN` requests through a local socket using
+`bench/e2/clamd_raw.py`. ClamAV uses one scan thread, the same CPU affinity
+and main and daily CVDs, with caching, bytecode and the optional format scanners
+disabled. Each round counts the same nonempty files as the prefilter run and
+requires an `OK` for each. Its timing includes the socket round trip, file open,
+and clamd's raw matching. The prefilter timing starts with bytes already in
+memory and ends after stage two.
+
 A local run with this timing method over combined B1 and B2 measured 850.9 MB/s
 for the ARM crypto kernel and 850.1 MB/s for the ARM baseline through stages
 one and two. The candidate, probe and verify counts per MB matched the previous

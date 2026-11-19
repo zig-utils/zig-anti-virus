@@ -8,6 +8,7 @@ permissions:
 
 env:
   ZIG_VERSION: '0.17.0-dev.1857+3c46da14d'
+  CLAMAV_VERSION: '1.5.4'
 
 jobs:
   native:
@@ -67,6 +68,63 @@ jobs:
           for corpus in B1 B2; do
             taskset -c "$core" ./zig-out/bin/prefilter stages "$db" "$RUNNER_TEMP/corpus/$corpus" --partition 1 --rounds 5 2>&1 | tee "$bench_dir/$corpus.txt"
           done
+      - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          package="clamav-$CLAMAV_VERSION.linux.${{ matrix.arch }}.deb"
+          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "$package" -D "$RUNNER_TEMP"
+          sudo apt-get install -y "$RUNNER_TEMP/$package"
+      - name: Measure clamd raw scans on the same corpora
+        run: |
+          bench_dir="$RUNNER_TEMP/e2"
+          core=$(awk '/^Cpus_allowed_list:/ {split($2, ids, /[-,]/); print ids[1]}' /proc/self/status)
+          clamd=$(dpkg -L clamav | awk '/\/clamd$/ {print; exit}')
+          certs=$(dirname "$(dpkg -L clamav | awk '/\/certs\// {print; exit}')")
+          test -x "$clamd" && test -d "$certs"
+          mkdir -p "$RUNNER_TEMP/e2-clamd-db"
+          ln -s "$HOME/clamav-db/"{main,daily}.cvd "$RUNNER_TEMP/e2-clamd-db/"
+          socket="$RUNNER_TEMP/e2-clamd.sock"
+          config="$RUNNER_TEMP/e2-clamd.conf"
+          cat > "$config" <<EOF
+          DatabaseDirectory $RUNNER_TEMP/e2-clamd-db
+          CVDCertsDirectory $certs
+          LocalSocket $socket
+          LocalSocketMode 600
+          Foreground yes
+          MaxThreads 1
+          DisableCache yes
+          HeuristicAlerts no
+          Bytecode no
+          ScanPE no
+          ScanELF no
+          ScanOLE2 no
+          ScanPDF no
+          ScanSWF no
+          ScanXMLDOCS no
+          ScanHWP3 no
+          ScanOneNote no
+          ScanImage no
+          ScanImageFuzzyHash no
+          ScanMail no
+          ScanHTML no
+          ScanArchive no
+          MaxFileSize 400M
+          MaxScanSize 1000M
+          EOF
+          taskset -c "$core" "$clamd" --config-file "$config" > "$RUNNER_TEMP/e2-clamd.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" || true' EXIT
+          for attempt in {1..120}; do
+            if test -S "$socket"; then break; fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          if ! test -S "$socket"; then
+            tail -40 "$RUNNER_TEMP/e2-clamd.log"
+            exit 1
+          fi
+          python3 bench/e2/clamd_raw.py --socket "$socket" "$RUNNER_TEMP/corpus/B1" "$RUNNER_TEMP/corpus/B2" | tee "$bench_dir/clamd-raw.txt"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
