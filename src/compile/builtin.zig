@@ -1,7 +1,6 @@
 //! Signatures compiled into every database, independent of any feed.
 //!
-//! The EICAR anti-malware test file (68 bytes, published by EICAR) is detected by hash here; its
-//! variants with trailing whitespace are covered by the pattern rules in the Guardian rule pack.
+//! The built-in hashes match the exact 68-byte anti-malware test file published by EICAR.
 const std = @import("std");
 const ir = @import("ir.zig");
 
