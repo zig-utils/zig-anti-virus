@@ -316,13 +316,16 @@ on the generation futex. Closing the pool drains accepted jobs before joining.
 128 uncontended push and last-item pop pairs per sample. On Apple M3 Pro,
 the mean was 693 ns per batch, or 2.7 ns per operation including benchmark
 loop overhead. The [hosted x86_64 benchmark](https://github.com/zig-utils/zig-anti-virus/actions/runs/44458256485)
-measured 676 ns per batch, or 2.6 ns per operation.
+measured 676 ns per batch, or 2.6 ns per operation, on an AMD EPYC 7763.
 
 `ZAV_RUNTIME_STRESS=1 zig test src/rt/pool.zig -O ReleaseSafe -fsanitize-thread -lc`
 ran 10 million jobs exactly once on macOS with 11 workers and 978,439 steals,
-and on an aarch64 Linux VM with six workers and 237,987 steals. The separate
-non-sanitized Linux backpressure test started at 260 resident pages and peaked
-at 261 while the full injector rejected a million offers.
+and on an aarch64 Linux VM with six workers and 237,987 steals. The
+[engine CI run](https://github.com/zig-utils/zig-anti-virus/actions/runs/44459623107)
+passed the macOS and Linux test suites and the hosted Linux ThreadSanitizer
+stress check. In non-sanitized Linux backpressure runs, a million full offers
+left resident memory flat in the integrated test (1,841 pages before and at
+peak) and within one page in the focused test (260 before and 261 at peak).
 
 **Injector and backpressure:**
 - A bounded MPMC injector holds 4N jobs. A full result tells the producer to yield or pause its source.
