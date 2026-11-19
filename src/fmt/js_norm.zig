@@ -3,7 +3,8 @@
 //! js-norm describes it. It never evaluates code.
 //!
 //! What it does, in one streaming pass with fixed memory:
-//! - comments and white space are removed; one space separates two word tokens;
+//! - block comments and white space are removed; one space separates two word tokens;
+//!   the HTML form drops `//` and normalizes the remaining text as tokens;
 //! - string literals are decoded (\xHH, \uHHHH, octal and the single-letter escapes) and written
 //!   double-quoted, with `"` and `\` escaped;
 //! - adjacent string literals joined with `+` are folded into one (`"ev"+"al"` is `"eval"`);
@@ -11,8 +12,8 @@
 //!   `String.fromCharCode(n, ...)` of numeric literals becomes the string it builds; both then
 //!   take part in folding;
 //! - identifiers declared with var, function names and function parameters are
-//!   renamed in order of declaration to n000, n001, ... wherever they appear later (not after a
-//!   `.`, where they are property names).
+//!   numbered in declaration order within their active scope. Property names after `.` keep
+//!   their spelling.
 //!
 //! Bounds: a folded string is flushed at `max_string` bytes, at most `max_names` identifiers are
 //! renamed, `String.fromCharCode` folds at most `max_args` arguments, and the caller limits the
@@ -23,6 +24,7 @@ pub const max_string = 64 * 1024;
 pub const max_names = 4096;
 pub const max_args = 1024;
 const max_word = 128;
+const max_functions = 64;
 
 pub const Output = struct {
     ctx: *anyopaque,
@@ -41,7 +43,7 @@ const Prev = enum { none, operand, dot, other };
 
 pub const Normalizer = struct {
     out: Output,
-    fold_ascii_case: bool = false,
+    html_output: bool = false,
     // Output buffering.
     obuf: [4096]u8 = undefined,
     olen: usize = 0,
@@ -81,9 +83,26 @@ pub const Normalizer = struct {
     depth: i32 = 0,
     decl_depth: i32 = 0,
     var_depth: i32 = 0,
+    functions: [max_functions]Function = undefined,
+    function_count: u8 = 0,
+    rename_disabled: bool = false,
 
-    const Name = struct { off: u32, len: u8 };
+    const Name = struct {
+        off: u32,
+        len: u8,
+        level: u8,
+        slot: u16,
+        previous_value: u16,
+        previous_binding: u16,
+    };
     const Decl = enum { none, var_next, var_list, func_name, func_params };
+    const Function = struct {
+        saved_decl: Decl,
+        saved_decl_depth: i32,
+        saved_var_depth: i32,
+        body_depth: ?i32 = null,
+        last_binding: u16 = 0,
+    };
     const Call = enum { idle, unescape, unescape_paren, unescape_str, string, string_dot, from_char_code, fcc_paren, fcc_num, fcc_comma };
 
     pub fn init(out: Output) Normalizer {
@@ -92,7 +111,7 @@ pub const Normalizer = struct {
 
     /// libclamav's HTML `javascript` file stores ASCII lowercase output.
     pub fn initHtml(out: Output) Normalizer {
-        return .{ .out = out, .fold_ascii_case = true };
+        return .{ .out = out, .html_output = true };
     }
 
     pub fn feed(n: *Normalizer, data: []const u8) Error!void {
@@ -151,7 +170,7 @@ pub const Normalizer = struct {
             .string => try n.stringByte(c),
             .slash => {
                 if (c == '/') {
-                    n.lex = .line_comment;
+                    n.lex = if (n.html_output) .start else .line_comment;
                 } else if (c == '*') {
                     n.lex = .block_comment;
                 } else if (n.prev == .operand) {
@@ -336,14 +355,14 @@ pub const Normalizer = struct {
     fn token(n: *Normalizer, kind: TokKind, text: []const u8) Error!void {
         var t = text;
         var renamed: [8]u8 = undefined;
-        if (kind == .word) {
+        if (!n.rename_disabled and kind == .word) {
             if (isKeyword(t)) {
-                try n.declKeyword(t);
+                n.declKeyword(t);
             } else if (n.prev != .dot) {
-                if (n.declaring()) n.declare(t);
-                if (n.lookup(t)) |i| t = std.fmt.bufPrint(&renamed, "n{d:0>3}", .{i}) catch t;
+                const binding = if (n.declaring()) n.declare(t) else n.slots[n.findSlot(t)];
+                if (binding != 0) t = std.fmt.bufPrint(&renamed, "n{d:0>3}", .{binding - 1}) catch t;
             }
-        } else if (kind == .punct) n.declPunct(t[0]);
+        } else if (!n.rename_disabled and kind == .punct) n.declPunct(t[0]);
         n.prev = switch (kind) {
             .word => if (isKeyword(text) and !isValueKeyword(text)) .other else .operand,
             .number, .string, .regex => .operand,
@@ -364,11 +383,21 @@ pub const Normalizer = struct {
         };
     }
 
-    fn declKeyword(n: *Normalizer, t: []const u8) Error!void {
+    fn declKeyword(n: *Normalizer, t: []const u8) void {
         if (std.mem.eql(u8, t, "var")) {
             n.decl = .var_next;
             n.var_depth = n.depth;
         } else if (std.mem.eql(u8, t, "function")) {
+            if (n.function_count == max_functions) {
+                n.rename_disabled = true;
+                return;
+            }
+            n.functions[n.function_count] = .{
+                .saved_decl = n.decl,
+                .saved_decl_depth = n.decl_depth,
+                .saved_var_depth = n.var_depth,
+            };
+            n.function_count += 1;
             n.decl = .func_name;
             n.decl_depth = n.depth;
         }
@@ -379,9 +408,21 @@ pub const Normalizer = struct {
             '(', '[', '{' => {
                 if (n.decl == .func_name and c == '(') n.decl = .func_params;
                 n.depth += 1;
+                if (c == '{' and n.function_count != 0) {
+                    const frame = &n.functions[n.function_count - 1];
+                    // The first brace starts the scope body in libclamav's lexer, including
+                    // a brace in a default parameter. Its matching brace ends the scope.
+                    if (frame.body_depth == null) frame.body_depth = n.depth;
+                }
             },
             ')', ']', '}' => {
+                const end_function = c == '}' and n.function_count != 0 and
+                    n.functions[n.function_count - 1].body_depth == n.depth;
                 n.depth -= 1;
+                if (end_function) {
+                    n.finishFunction();
+                    return;
+                }
                 if (n.decl == .func_params and n.depth == n.decl_depth) n.decl = .none;
                 if ((n.decl == .var_list or n.decl == .var_next) and n.depth < n.var_depth) n.decl = .none;
             },
@@ -395,33 +436,64 @@ pub const Normalizer = struct {
         }
     }
 
-    fn declare(n: *Normalizer, t: []const u8) void {
+    fn declare(n: *Normalizer, t: []const u8) u16 {
         if (n.decl == .var_next) n.decl = .var_list;
         if (n.decl == .func_name) n.decl = .func_params; // the name; parameters follow
-        if (n.lookup(t) != null) return;
-        if (n.nnames == max_names or t.len > 255 or n.name_used + t.len > n.name_bytes.len) return;
-        @memcpy(n.name_bytes[n.name_used..][0..t.len], t);
-        n.names[n.nnames] = .{ .off = @intCast(n.name_used), .len = @intCast(t.len) };
-        n.name_used += t.len;
-        var h = slotOf(t);
-        while (n.slots[h] != 0) h = (h + 1) % n.slots.len;
+        const slot = n.findSlot(t);
+        const previous = n.slots[slot];
+        if (previous != 0 and n.names[previous - 1].level == n.function_count) return previous;
+        if (n.nnames == max_names or t.len > 255) return 0;
+        const off = if (previous != 0) n.names[previous - 1].off else blk: {
+            if (n.name_used + t.len > n.name_bytes.len) return 0;
+            const offset: u32 = @intCast(n.name_used);
+            @memcpy(n.name_bytes[n.name_used..][0..t.len], t);
+            n.name_used += t.len;
+            break :blk offset;
+        };
+        const frame = if (n.function_count == 0) null else &n.functions[n.function_count - 1];
+        n.names[n.nnames] = .{
+            .off = off,
+            .len = @intCast(t.len),
+            .level = n.function_count,
+            .slot = @intCast(slot),
+            .previous_value = previous,
+            .previous_binding = if (frame) |f| f.last_binding else 0,
+        };
         n.nnames += 1;
-        n.slots[h] = @intCast(n.nnames);
+        const binding: u16 = @intCast(n.nnames);
+        n.slots[slot] = binding;
+        if (frame) |f| f.last_binding = binding;
+        return binding;
+    }
+
+    fn finishFunction(n: *Normalizer) void {
+        n.function_count -= 1;
+        const frame = n.functions[n.function_count];
+        var binding = frame.last_binding;
+        // Undo insertions in reverse order to preserve each probe chain.
+        while (binding != 0) {
+            const name = n.names[binding - 1];
+            n.slots[name.slot] = name.previous_value;
+            binding = name.previous_binding;
+        }
+        n.decl = frame.saved_decl;
+        n.decl_depth = frame.saved_decl_depth;
+        n.var_depth = frame.saved_var_depth;
     }
 
     fn slotOf(t: []const u8) usize {
         return @intCast(std.hash.Wyhash.hash(0x6a73, t) % (2 * max_names));
     }
 
-    fn lookup(n: *const Normalizer, t: []const u8) ?usize {
+    fn findSlot(n: *const Normalizer, t: []const u8) usize {
         // At most half the slots are used, so a probe always reaches an empty one.
         var h = slotOf(t);
         while (n.slots[h] != 0) : (h = (h + 1) % n.slots.len) {
             const i = n.slots[h] - 1;
             const e = n.names[i];
-            if (std.mem.eql(u8, n.name_bytes[e.off..][0..e.len], t)) return i;
+            if (std.mem.eql(u8, n.name_bytes[e.off..][0..e.len], t)) break;
         }
-        return null;
+        return h;
     }
 
     /// Call folding: unescape("...") and String.fromCharCode(numbers).
@@ -603,7 +675,7 @@ pub const Normalizer = struct {
     fn flushOut(n: *Normalizer) Error!void {
         if (n.olen == 0) return;
         const chunk = n.obuf[0..n.olen];
-        if (n.fold_ascii_case) _ = std.ascii.lowerString(chunk, chunk);
+        if (n.html_output) _ = std.ascii.lowerString(chunk, chunk);
         try n.out.write(n.out.ctx, chunk);
         n.olen = 0;
     }
@@ -705,7 +777,7 @@ test "white space, comments, renaming and folding" {
     const cases = [_][2][]const u8{
         .{ "var foo = 'bar'; alert(foo);", "var n000=\"bar\";alert(n000);" },
         .{ "var  a = \"ev\" + 'al' ; // comment\n/* block */ window[a]('x')", "var n000=\"eval\";window[n000](\"x\")" },
-        .{ "function f(x, y) { return x + y; } f(1, 2);", "function n000(n001,n002){return n001+n002;}n000(1,2);" },
+        .{ "function f(x, y) { return x + y; } f(1, 2);", "function n000(n001,n002){return n001+n002;}f(1,2);" },
         .{ "var s = unescape('%61%6C%u0065rt'); var t = String.fromCharCode(0x65, 118, 97, 108);", "var n000=\"alert\";var n001=\"eval\";" },
         .{ "x = \"\\x41\\u0042\\103\\n\\\"\";", "x=\"ABC\n\\\"\";" },
         .{ "var o = {}; o.foo = 1; var foo = o.foo;", "var n000={};n000.foo=1;var n001=n000.foo;" },
@@ -723,6 +795,19 @@ test "white space, comments, renaming and folding" {
             std.debug.print("input: {s}\n", .{c[0]});
             return e;
         };
+    }
+}
+
+test "function scopes reproduce ClamAV declaration numbering" {
+    const cases = [_][2][]const u8{
+        .{ "var item=0;function first(item){var top=item;return top;}var result=item;report(top,result);", "var n000=0;function n001(n002){var n003=n002;return n003;}var n004=n000;report(top,n004);" },
+        .{ "function outer(item){function inner(q){return inner(q);}inner(item);return outer(item);}outer(1);inner(1);", "function n000(n001){function n002(n003){return n002(n003);}inner(n001);return n000(n001);}outer(1);inner(1);" },
+        .{ "var a=1, handler=function f(a){return f(a);}, b=a; f(a); use(a,b,handler);", "var n000=1,n001=function n002(n003){return n002(n003);},n004=n000;f(n000);use(n000,n004,n001);" },
+        .{ "function a(x=1){return x;} function b(x={}){return x;} function c(x=[1]){return x;} test(x);", "function n000(n001=1){return n001;}function n002(n003={}){return x;}function n004(n005=[1]){return n005;}test(x);" },
+    };
+    for (cases) |config| {
+        var cap: Capture = .{};
+        try std.testing.expectEqualStrings(config[1], try normalize(config[0], &cap));
     }
 }
 

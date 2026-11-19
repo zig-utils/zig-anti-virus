@@ -81,16 +81,17 @@ are covered in `src/fmt/mime.zig`.
 
 ### Inline JavaScript
 
-The HTML `javascript` form folds ASCII case after normalization. In the native
-ClamAV 1.5.4 comparison, `let` and `const` declarations keep their names while
-`var` declarations use numbered names. The regular-expression, string literal,
-property, and declaration tests preserve those observed bytes.
+The HTML `javascript` form folds ASCII case after normalization. ClamAV 1.5.4
+numbers names declared with `var`, function names, and function parameters.
+At the end of a function, aliases from the enclosing scope are visible again.
+`let` and `const` declarations keep their names. The HTML form discards block
+comments and strips `//` delimiters while tokenizing their text.
 
-On 674 script-bearing pages derived from the B1 manifest, the strict comparison
-improved from 1 to 29 byte-identical JavaScript outputs. Both other HTML forms
-agreed on all pages. The remaining examples include differences in function
-parameter numbering and comment handling, so the JavaScript comparison still
-fails with `--strict-js`.
+On 674 script-bearing pages derived from the B1 manifest, function scoping and
+line-comment tokenization raised the count of byte-identical JavaScript outputs
+from 29 to 86. Both other HTML forms agreed on all 674 pages. The remaining
+examples include hexadecimal literals and quotes in line comments, so the
+JavaScript comparison still fails with `--strict-js`.
 
 ### Named HTML references
 

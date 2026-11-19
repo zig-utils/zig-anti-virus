@@ -627,6 +627,13 @@ test "HTML JavaScript lowercases output and keeps const and let names" {
     );
 }
 
+test "HTML JavaScript retains line comment tokens and drops block comments" {
+    const s = try Scanner.init(std.testing.allocator, std.testing.io);
+    defer s.deinit();
+    try s.normalizeHtml("<html><script>if(a){ // Clear note.\n /* Plain note. */ var b=2;}</script></html>");
+    try std.testing.expectEqualStrings("<script>if(a){clear note.var n000=2;}</script>", s.forms[2].items);
+}
+
 fn testEngine(tmp: *std.testing.TmpDir, files: []const [2][]const u8) !Engine {
     const Compiler = @import("../compile/compiler.zig").Compiler;
     var c = Compiler.init(std.testing.allocator);
