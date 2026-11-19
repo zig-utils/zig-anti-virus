@@ -158,6 +158,27 @@ for the ARM crypto kernel and 850.1 MB/s for the ARM baseline through stages
 one and two. The candidate, probe and verify counts per MB matched the previous
 combined run. The 1 GB/s target remains unmet on this ARM measurement.
 
+The [native Linux run](https://github.com/zig-utils/zig-anti-virus/actions/runs/44454816241)
+used Zig 0.17.0-dev.1857+3c46da14d and identical main and daily CVDs on both
+runners. Each figure is the best of five rounds on one logical CPU, using the
+active kernel reported by the run. Both stages operated on the same PE partition
+of the full compiled database.
+
+| CPU | Corpus | Stage 1 (MB/s) | Stages 1+2 (MB/s) | Candidates/MB | Probes/MB | Verifies/MB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| AMD EPYC 9V74, x86_64 v3 SHA | B1 | 653.3 | 555.2 | 4,308.2 | 10,900.1 | 546.8 |
+| AMD EPYC 9V74, x86_64 v3 SHA | B2 | 647.0 | 454.4 | 9,294.4 | 26,013.2 | 472.3 |
+| Arm Neoverse-N2, aarch64 crypto | B1 | 426.3 | 380.5 | 4,308.2 | 10,900.1 | 546.8 |
+| Arm Neoverse-N2, aarch64 crypto | B2 | 407.2 | 318.2 | 9,294.4 | 26,013.2 | 472.3 |
+
+B1 provided 8,398 nonempty files (355.9 MB) and B2 provided 12 (366.4 MB).
+The x86_64 guest reported four logical CPUs with two threads per core. The
+Arm guest reported four logical CPUs with one thread per core. The artifacts
+contain measurements for every runnable kernel. Candidate, probe and verify
+counts agreed across architectures and kernels. The Linux runs missed the
+1 GB/s pass line in both corpora. A controlled SMT comparison, cache-miss
+counts, a clamd raw baseline and the full alternative bake-off remain open.
+
 ## Against the other designs
 
 The alternatives were measured in zig-regex (docs/BENCHMARKS.md, binary literal sets of 100k
