@@ -1,2 +1,3 @@
 src/compile/fixtures/*.sign -text
 src/compile/fixtures/*.pin -text
+src/fmt/fixtures/html_named_refs.* -text
