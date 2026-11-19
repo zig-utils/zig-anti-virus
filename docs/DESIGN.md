@@ -307,15 +307,26 @@ miss -> read first 4 KiB -> file-type trie
 
 **Workers:** one per physical core. Each owns a scratch reservation, a Chase-Lev deque, and padded epoch and stats slots.
 
+`Pool` uses native core topology on Linux, macOS and Windows. The worker count
+is configurable. Linux can pin workers to the process's allowed CPUs, assigning
+one logical CPU per physical core before using SMT siblings. Idle workers park
+on the generation futex. Closing the pool drains accepted jobs before joining.
+
 `zig build bench -Doptimize=ReleaseFast -- zig-out/deque.json deque` measures
 128 uncontended push and last-item pop pairs per sample. On Apple M3 Pro,
 the mean was 693 ns per batch, or 2.7 ns per operation including benchmark
-loop overhead. A single deque handled 10 million jobs exactly once with
-one owner and ten thieves in a separate ReleaseSafe run on that machine.
+loop overhead. The [hosted x86_64 benchmark](https://github.com/zig-utils/zig-anti-virus/actions/runs/44458256485)
+measured 676 ns per batch, or 2.6 ns per operation.
+
+`ZAV_RUNTIME_STRESS=1 zig test src/rt/pool.zig -O ReleaseSafe -fsanitize-thread -lc`
+ran 10 million jobs exactly once on macOS with 11 workers and 978,439 steals,
+and on an aarch64 Linux VM with six workers and 237,987 steals. The separate
+non-sanitized Linux backpressure test started at 260 resident pages and peaked
+at 261 while the full injector rejected a million offers.
 
 **Injector and backpressure:**
-- A bounded MPMC injector holds 4N jobs. When it is full, the event loop stops reading sockets.
-- Directory walkers split subdirectories into new jobs only while their deque is short.
+- A bounded MPMC injector holds 4N jobs. A full result tells the producer to yield or pause its source.
+- Directory walkers split subdirectories when their local deque has 64 or fewer jobs. They visit additional directories inline.
 
 **Directory walking:**
 - Linux: `getdents64` plus `statx`, batched through io_uring.

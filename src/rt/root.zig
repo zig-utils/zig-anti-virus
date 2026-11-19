@@ -2,9 +2,13 @@
 //! See docs/DESIGN.md for the design this module implements.
 
 pub const deque = @import("deque.zig");
+pub const pool = @import("pool.zig");
 pub const vm = @import("vm.zig");
+pub const walk = @import("walk.zig");
 
 test {
     _ = deque;
+    _ = pool;
     _ = vm;
+    _ = walk;
 }

@@ -40,6 +40,12 @@ jobs:
       - run: zig build
       - run: zig build test --summary all
       - run: zig build test -Doptimize=safe
+      - name: Work-stealing stress under ThreadSanitizer
+        if: runner.os == 'Linux'
+        timeout-minutes: 12
+        env:
+          ZAV_RUNTIME_STRESS: '1'
+        run: zig test src/rt/pool.zig -O ReleaseSafe -fsanitize-thread -lc
       - run: zig build fuzz -Dfuzz-iterations=20000
       - run: zig build lib -Doptimize=fast
       - run: ./zig-out/bin/zav --version && ./zig-out/bin/zavd --version
