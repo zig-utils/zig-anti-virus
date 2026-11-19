@@ -90,10 +90,11 @@ fn buildCommands(gpa: std.mem.Allocator) !*Command {
     _ = coverage.setActionWithCode(coverageAction);
     _ = try root.addCommand(coverage);
 
-    const scan = try Command.init(gpa, "scan", "Scan files");
+    const scan = try Command.init(gpa, "scan", "Scan files and directories");
     _ = try scan.addOption(Option.init("db", "db", "Database to scan with", .string));
     _ = try scan.addOption(Option.init("allow-unsigned", "allow-unsigned", "Accept an unsigned database", .bool));
-    _ = try scan.addArgument(Argument.init("paths", "Files to scan", .string).withVariadic(true));
+    _ = try scan.addOption(Option.init("keep-cache", "keep-cache", "Keep directory-scan files in the OS cache", .bool));
+    _ = try scan.addArgument(Argument.init("paths", "Files or directories to scan", .string).withVariadic(true));
     _ = scan.setActionWithCode(scanAction);
     _ = try root.addCommand(scan);
 
@@ -326,6 +327,48 @@ fn coverageAction(ctx: *Command.ParseContext) !u8 {
     return 0;
 }
 
+const FileScan = struct {
+    ctx: *Command.ParseContext,
+    index: zav.engine.hashscan.HashIndex,
+    block: []u8,
+    tracker: zav.engine.limits.Tracker = .init(.{}),
+    name_buf: [512]u8 = undefined,
+    directory: []const u8 = "",
+    found: bool = false,
+    failed: bool = false,
+
+    fn readError(scan: *FileScan, path: []const u8, err: anyerror) !void {
+        scan.failed = true;
+        try app.out.print("{s}: {t} ERROR\n", .{ path, err });
+    }
+
+    fn scanSource(scan: *FileScan, path: []const u8, source: zav.engine.source.Source) !void {
+        scan.tracker.reset();
+        const verdict = zav.engine.hashscan.scanSource(app.io, &scan.index, source, &scan.tracker, scan.block) catch |err|
+            return scan.readError(path, err);
+        switch (verdict) {
+            .clean, .allowed => try report(scan.ctx, path, "OK", null),
+            .infected => |sig| {
+                scan.found = true;
+                const name = if (scan.index.meta) |m| try m.name(sig, &scan.name_buf) else "unknown";
+                try report(scan.ctx, path, "FOUND", name);
+            },
+            .limited => |event| {
+                var event_buf: [64]u8 = undefined;
+                try report(scan.ctx, path, "LIMITED", try std.fmt.bufPrint(&event_buf, "{t}", .{event}));
+            },
+        }
+    }
+
+    fn visit(ptr: *anyopaque, relative: []const u8, source: zav.engine.source.Source, _: ?zav.rt.directory.Volume) !void {
+        const scan: *FileScan = @ptrCast(@alignCast(ptr));
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const separator = if (std.fs.path.isSep(scan.directory[scan.directory.len - 1])) "" else std.fs.path.sep_str;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}{s}{s}", .{ scan.directory, separator, relative });
+        try scan.scanSource(path, source);
+    }
+};
+
 fn scanAction(ctx: *Command.ParseContext) !u8 {
     const db_path = ctx.getOption("db") orelse "zav.zavdb";
     const database = openDb(ctx, db_path) catch return 2;
@@ -334,44 +377,42 @@ fn scanAction(ctx: *Command.ParseContext) !u8 {
         try app.err.print("zav: {s}: {t}\n", .{ db_path, e });
         return 2;
     };
-
     var scratch = try zav.engine.scratch.Scratch.init(zav.engine.scratch.default_reservation);
     defer scratch.deinit();
-    const block = try scratch.allocator().alloc(u8, 256 * 1024);
-    var tracker = zav.engine.limits.Tracker.init(.{});
-    var name_buf: [512]u8 = undefined;
-    var found = false;
-    var failed = false;
+    var scan: FileScan = .{ .ctx = ctx, .index = index, .block = try scratch.allocator().alloc(u8, 256 * 1024) };
+    var reader: ?zav.rt.scan_io.Reader = null;
+    defer if (reader) |*worker| worker.deinit();
 
     for (ctx.arguments.items) |path| {
-        tracker.reset();
-        const file = std.Io.Dir.cwd().openFile(app.io, path, .{}) catch |e| {
-            try app.out.print("{s}: {t} ERROR\n", .{ path, e });
-            failed = true;
+        const file = std.Io.Dir.cwd().openFile(app.io, path, .{}) catch |err| {
+            try scan.readError(path, err);
             continue;
         };
         defer file.close(app.io);
-        const size = (try file.stat(app.io)).size;
-        const verdict = zav.engine.hashscan.scanSource(app.io, &index, .{ .file = .{ .file = file, .len = size } }, &tracker, block) catch |e| {
-            try app.out.print("{s}: {t} ERROR\n", .{ path, e });
-            failed = true;
+        const stat = file.stat(app.io) catch |err| {
+            try scan.readError(path, err);
             continue;
         };
-        switch (verdict) {
-            .clean, .allowed => try report(ctx, path, "OK", null),
-            .infected => |sig| {
-                found = true;
-                const name = if (index.meta) |m| try m.name(sig, &name_buf) else "unknown";
-                try report(ctx, path, "FOUND", name);
-            },
-            .limited => |event| {
-                var event_buf: [64]u8 = undefined;
-                try report(ctx, path, "LIMITED", try std.fmt.bufPrint(&event_buf, "{t}", .{event}));
-            },
+        if (stat.kind == .directory) {
+            const dir = std.Io.Dir.cwd().openDir(app.io, path, .{ .iterate = true }) catch |err| {
+                try scan.readError(path, err);
+                continue;
+            };
+            defer dir.close(app.io);
+            if (reader == null) reader = try .init(app.gpa, app.io, .{
+                .cache = if (flag(ctx, "keep-cache")) .keep else .discard,
+            });
+            scan.directory = path;
+            reader.?.walk(dir, .{ .context = &scan, .file = FileScan.visit }) catch |err| try scan.readError(path, err);
+        } else {
+            const mark = scratch.mark();
+            defer scratch.release(mark);
+            const source: zav.engine.source.Source = .{ .file = .{ .file = file, .len = stat.size } };
+            try scan.scanSource(path, zav.rt.io_small.prepare(app.io, scratch.allocator(), source));
         }
     }
-    if (failed) return 2;
-    return if (found) 1 else 0;
+    if (scan.failed) return 2;
+    return if (scan.found) 1 else 0;
 }
 
 fn report(ctx: *Command.ParseContext, path: []const u8, status: []const u8, detail: ?[]const u8) !void {

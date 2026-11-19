@@ -256,6 +256,22 @@ pub fn build(b: *std.Build) void {
     run_gram_model.addPassthruArgs();
     b.step("gram-model", "Build the 4-gram frequency model from benign corpus directories").dependOn(&run_gram_model.step);
 
+    const io_check = b.addExecutable(.{
+        .name = "io-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/io_check.zig"),
+            .target = target,
+            .optimize = .fast,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zav", .module = zav }},
+        }),
+    });
+    const run_io_check = b.addRunArtifact(io_check);
+    run_io_check.addPassthruArgs();
+    const io_check_step = b.step("io-check", "Verify the small-file I/O corpus (pass mode, directory and count after --)");
+    io_check_step.dependOn(&b.addInstallArtifact(io_check, .{}).step);
+    io_check_step.dependOn(&run_io_check.step);
+
     // Kernel benchmarks (zig-bench is a lazy dependency, fetched only by this step).
     const bench_step = b.step("bench", "Run kernel benchmarks and write a JSON result file");
     if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {

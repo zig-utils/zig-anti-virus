@@ -25,7 +25,7 @@ pub fn prepare(io: std.Io, scratch: std.mem.Allocator, src: Source) Source {
     return .{ .memory = buffer };
 }
 
-fn adviseSequential(file: Source.FileRange) void {
+pub fn adviseSequential(file: Source.FileRange) void {
     if (builtin.os.tag != .linux) return;
     if (file.offset > std.math.maxInt(i64) or file.len > std.math.maxInt(i64)) return;
     const linux = std.os.linux;

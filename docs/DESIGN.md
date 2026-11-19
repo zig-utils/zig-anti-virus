@@ -332,15 +332,28 @@ peak) and within one page in the focused test (260 before and 261 at peak).
 - Directory walkers split subdirectories when their local deque has 64 or fewer jobs. They visit additional directories inline.
 
 **Directory walking:**
-- Linux: `getdents64` plus `statx`, batched through io_uring.
-- macOS: `getattrlistbulk`.
+- Linux: `getdents64` for directory entries and batched `statx` for file metadata. Volume identity carries the mount ID and, when the kernel supplies it, the subvolume ID.
+- macOS: `getattrlistbulk` returns names, kinds, inode numbers and file lengths in batches.
+- Entries are sorted by inode. Walkers reuse reserved directory scratch during traversal.
 
 **I/O:**
 - The positional walker reads files up to 1 MiB into reused scan scratch. Format detection and parsing share that copy.
 - Larger root files are read in 256 KiB blocks, with sequential advice on Linux. The matcher still receives 64 KiB chunks for consistent limit accounting.
-- mmap only for large random access.
+- Large random access uses the positional source. Use mmap only when a parser requires a contiguous view beyond the in-memory cap.
 - Optional page-cache hygiene for bulk scans.
-- On Linux 5.19+, io_uring with linked openat, statx, read and close for small files.
+- On Linux with io_uring support, batches of up to 64 entries link directory-relative `statx` and direct `openat`, then fixed-file `read` and `close`. `statx` takes the directory descriptor and name. The open completion supplies the allocated slot for the second batch. If setup fails, the worker uses pread and logs the fallback once per process.
+
+**Small-file verification:** `python3 bench/io_fixture.py ROOT 1000000` creates
+the deterministic 4 KiB corpus. `zig build io-check -- MODE ROOT 1000000`
+checks every path exactly once and compares all bytes against the independent
+fixture pattern. Linux 6.8 (arm64) matched all 1,000,000 files and 4,096,000,000
+bytes with both io_uring and pread. The io_uring run used zero positional
+retries. A process-wide `strace -f -c` counted 62,706 syscalls (0.063 per file).
+A separate trace found zero `mmap` or `munmap` calls from the first directory
+read through the verification result. An Ubuntu 24.04 container using Docker's
+default seccomp profile rejected io_uring setup and verified the same corpus
+using `fallback` mode. On macOS (arm64), both `bulk` and `pread` modes verified
+the entire corpus.
 
 **Scan cache (`scan-cache.zavc`):**
 - 8-way buckets of 32-byte entries, each `{ino, meta_fp, db_ver, dev, verdict, flags, seq, crc}`.
