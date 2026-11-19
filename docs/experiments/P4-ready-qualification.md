@@ -5,7 +5,7 @@ the issues' acceptance criteria. Historical benchmark observations are not new m
 
 | Issue | Proven | Remaining before closure |
 |---|---|---|
-| [#24, anchored index](https://github.com/zig-utils/zig-anti-virus/issues/24) | The compiler proves every anchored program reachable. PE and ELF offset verdict cases pass the grammar differential. The ARM benchmark now averages 1.67 microseconds per file. | Verify the updated build on the hosted x86_64 benchmark. |
+| [#24, anchored index](https://github.com/zig-utils/zig-anti-virus/issues/24) | The compiler proves every anchored program reachable. PE and ELF offset verdict cases pass the grammar differential. The benchmark averages 1.67 microseconds per file on ARM and 1.94 on x86_64. | Complete. |
 | [#27, tier-D deferral](https://github.com/zig-utils/zig-anti-virus/issues/27) | Required-cover analysis, deferred second pass, fallback filters and coverage counts exist. E3 measures fewer candidates on B1, B2 and S1. | E3 explicitly substitutes planted samples for the requested malware corpus. That corpus differential remains unproven. |
 | [#32, Guardian rules](https://github.com/zig-utils/zig-anti-virus/issues/32) | The [signed starter pack](../rules/guardian.md) passed CLI coverage, fixture detection, benign corpus, and tamper checks. | Complete. |
 | [#35, E4](https://github.com/zig-utils/zig-anti-virus/issues/35) | E4's follow-up justifies the budgets; all four generated worst cases passed the 50 ms/MB threshold in the successful ab208d5 real-database CI job. | Qualified for the current generated A1 cases. Full-pipeline performance remains a later gate. |
@@ -96,3 +96,7 @@ Using the original 20,000-signature fixture and 10,000 iterations on the Apple
 M3 Pro, the ReleaseFast mean fell from 2,638 ns to 1,667 ns per file. The
 median fell from 2,375 ns to 1,666 ns, and p99 from 5,334 ns to 1,750 ns.
 Both measurements used Zig `0.17.0-dev.1857+3c46da14d`.
+
+The [hosted x86_64 benchmark](https://github.com/zig-utils/zig-anti-virus/actions/runs/44447268372/job/135302336326)
+used the same fixture and 10,000 iterations. It recorded a 1,944 ns mean, a
+1,893 ns median, and a 3,506 ns p99 per file.
