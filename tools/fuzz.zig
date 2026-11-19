@@ -320,7 +320,10 @@ fn verifyDiff(random: std.Random) void {
         const bytes = zc.prog_build.build(arena, &input) catch return;
         const aligned = arena.alignedAlloc(u8, .@"4", bytes.len) catch return;
         @memcpy(aligned, bytes);
-        const progs = prog.Programs.init(aligned) catch @panic("fuzz: compiler built a program that does not validate");
+        const progs = prog.Programs.init(aligned) catch |err| {
+            std.debug.print("verifyDiff body {s}, mods {}, offset {}: {t}\n", .{ body, mods, off, err });
+            @panic("fuzz: compiler built a program that does not validate");
+        };
         const program = progs.get(0);
 
         var budget: vm.Budget = .{ .per_verify = 20_000, .per_file = 200_000 };

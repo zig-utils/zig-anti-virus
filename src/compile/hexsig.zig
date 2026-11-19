@@ -721,6 +721,11 @@ fn caseVariant(arena: Allocator, p: ir.Pattern, bits: usize) Error!ir.Pattern {
 fn expandableAlt(p: ir.Pattern) ?usize {
     for (p.ops, 0..) |o, i| {
         if (o.code != .alt or o.flags & ir.op_nocase != 0) continue;
+        // Keep optional alternatives in the VM. Expanding an empty arm can remove the
+        // whole pattern or a part next to a gap, leaving an invalid verify program.
+        var optional = false;
+        for (p.alternatives(o)) |entry| optional = optional or entry.op_count == 0;
+        if (optional) continue;
         if (allLiteral(p, o)) return i;
     }
     return null;

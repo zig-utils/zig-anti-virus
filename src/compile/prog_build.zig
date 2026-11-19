@@ -190,6 +190,30 @@ test "anchors prefer the longest fixed-distance literal" {
     try testing.expectEqual(@as(u32, 7), minLen(q));
 }
 
+test "expanded optional alternations produce valid verify programs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "(6162|)", "6162*(6364|)", "(6162|)*6364", "6162*(6364|)*6566", "6162(6364|)" }) |body| {
+        var diag: hexsig.Diag = .{};
+        const pattern = try hexsig.parse(a, body, &diag);
+        for (0..16) |bits| {
+            const mods: ir.Modifiers = @bitCast(@as(u8, @intCast(bits)));
+            const variants = try hexsig.expand(a, pattern, mods);
+            for (variants) |variant| {
+                const inputs = [_]Input{.{ .pattern = variant.pattern, .sig = 1 }};
+                const bytes = try build(a, &inputs);
+                const aligned = try a.alignedAlloc(u8, .@"4", bytes.len);
+                @memcpy(aligned, bytes);
+                _ = prog.Programs.init(aligned) catch |err| {
+                    std.debug.print("invalid expanded program for {s} mods {}: {t}\n", .{ body, mods, err });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
 test "built sections validate and read back" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
