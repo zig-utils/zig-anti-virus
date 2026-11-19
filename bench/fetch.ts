@@ -20,8 +20,9 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-interface Source {
+export interface Source {
   id: string
   url: string
   format: 'tar.gz' | 'tar.bz2' | 'zip' | 'file'
@@ -40,19 +41,19 @@ interface CorpusSpec {
   sources: Source[]
 }
 
-interface Archive extends Source {
+export interface Archive extends Source {
   sha256: string
   size: number
 }
 
-interface Entry {
+export interface Entry {
   sha256: string
   size: number
   archive: string
   member: string
 }
 
-interface Manifest {
+export interface Manifest {
   name: string
   description: string
   sampling: string
@@ -64,17 +65,8 @@ interface Manifest {
   files: Entry[]
 }
 
-const root = new URL('..', import.meta.url).pathname
-const corpusDir = join(root, 'bench', 'corpus')
-const args = process.argv.slice(2)
-const flag = (name: string) => {
-  const i = args.indexOf(name)
-  return i >= 0 ? args[i + 1] : undefined
-}
-const out = flag('--out') ?? join(homedir(), '.cache', 'zav', 'corpus')
-const subset = flag('--subset')
-const valued = new Set(['--out', '--subset'])
-const names = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && valued.has(args[i - 1])))
+const corpusDir = fileURLToPath(new URL('corpus/', import.meta.url))
+const defaultOut = join(homedir(), '.cache', 'zav', 'corpus')
 
 function sha256File(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
@@ -86,7 +78,7 @@ function run(cmd: string, argv: string[]): void {
 }
 
 /** Download `url` into DIR/dl once; the file name is the source id. */
-function download(src: Source): string {
+function download(src: Source, out: string): string {
   const dl = join(out, 'dl')
   mkdirSync(dl, { recursive: true })
   const path = join(dl, src.id)
@@ -99,7 +91,7 @@ function download(src: Source): string {
 }
 
 /** Extract an archive into DIR/x/<id> once and return that directory. */
-function extract(src: Source, archive: string): string {
+function extract(src: Source, archive: string, out: string): string {
   const dir = join(out, 'x', src.id)
   if (existsSync(join(dir, '.done'))) return dir
   rmSync(dir, { recursive: true, force: true })
@@ -121,26 +113,26 @@ function walk(dir: string, base = dir, acc: string[] = []): string[] {
 }
 
 /** Where a member lives on disk after download and extraction. */
-function memberPath(src: Source, member: string): string {
-  const archive = download(src)
+function memberPath(src: Source, member: string, out: string): string {
+  const archive = download(src, out)
   if (src.format === 'file') return archive
-  return join(extract(src, archive), member)
+  return join(extract(src, archive, out), member)
 }
 
-function generate(): void {
+function generate(out: string): void {
   const spec = JSON.parse(readFileSync(join(corpusDir, 'sources.json'), 'utf8')) as { corpora: Record<string, CorpusSpec> }
   for (const [name, corpus] of Object.entries(spec.corpora)) {
     const seen = new Set<string>()
     const archives: Archive[] = []
     const files: Entry[] = []
     for (const src of corpus.sources) {
-      const archive = download(src)
+      const archive = download(src, out)
       archives.push({ ...src, sha256: sha256File(archive), size: statSync(archive).size })
-      const members = src.format === 'file' ? [''] : walk(extract(src, archive)).sort()
+      const members = src.format === 'file' ? [''] : walk(extract(src, archive, out)).sort()
       const picked: Entry[] = []
       for (const member of members) {
         if (src.include && !src.include.some(p => member.startsWith(p))) continue
-        const path = memberPath(src, member)
+        const path = memberPath(src, member, out)
         const size = statSync(path).size
         if (size < corpus.min_size || size > corpus.max_size) continue
         const sha256 = sha256File(path)
@@ -185,13 +177,15 @@ function render(m: Manifest): string {
   return `${top},\n  "files": [\n${files.map(f => `    ${JSON.stringify(f)}`).join(',\n')}\n  ]\n}\n`
 }
 
-function inCi(e: Entry): boolean {
+export function inCi(e: Entry): boolean {
   return e.sha256.startsWith('0')
 }
 
-function fetch(name: string): void {
-  const manifest = JSON.parse(readFileSync(join(corpusDir, `${name}.json`), 'utf8')) as Manifest
-  const files = subset === 'ci' ? manifest.files.filter(inCi) : manifest.files
+export function fetchCorpus(manifest: Manifest, options: { out?: string, subset?: 'ci' } = {}): void {
+  const { out = defaultOut, subset } = options
+  validateManifest(manifest)
+  const { name } = manifest
+  const files = selectFiles(manifest, subset)
   const dest = join(out, subset === 'ci' ? `${name}-ci` : name)
   mkdirSync(dest, { recursive: true })
   const archives = new Map(manifest.archives.map(a => [a.id, a]))
@@ -201,32 +195,109 @@ function fetch(name: string): void {
   for (const e of files) {
     const target = join(dest, e.sha256)
     bytes += e.size
-    if (existsSync(target) && statSync(target).size === e.size) continue
+    if (existsSync(target) && statSync(target).size === e.size && sha256File(target) === e.sha256) continue
     const src = archives.get(e.archive)
     if (!src) throw new Error(`${name}: unknown archive ${e.archive}`)
     if (!checked.has(src.id)) {
       checked.add(src.id)
-      const got = sha256File(download(src))
-      if (got !== src.sha256) {
+      const got = sha256File(download(src, out))
+      if (got !== src.sha256 || statSync(download(src, out)).size !== src.size) {
         if (!src.archive_hash_unstable) throw new Error(`${src.id}: archive hash ${got}, manifest says ${src.sha256}`)
         console.error(`${src.id}: archive bytes changed upstream; members are still checked one by one`)
       }
     }
-    const path = memberPath(src, e.member)
-    const got = existsSync(path) ? sha256File(path) : 'missing'
-    if (got !== e.sha256) {
-      console.error(`${name}: ${e.archive}:${e.member} has hash ${got}, manifest says ${e.sha256}`)
+    const path = memberPath(src, e.member, out)
+    const size = existsSync(path) ? statSync(path).size : -1
+    const got = size >= 0 ? sha256File(path) : 'missing'
+    if (got !== e.sha256 || size !== e.size) {
+      console.error(`${name}: ${e.archive}:${e.member} has hash ${got}, size ${size}; expected ${e.sha256}, size ${e.size}`)
       bad++
       continue
     }
-    copyFileSync(path, target)
+    copyFileSync(path, `${target}.part`)
+    renameSync(`${target}.part`, target)
   }
   console.log(`${name}${subset === 'ci' ? ' (CI subset)' : ''}: ${files.length - bad} of ${files.length} files verified, ${bytes} bytes in ${dest}`)
-  if (bad > 0) process.exit(1)
+  if (bad > 0) throw new Error(`${name}: ${bad} corpus member(s) failed verification`)
 }
 
-if (args.includes('--generate')) generate()
-else {
-  const list = names.length === 0 || names.includes('all') ? ['B1', 'B2', 'S1'] : names
-  for (const name of list) fetch(name)
+/** Shared manifest boundary for corpus consumers; importing this module performs no I/O. */
+export function loadManifest(name: string, directory = corpusDir): Manifest {
+  if (!['B1', 'B2', 'S1'].includes(name)) throw new Error(`unknown benign corpus: ${name}`)
+  const manifest = JSON.parse(readFileSync(join(directory, `${name}.json`), 'utf8')) as Manifest
+  validateManifest(manifest)
+  if (manifest.name !== name) throw new Error(`${name}: manifest name mismatch`)
+  return manifest
+}
+
+/** Validate metadata before it can name any path or create a misleading benchmark input. */
+export function validateManifest(manifest: Manifest): void {
+  const fail = (message: string): never => { throw new Error(`invalid corpus manifest: ${message}`) }
+  if (!['B1', 'B2', 'S1'].includes(manifest.name)) fail('unknown name')
+  if (!Array.isArray(manifest.archives) || !Array.isArray(manifest.files)) fail('missing archives or files')
+  const digest = /^[a-f0-9]{64}$/
+  const size = (n: number) => Number.isSafeInteger(n) && n >= 0
+  const archives = new Map<string, Archive>()
+  for (const source of manifest.archives) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(source.id) || archives.has(source.id)) fail('invalid or duplicate archive id')
+    if (!digest.test(source.sha256) || !size(source.size)) fail(`invalid archive digest or size: ${source.id}`)
+    if (!['file', 'zip', 'tar.gz', 'tar.bz2'].includes(source.format)) fail(`unknown archive format: ${source.id}`)
+    if (!source.url || !source.license || !source.project) fail(`missing source provenance: ${source.id}`)
+    archives.set(source.id, source)
+  }
+  let previous = ''
+  for (const file of manifest.files) {
+    if (!digest.test(file.sha256) || !size(file.size)) fail('invalid file digest or size')
+    if (file.sha256 <= previous) fail('files must be unique and in SHA-256 order')
+    previous = file.sha256
+    const source = archives.get(file.archive)
+    if (!source) fail(`unknown archive: ${file.archive}`)
+    if (typeof file.member !== 'string' || file.member.startsWith('/') || file.member.includes('\\') || file.member.split('/').some(part => part === '..')) fail('unsafe member path')
+    if (source.format === 'file' && file.member !== '') fail('direct file must have an empty member')
+    if (source.format !== 'file' && !file.member) fail('archive member is required')
+  }
+  const ci = manifest.files.filter(inCi)
+  if (manifest.file_count !== manifest.files.length || manifest.total_bytes !== manifest.files.reduce((n, file) => n + file.size, 0)) fail('file totals disagree')
+  if (manifest.ci_file_count !== ci.length || manifest.ci_total_bytes !== ci.reduce((n, file) => n + file.size, 0)) fail('CI totals disagree')
+}
+
+export function selectFiles(manifest: Manifest, subset?: 'ci'): Entry[] {
+  return subset === 'ci' ? manifest.files.filter(inCi) : manifest.files.slice()
+}
+
+function main(args: string[]): void {
+  let out = defaultOut
+  let subset: 'ci' | undefined
+  let regenerate = false
+  const names: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '--out') {
+      if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error('--out requires a directory')
+      out = args[++i]
+    }
+    else if (arg === '--subset') {
+      if (args[++i] !== 'ci') throw new Error('--subset must be ci')
+      subset = 'ci'
+    }
+    else if (arg === '--generate') regenerate = true
+    else if (['B1', 'B2', 'S1', 'all'].includes(arg)) names.push(arg)
+    else throw new Error(`unknown argument: ${arg}`)
+  }
+  if (regenerate) {
+    if (subset || names.length) throw new Error('--generate cannot select corpora or a subset')
+    generate(out)
+  }
+  else {
+    const list = !names.length || names.includes('all') ? ['B1', 'B2', 'S1'] : [...new Set(names)]
+    for (const name of list) fetchCorpus(loadManifest(name), { out, subset })
+  }
+}
+
+if (import.meta.main) {
+  try { main(process.argv.slice(2)) }
+  catch (error) {
+    console.error(error instanceof Error ? error.message : error)
+    process.exitCode = 1
+  }
 }

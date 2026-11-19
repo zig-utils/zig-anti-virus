@@ -1,5 +1,5 @@
 {
-  "comment": "Inputs to `bun bench/fetch.ts --generate`, which turns them into B1.json, B2.json and S1.json. Each archive is a public, freely licensed download; `take` picks members by size and path, and `max_bytes` caps a source by keeping its members in SHA-256 order (a deterministic sample). See README.md for the licences.",
+  "comment": "Inputs to `bun bench/fetch.ts --generate`, which turns them into B1.json, B2.json and S1.json. Each archive is a public download with its own licence or corpus terms; size limits and include prefixes pick members by size and path, and `max_bytes` caps a source by keeping its members in SHA-256 order (a deterministic sample). See README.md for the licences.",
   "corpora": {
     "B1": {
       "description": "Benign filesystem slice: executables (ELF, PE, Mach-O), shared libraries, scripts, source, HTML, office documents, PDFs and compressed archives as they sit on disk.",

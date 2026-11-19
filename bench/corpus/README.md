@@ -20,11 +20,13 @@ bun bench/fetch.ts B1 --out /some/dir   # elsewhere
 ```
 
 Each source archive is downloaded once into `<out>/dl`, extracted into `<out>/x`, and every
-listed member is copied to `<out>/<name>/<sha256>` after its SHA-256 is checked; a mismatch
-fails the run. Files are named by hash, so a directory holds each distinct file once and every
+listed member is copied to `<out>/<name>/<sha256>` after its SHA-256 and byte count are checked; a mismatch
+fails the run. Existing output files are rehashed on every run, so same-size cache corruption
+is repaired from verified source bytes. Corrupt downloaded archives or extracted members fail
+verification rather than being accepted from the cache. Files are named by hash, so a directory holds each distinct file once and every
 tool reads them in the same (name) order. A clean fetch of the CI subset of all three corpora
-takes under three minutes (about 500 MB of downloads; 2 min 45 s measured on a residential
-link).
+requires downloading whole source archives (roughly 400 MB), even though only the selected
+members are materialized. Network speed and extraction time affect the five-minute CI budget.
 
 ## Sampling and the CI subset
 
@@ -39,15 +41,20 @@ file joins the subset only if its own hash starts with `0`).
 
 ## Sources and licences
 
+Most software sources use permissive licences. BusyBox is GPL-2.0-only, and the public mail
+corpus retains the message authors' copyrights; this is not an all-permissive dataset. Only
+manifest metadata is committed. Downloaded samples stay in the local cache, and the engine
+does not incorporate their implementation code.
+
 | Source | Corpus | Licence |
 |---|---|---|
 | [Go 1.22.5](https://go.dev/dl/) toolchains for linux/amd64, windows/amd64 and darwin/arm64, and the Windows MSI | B1, B2 | BSD-3-Clause |
 | [Node.js 20.15.1](https://nodejs.org/dist/v20.15.1/) for win-x64 and darwin-arm64 | B1, B2 | MIT, with the bundled licences listed in the archive's LICENSE |
 | [CPython 3.12.4](https://www.python.org/downloads/release/python-3124/) embeddable package and installer (amd64) | B1, B2 | PSF-2.0 |
 | [Apache POI 5.2.5](https://github.com/apache/poi/tree/REL_5_2_5/test-data) test documents (OLE2, OOXML, PDF, images and more) | B1 | Apache-2.0 |
-| [BusyBox 1.35.0](https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/) static x86_64 binary | B1 | GPL-2.0-only |
+| [BusyBox 1.35.0](https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/) ([licence](https://busybox.net/license.html)) static x86_64 binary | B1 | GPL-2.0-only |
 | [PuTTY 0.81](https://www.chiark.greenend.org.uk/~sgtatham/putty/) for w64 | B1 | MIT |
-| [SpamAssassin public corpus](https://spamassassin.apache.org/old/publiccorpus/) easy_ham and hard_ham (2003-02-28) | S1 | Published by the SpamAssassin project for testing mail filters; copyright in each message stays with its sender (see the corpus readme). Fetched from the project, never redistributed here, and never sent into a live mail system. Only the ham (non-spam) sets are used |
+| [SpamAssassin public corpus](https://spamassassin.apache.org/old/publiccorpus/) easy_ham and hard_ham (2003-02-28) | S1 | Published by the SpamAssassin project for testing mail filters; copyright in each message stays with its sender ([corpus terms](https://spamassassin.apache.org/old/publiccorpus/readme.html)). Fetched from the project, never redistributed here, and never sent into a live mail system. Only the ham (non-spam) sets are used |
 
 GitHub tag archives are generated on demand and their bytes have changed in the past, so the
 POI archive's hash is recorded but not enforced (`archive_hash_unstable`); every member it
@@ -59,4 +66,22 @@ yields is still checked against the manifest. Every other archive's hash is enfo
   frequency model from B1.
 - `zig build prefilter -- scan|stages|top|prefix <db> ~/.cache/zav/corpus/B1 ...` measures the
   byte-pattern prefilter on B1, B2 and S1 (docs/experiments/E2-prefilter.md, E3-atoms.md).
-- The P6.15 harness reads the same manifests and the same fetched directories.
+- The P6.15 harness must consume these same manifests and fetched directories when it lands.
+
+TypeScript consumers share the validated loader and selector instead of implementing their own
+sampling rule. Importing `bench/fetch.ts` has no download or generation side effects:
+
+```ts
+import { fetchCorpus, loadManifest, selectFiles } from '../bench/fetch'
+
+const manifest = loadManifest('B1')
+const files = selectFiles(manifest, 'ci') // the same stable prefix used by the fetch CLI
+fetchCorpus(manifest, { subset: 'ci' }) // verifies/materializes those files in the default cache
+```
+
+The JSON contract records source archive URL, licence, SHA-256 and size, and each member's
+archive id, path, SHA-256 and size. Entries are unique and sorted by digest. Consumers scanning
+the materialized directory use that digest order; they must not enumerate extracted source
+archives or mix a full corpus with its `-ci` directory. `loadManifest` validates references,
+paths, ordering and full/CI byte totals. `bun test bench/fetch.test.ts` exercises this contract
+without requiring public network access.

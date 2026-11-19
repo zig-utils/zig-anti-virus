@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
       - run: bun scripts/check-pin.ts
+      - run: bun test bench/fetch.test.ts
       - name: No tracked executable binaries
         run: |
           bad=$(git ls-files -z | xargs -0 file --mime-type | grep -E 'application/(x-mach-binary|x-executable|x-pie-executable|x-sharedlib|x-dosexec)' || true)
