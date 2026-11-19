@@ -140,7 +140,7 @@ rounds. The benchmark ran alongside other work on the same machine.
 
 Both kernels recorded 18,565.9 probes and 509 verifies per MB. The stride-one
 gate passed 0.83% of positions. Both runs fell short of the 1 GB/s target for
-the two stages together. Real-corpus x86_64 and clamd measurements remain open.
+the two stages together. The hosted runs below cover Linux x86_64 and clamd.
 
 ### Hosted measurements
 
@@ -185,7 +185,23 @@ Arm guest reported four logical CPUs with one thread per core. The artifacts
 contain measurements for every runnable kernel. Candidate, probe and verify
 counts agreed across architectures and kernels. The Linux runs missed the
 1 GB/s pass line in both corpora. A controlled SMT comparison, cache-miss
-counts, a clamd raw baseline and the full alternative bake-off remain open.
+counts and the full alternative bake-off remain open.
+
+The [raw clamd comparison](https://github.com/zig-utils/zig-anti-virus/actions/runs/44456035934)
+used ClamAV 1.5.4 and the same CVD checksums as the first native run. This
+x86_64 guest ran on an Intel Xeon 6975P-C with two threads per core. The Arm
+guest again ran on Neoverse-N2 with one thread per core. Rates are the best
+of five prefilter rounds and three raw clamd rounds from that run.
+
+| CPU | Corpus | PE stages 1+2 (MB/s) | clamd raw scan (MB/s) |
+| --- | --- | ---: | ---: |
+| Intel Xeon 6975P-C, x86_64 v3 SHA | B1 | 553.4 | 3.8 |
+| Intel Xeon 6975P-C, x86_64 v3 SHA | B2 | 457.4 | 7.3 |
+| Arm Neoverse-N2, aarch64 crypto | B1 | 360.3 | 2.6 |
+| Arm Neoverse-N2, aarch64 crypto | B2 | 301.8 | 4.5 |
+
+Each stage-one-plus-two rate exceeded three times its raw clamd baseline.
+Each stayed below 1 GB/s per core. P6.15 covers end-to-end throughput.
 
 ## Against the other designs
 
@@ -212,7 +228,7 @@ PE partition, mostly `.ndb` signatures with no literal of 7 bytes), which costs 
 byte. Follow-ups: zig-utils/zig-anti-virus#107 (4-byte atoms for tier D, which removes most of
 the 3-gram filter), zig-utils/zig-anti-virus#109 (CPU-variant builds of the kernel, x86-64-v3
 and aarch64, dispatched at runtime) and zig-utils/zig-anti-virus#108 (a text-aware model for
-mail and HTML). clamd's raw throughput on the same corpus is not measured yet (P6.15).
+mail and HTML). The hosted measurements above record the raw clamd baseline.
 
 No losing variant is kept: the zig-regex structures stay in zig-regex, where their benchmarks
 live.
