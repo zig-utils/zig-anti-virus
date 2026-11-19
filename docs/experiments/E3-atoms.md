@@ -64,6 +64,31 @@ of logical state (it touches every short subsig the file contains) while the pre
 detected the planted signature, and no file where the two disagree. There is no malware corpus
 yet (M1, P5.17); this stands in for the differential on it.
 
+### Compare production prefilters with deferral on and off
+
+`deferral-diff` compares the two compiled prefilters over the same raw object
+bytes. It uses the engine's native executable classification and layout for both
+scans. Before scanning, it checks that the databases contain equivalent
+signatures and that only the first database contains deferred programs. It
+compares the first reported signature ID against the identical signature tables.
+An empty corpus, a different verdict or any scan limit causes a nonzero exit.
+This check covers body signatures. It excludes whole-file hashes, container
+extraction and derived streams so those paths cannot mask a body verdict.
+
+```sh
+zig build prefilter -Doptimize=ReleaseFast -- compile defer.zavdb main.cvd daily.cvd
+./zig-out/bin/prefilter compile no-defer.zavdb main.cvd daily.cvd --no-defer
+./zig-out/bin/prefilter deferral-diff defer.zavdb no-defer.zavdb /path/to/corpus
+```
+
+Use the same CVD files for both builds. Use only an isolated environment for M1
+and keep the corpus and per-sample output there.
+
+With main 63 and daily 28187, the two builds had 1,628,441 equivalent verify
+programs. On all 11,162 B1, B2 and S1 files, 11,101 were clean in both scans
+and 61 were inconclusive because a scan reported a limit. No conclusive verdicts
+differed. The command exited nonzero. The M1 acceptance check is still open.
+
 ## Tier D
 
 Programs whose longest literal at a fixed distance is shorter than 4 bytes, by what happened

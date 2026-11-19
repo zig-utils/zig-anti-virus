@@ -9,6 +9,8 @@
 //!       stage one alone, and stages one and two (no verify), per partition the files use
 //!   zig build prefilter -Doptimize=ReleaseFast -- diff <db> <dir>... [--limit N]
 //!       prefiltered against reference verdicts, file by file
+//!   zig build prefilter -Doptimize=ReleaseFast -- deferral-diff <db> <no-defer-db> <dir>...
+//!       compare first raw-body verdicts under both compiled prefilters, including limits
 //!   zig build prefilter -Doptimize=ReleaseFast -- prefix <db> <dir>...
 //!       E3: candidates per MB with 3-byte prefixes (ClamAV's Aho-Corasick depth) against atoms
 const std = @import("std");
@@ -48,6 +50,10 @@ pub fn main(init: std.process.Init) !void {
     defer database.close();
     index_db = database;
     const index = try bodyscan.BodyIndex.load(database);
+    if (std.mem.eql(u8, cmd, "deferral-diff")) {
+        if (args.len < 5) return error.MissingDeferralInputs;
+        return deferralDiff(gpa, arena, io, database, &index, args[3], args[4..]);
+    }
 
     var dirs: std.ArrayList([]const u8) = .empty;
     var reference = false;
@@ -213,6 +219,7 @@ fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
 fn usage() void {
     std.debug.print("usage: prefilter census|scan|stages|diff|prefix <db> [dir...] [--reference] [--limit N]\n", .{});
+    std.debug.print("       prefilter deferral-diff <db> <no-defer-db> <dir>...\n", .{});
 }
 
 fn list(io: std.Io, arena: std.mem.Allocator, dir_path: []const u8, corpus: *Corpus, limit: usize) !void {
@@ -266,7 +273,9 @@ const Worker = struct {
 
     fn init(gpa: std.mem.Allocator, index: *const bodyscan.BodyIndex) !*Worker {
         const w = try gpa.create(Worker);
+        errdefer gpa.destroy(w);
         w.scratch = try gpa.alloc(u8, 64 * 1024 * 1024);
+        errdefer gpa.free(w.scratch);
         w.fba = .init(w.scratch);
         w.state = try .init(w.fba.allocator());
         w.scan = try w.fba.allocator().create(bodyscan.Scratch);
@@ -278,13 +287,22 @@ const Worker = struct {
         }
         return w;
     }
+
+    fn deinit(w: *Worker, gpa: std.mem.Allocator) void {
+        gpa.free(w.scratch);
+        gpa.destroy(w);
+    }
 };
 
 fn scanOne(index: *const bodyscan.BodyIndex, w: *Worker, data: []const u8, mode: bodyscan.Mode, stats: ?*pf.Stats) !bodyscan.Verdict {
+    return scanBody(index, w, data, .{ .info = .{ .size = data.len }, .target = targetOf(data) }, mode, stats);
+}
+
+fn scanBody(index: *const bodyscan.BodyIndex, w: *Worker, data: []const u8, file: bodyscan.File, mode: bodyscan.Mode, stats: ?*pf.Stats) !bodyscan.Verdict {
     w.state.reset();
     var budget: vm.Budget = .{};
     var tracker = zav.engine.limits.Tracker.init(.{});
-    return bodyscan.scanBufferScratch(index, data, .{ .info = .{ .size = data.len }, .target = targetOf(data) }, &budget, &tracker, &w.state, mode, stats, w.scan);
+    return bodyscan.scanBufferScratch(index, data, file, &budget, &tracker, &w.state, mode, stats, w.scan);
 }
 
 fn scan(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus, mode: bodyscan.Mode) !void {
@@ -488,6 +506,89 @@ fn diff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: C
         }
     }
     std.debug.print("{d} files compared, {d} mismatches\n", .{ corpus.paths.items.len, mismatches });
+}
+
+fn deferralDiff(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, database: zav.db.reader.Database, index: *const bodyscan.BodyIndex, baseline_path: []const u8, dirs: []const []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const baseline_db = try zav.db.reader.open(io, cwd, baseline_path, .{ .allow_unsigned = true });
+    defer baseline_db.close();
+    const baseline = try bodyscan.BodyIndex.load(baseline_db);
+    try checkDeferralPair(database, index, baseline_db, &baseline);
+
+    var corpus: Corpus = .{};
+    for (dirs) |dir| try list(io, arena, dir, &corpus, std.math.maxInt(usize));
+    if (corpus.paths.items.len == 0) return error.EmptyCorpus;
+
+    const classifier = try zav.engine.layerscan.Scanner.init(gpa, io);
+    defer classifier.deinit();
+    const enabled = try Worker.init(gpa, index);
+    defer enabled.deinit(gpa);
+    const disabled = try Worker.init(gpa, &baseline);
+    defer disabled.deinit(gpa);
+    var clean: usize = 0;
+    var detected: usize = 0;
+    var different: usize = 0;
+    var limited: usize = 0;
+    for (corpus.paths.items) |path| {
+        const data = try cwd.readFileAlloc(io, path, gpa, .limited(1 << 31));
+        defer gpa.free(data);
+        const file = classifier.classify(data).file;
+        const a = try scanBody(index, enabled, data, file, .auto, null);
+        const b = try scanBody(&baseline, disabled, data, file, .auto, null);
+        if (a == .limited or b == .limited) {
+            limited += 1;
+            std.debug.print("INCONCLUSIVE {s}: deferred {any}, non-deferred {any}\n", .{ std.fs.path.basename(path), a, b });
+        } else if (a == .clean and b == .clean) {
+            clean += 1;
+        } else if (a == .infected and b == .infected and a.infected.sig == b.infected.sig) {
+            detected += 1;
+        } else {
+            different += 1;
+            std.debug.print("MISMATCH {s}: deferred {any}, non-deferred {any}\n", .{ std.fs.path.basename(path), a, b });
+        }
+    }
+    std.debug.print("{d} files: {d} clean, {d} same first detection, {d} mismatched, {d} inconclusive\n", .{
+        corpus.paths.items.len, clean, detected, different, limited,
+    });
+    if (different != 0 or limited != 0) return error.DeferralComparisonFailed;
+}
+
+/// Require matching signatures and allow differences in the atom plans and their reports.
+fn checkDeferralPair(a: zav.db.reader.Database, enabled: *const bodyscan.BodyIndex, b: zav.db.reader.Database, disabled: *const bodyscan.BodyIndex) !void {
+    if (!std.meta.eql(a.header().sources, b.header().sources)) return error.DifferentSignatureSources;
+    for ([_]zav.db.reader.Database{ a, b }, [_]zav.db.reader.Database{ b, a }) |left, right| {
+        for (left.sections()) |section| {
+            switch (section.kind) {
+                .prefilter, .atom_table, .coverage_report => continue,
+                .subsig_prog => if (section.variant == 0) continue,
+                else => {},
+            }
+            const x = left.section(section.kind, section.variant).?;
+            const y = right.section(section.kind, section.variant) orelse return error.DifferentSignatureTables;
+            if (!std.mem.eql(u8, x, y)) return error.DifferentSignatureTables;
+        }
+    }
+    if (enabled.partitionFor(0) == null or disabled.partitionFor(0) == null) return error.MissingPrefilter;
+    const x = enabled.programs orelse return error.MissingPrograms;
+    const y = disabled.programs orelse return error.MissingPrograms;
+    if (x.count() != y.count()) return error.DifferentPrograms;
+    var deferred: usize = 0;
+    for (0..x.count()) |i| {
+        const p = x.get(i);
+        const q = y.get(i);
+        if (q.header.flags & prog.flag_deferred != 0) return error.BaselineHasDeferredPrograms;
+        deferred += @intFromBool(p.header.flags & prog.flag_deferred != 0);
+        var header = p.header;
+        header.flags &= ~prog.flag_deferred;
+        header.anchor_op = q.header.anchor_op;
+        header.anchor_part = q.header.anchor_part;
+        header.anchor_delta = q.header.anchor_delta;
+        if (!std.meta.eql(header, q.header) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(p.pattern.ops), std.mem.sliceAsBytes(q.pattern.ops)) or
+            !std.mem.eql(u8, p.pattern.data, q.pattern.data)) return error.DifferentPrograms;
+    }
+    if (deferred == 0) return error.NoDeferredPrograms;
+    std.debug.print("{d} equivalent verify programs, {d} deferred only in the first database\n", .{ x.count(), deferred });
 }
 
 fn prefix(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
