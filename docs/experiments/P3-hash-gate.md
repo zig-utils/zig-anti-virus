@@ -15,6 +15,9 @@ removed. These are compiler summary counts, distinct from the input-line census.
 daily hash line through the mapped index, including the size-need map. It
 preloads the same ignore lists as compilation and applies functionality-level
 filtering. Any unexplained missing rule fails the command.
+Size-less rules require their algorithm's global need bit, even when a sized
+zero-byte entry exists. A serialized need-map regression checks that distinction
+for MD5, SHA-1 and SHA-256.
 
 | Result | Hash lines |
 |---|---:|

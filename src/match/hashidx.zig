@@ -18,6 +18,26 @@
 const std = @import("std");
 const ir = @import("../compile/ir.zig");
 
+test "need-map coverage distinguishes a zero-sized entry from any-size hashing" {
+    for ([_]Algo{ .md5, .sha1, .sha256 }) |algo| {
+        var bytes: [@sizeOf(NeedHeader) + 16]u8 align(8) = @splat(0);
+        const header: *NeedHeader = @ptrCast(&bytes);
+        header.* = .{};
+        header.maps[@backingInt(algo)] = .{ .mode = .list, .count = 2, .off = @sizeOf(NeedHeader) };
+        std.mem.writeInt(u64, bytes[@sizeOf(NeedHeader)..][0..8], 0, .little);
+        std.mem.writeInt(u64, bytes[@sizeOf(NeedHeader) + 8 ..][0..8], 64, .little);
+        const need = try NeedMap.init(&bytes);
+        try std.testing.expect(need.mask(0) & needBit(algo) != 0);
+        try std.testing.expect(need.covers(algo, 0));
+        try std.testing.expect(need.covers(algo, 64));
+        try std.testing.expect(!need.covers(algo, 65));
+        try std.testing.expect(!need.covers(algo, null));
+        header.sizeless_mask = needBit(algo);
+        try std.testing.expect(need.covers(algo, null));
+        try std.testing.expect(need.covers(algo, 65));
+    }
+}
+
 pub const Algo = ir.HashAlgo;
 pub const Scope = ir.HashScope;
 
@@ -129,6 +149,13 @@ pub const NeedMap = struct {
     }
 
     /// Algorithms (need_* bits) to compute for data of this size.
+    /// Whether a rule's algorithm is covered by this map. An any-size rule must have its
+    /// global bit set; a sized entry at zero cannot stand in for any-size coverage.
+    pub fn covers(map: NeedMap, algo: Algo, size: ?u64) bool {
+        const bits = if (size) |n| map.mask(n) else map.header.sizeless_mask;
+        return bits & needBit(algo) != 0;
+    }
+
     pub fn mask(map: NeedMap, size: u64) u8 {
         var m = map.header.sizeless_mask;
         inline for (0..3) |a| {

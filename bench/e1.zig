@@ -160,9 +160,12 @@ const Check = struct {
                 continue;
             };
             // The scan path: the need map first (a size-less rule passes through the mask).
-            const need = c.index.need[@backingInt(rule.scope)].?;
+            const need = c.index.need[@backingInt(rule.scope)] orelse {
+                c.missing += 1;
+                continue;
+            };
             const size = rule.size orelse 0;
-            if (rule.size != null and need.mask(size) & hashidx.needBit(rule.algo) == 0) {
+            if (!need.covers(rule.algo, rule.size)) {
                 c.missing += 1;
                 continue;
             }
