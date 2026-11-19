@@ -12,6 +12,7 @@ cross libclamav's 8191-byte chunks with and without whitespace near the cut.
 import argparse
 import os
 import random
+from pathlib import Path
 
 TOKENS = [
     b"<html>", b"<HTML LANG='en'>", b"</html>", b"<body bgcolor=#fff onload=\"go( 'a b' )\">", b"<p>", b"</p>",
@@ -21,6 +22,8 @@ TOKENS = [
     b"<script>", b"<SCRIPT language=javascript>", b"</script>", b"</SCRIPT >", b"</script foo>", b"<script src=x.js></script>",
     b"var A = 'x' + \"y\";", b"if (a<b) c();", b"</b>", b"<!-- in -->", b"document.write('<p>');",
     b"<style>", b"</style>", b"b { c: 'd' }", b"<style type=text/css>p{}</style>",
+    b"&Agr;", b"&Acy;", b"&boxh;", b"&frac13;", b"&tdot;", b"&DotDot;", b"&apos;",
+    b"&Abreve;", b"&NotEqualTilde;", b"&fjlig;",
     b"&amp;", b"&AMP;", b"&nbsp;", b"&lt;", b"&eacute;", b"&Eacute;", b"&bogus;", b"&amp", b"&", b"&#65;", b"&#x41;",
     b"&#0;", b"&#x;", b"&#65", b"&#xffff;", b"&#x3002;", b"&#300;", b"&#99999999999999999999;", b"&#X4a;", b"&x-y_z:w;",
     b"&" + b"a" * 1100 + b";",
@@ -64,7 +67,11 @@ def main():
         # Starting with a tag keeps libclamav's file typing on HTML.
         with open(os.path.join(args.out, "h%04d.html" % i), "wb") as f:
             f.write(b"<html><script>" + doc(rng))
-    print("gen_html.py: %d documents" % args.count)
+    # Stable native-binary fixture independently lists all 743 supported names.
+    # Keep it in the byte differential run so removed or mistyped entries fail CI.
+    fixture = Path(__file__).resolve().parents[2] / "src/fmt/fixtures/html_named_refs.html"
+    (Path(args.out) / "named-references.html").write_bytes(fixture.read_bytes())
+    print("gen_html.py: %d documents" % (args.count + 1))
 
 
 if __name__ == "__main__":
