@@ -46,53 +46,70 @@ pub fn scanSource(io: Io, index: *const HashIndex, src: source_mod.Source, track
     const size = src.len() orelse return error.UnknownSize;
     if (size < limits_mod.min_scan_size) return .clean;
     tracker.checkFileSize(size) catch return .{ .limited = .file_size };
-    const need = if (index.need[@backingInt(ir.HashScope.file)]) |map| map.mask(size) else 0;
-    if (need == 0) return .clean;
-
-    var md5 = std.crypto.hash.Md5.init(.{});
-    var sha1 = std.crypto.hash.Sha1.init(.{});
-    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
-    var offset: u64 = 0;
-    while (offset < size) {
-        const n = try src.readAt(io, offset, block);
+    var file = FileHashes.init(index, size) orelse return .clean;
+    while (file.bytes < size) {
+        const n = try src.readAt(io, file.bytes, block);
         if (n == 0) break;
         tracker.addScanned(n) catch return .{ .limited = .scan_size };
-        const chunk = block[0..n];
-        if (need & hashidx.need_md5 != 0) md5.update(chunk);
-        if (need & hashidx.need_sha1 != 0) sha1.update(chunk);
-        if (need & hashidx.need_sha256 != 0) sha256.update(chunk);
-        offset += n;
+        file.update(block[0..n]);
     }
-    if (offset != size) return error.SourceChanged;
-
-    var d_md5: [16]u8 = undefined;
-    var d_sha1: [20]u8 = undefined;
-    var d_sha256: [32]u8 = undefined;
-    if (need & hashidx.need_md5 != 0) md5.final(&d_md5);
-    if (need & hashidx.need_sha1 != 0) sha1.final(&d_sha1);
-    if (need & hashidx.need_sha256 != 0) sha256.final(&d_sha256);
-
-    const digests = [_]struct { algo: ir.HashAlgo, bit: u8, bytes: []const u8 }{
-        .{ .algo = .md5, .bit = hashidx.need_md5, .bytes = &d_md5 },
-        .{ .algo = .sha1, .bit = hashidx.need_sha1, .bytes = &d_sha1 },
-        .{ .algo = .sha256, .bit = hashidx.need_sha256, .bytes = &d_sha256 },
-    };
-    for (digests) |d| {
-        if (need & d.bit == 0) continue;
-        const t = hashidx.tableVariant(d.algo, .file);
-        const table = index.tables[t] orelse continue;
-        const sig = table.lookup(size, d.bytes) orelse continue;
-        // A detection: an allowlist entry for this exact file wins (checked only now).
-        for (digests) |a| {
-            if (need & a.bit == 0) continue;
-            if (index.allow[hashidx.tableVariant(a.algo, .file)]) |allow| {
-                if (allow.lookup(size, a.bytes) != null) return .{ .allowed = sig };
-            }
-        }
-        return .{ .infected = sig };
-    }
-    return .clean;
+    if (file.bytes != size) return error.SourceChanged;
+    return file.finish(index);
 }
+
+/// The whole-file hash stage for callers that already deliver an object's bytes in chunks.
+pub const FileHashes = struct {
+    size: u64,
+    bytes: u64 = 0,
+    need: u8,
+    md5: std.crypto.hash.Md5 = .init(.{}),
+    sha1: std.crypto.hash.Sha1 = .init(.{}),
+    sha256: std.crypto.hash.sha2.Sha256 = .init(.{}),
+
+    pub fn init(index: *const HashIndex, size: u64) ?FileHashes {
+        if (size < limits_mod.min_scan_size) return null;
+        const map = index.need[@backingInt(ir.HashScope.file)] orelse return null;
+        const need = map.mask(size);
+        return if (need == 0) null else .{ .size = size, .need = need };
+    }
+
+    pub fn update(file: *FileHashes, chunk: []const u8) void {
+        file.bytes += chunk.len;
+        if (file.need & hashidx.need_md5 != 0) file.md5.update(chunk);
+        if (file.need & hashidx.need_sha1 != 0) file.sha1.update(chunk);
+        if (file.need & hashidx.need_sha256 != 0) file.sha256.update(chunk);
+    }
+
+    pub fn finish(file: *FileHashes, index: *const HashIndex) Verdict {
+        if (file.bytes != file.size) return .clean;
+        var md5: [16]u8 = undefined;
+        var sha1: [20]u8 = undefined;
+        var sha256: [32]u8 = undefined;
+        if (file.need & hashidx.need_md5 != 0) file.md5.final(&md5);
+        if (file.need & hashidx.need_sha1 != 0) file.sha1.final(&sha1);
+        if (file.need & hashidx.need_sha256 != 0) file.sha256.final(&sha256);
+
+        const digests = [_]struct { algo: ir.HashAlgo, bit: u8, bytes: []const u8 }{
+            .{ .algo = .md5, .bit = hashidx.need_md5, .bytes = &md5 },
+            .{ .algo = .sha1, .bit = hashidx.need_sha1, .bytes = &sha1 },
+            .{ .algo = .sha256, .bit = hashidx.need_sha256, .bytes = &sha256 },
+        };
+        for (digests) |d| {
+            if (file.need & d.bit == 0) continue;
+            const table = index.tables[hashidx.tableVariant(d.algo, .file)] orelse continue;
+            const sig = table.lookup(file.size, d.bytes) orelse continue;
+            // Check the whole-file allowlist only when a hash hit.
+            for (digests) |a| {
+                if (file.need & a.bit == 0) continue;
+                if (index.allow[hashidx.tableVariant(a.algo, .file)]) |allow| {
+                    if (allow.lookup(file.size, a.bytes) != null) return .{ .allowed = sig };
+                }
+            }
+            return .{ .infected = sig };
+        }
+        return .clean;
+    }
+};
 
 /// Section (.mdb/.msb) and import (.imp) hashes of a parsed PE. A section is hashed only when
 /// the pe_section need map lists its stored raw size, and only with the algorithms that size

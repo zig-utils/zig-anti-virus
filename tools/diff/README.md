@@ -71,6 +71,14 @@ Every difference was fixed in zav or listed in `known.txt`:
   (target 7) and, for HTML, nocomment.html, notags.html and `javascript`. `gen_html.py` writes
   stress documents that reach every state of libclamav's HTML normaliser, chunk cuts included.
 
+### MIME messages
+
+The `mail.case` differential checks target-4 matching on an intact message and
+whole-file hash matching on a decoded attachment. Both tools agreed on the two
+case messages and all 2,752 messages in the manifest-backed S1 corpus using the
+case's signatures. The named-attachment path and the zig-mime evasion fixtures
+are covered in `src/fmt/mime.zig`.
+
 ### Named HTML references
 
 `src/fmt/html_named_refs.zig` contains the 743 names recognised by the official

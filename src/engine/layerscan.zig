@@ -150,7 +150,7 @@ pub const Scanner = struct {
     norm: std.ArrayList(u8) = .empty,
     html: *html_norm.Normalizer,
     forms: [3]std.ArrayList(u8) = @splat(.empty),
-    /// Scratch for walking containers (VBA modules in OLE2), made on first use.
+    /// Scratch for walking mail attachments and OLE2 macro streams, made on first use.
     walk_scratch: ?scratch_mod.Scratch = null,
 
     pub fn init(gpa: std.mem.Allocator, io: Io) !*Scanner {
@@ -223,6 +223,7 @@ pub const Scanner = struct {
                 for (info.sections[0..n], s.vm_sections[0..n]) |sec, *v| v.* = .{ .offset = sec.offset, .size = sec.size };
                 out.file.info.sections = s.vm_sections[0..n];
             } else |_| {},
+            .mail => out.file.target = 4,
             else => {},
         }
         return out;
@@ -292,6 +293,11 @@ pub const Scanner = struct {
             .limited => |ev| limited = limited orelse ev,
             .clean => {},
         };
+        if (c.format == .mail or c.retyped == .mail) switch (try s.scanMailAttachments(e, data)) {
+            .found => |sig| return .{ .found = sig },
+            .limited => |ev| limited = limited orelse ev,
+            .clean => {},
+        };
         if (c.kind == .text) {
             // scanraw: ASCII text whose type magics settle on HTML is scanned as HTML too (and
             // not as text); on mail, its raw bytes are matched with the mail target as well.
@@ -330,28 +336,84 @@ pub const Scanner = struct {
     /// cli_vba_scandir: each VBA module's decompressed source in an OLE2 compound file, matched
     /// with target type 2. The walker's OLE2 parser finds them (its `macro/<module>` children).
     fn scanMacros(s: *Scanner, e: *Engine, data: []const u8, tracker: *limits.Tracker) !Result {
+        const ws = try s.prepareWalk();
+        var mc: MacroCollect = .{ .s = s, .e = e, .tracker = tracker };
+        defer mc.source.deinit(s.gpa);
+        _ = s.walkObject(ws, data, mc.visitor(), null);
+        if (mc.err) |err| return err;
+        if (mc.found) |sig| return .{ .found = sig };
+        if (mc.limited) |ev| return .{ .limited = ev };
+        return .clean;
+    }
+
+    fn prepareWalk(s: *Scanner) !*scratch_mod.Scratch {
         if (s.walk_scratch == null) s.walk_scratch = try .init(scratch_mod.default_reservation);
         const ws = &s.walk_scratch.?;
         ws.reset();
+        return ws;
+    }
+
+    fn walkObject(s: *Scanner, ws: *scratch_mod.Scratch, data: []const u8, visitor: container.Visitor, magics: ?*const ftm.Ftm) ?limits.Event {
         var budget = budget_mod.Budget.init(64 * 1024 * 1024);
         var walk_tracker = limits.Tracker.init(s.limits);
-        var mc: MacroCollect = .{ .s = s, .e = e, .tracker = tracker };
-        defer mc.source.deinit(s.gpa);
         var w: container.Walker = .{
             .io = s.io,
             .scratch = ws,
             .tracker = &walk_tracker,
             .budget = &budget,
             .spill_dir = Io.Dir.cwd(),
-            .visitor = mc.visitor(),
+            .visitor = visitor,
             .parse = fmt_scan.parse,
+            .options = .{ .types = magics },
         };
         w.scan(.{ .memory = data }, "object") catch {};
-        if (mc.err) |err| return err;
-        if (mc.found) |sig| return .{ .found = sig };
-        if (mc.limited) |ev| return .{ .limited = ev };
+        return walk_tracker.last;
+    }
+
+    fn scanMailAttachments(s: *Scanner, e: *const Engine, data: []const u8) !Result {
+        const ws = try s.prepareWalk();
+        const files = try ws.allocator().alloc(?hashscan.FileHashes, @as(usize, s.limits.max_recursion) + 1);
+        @memset(files, null);
+        var hashes: MailAttachmentHashes = .{ .files = files, .index = &e.hashes };
+        const event = s.walkObject(ws, data, .{ .ptr = &hashes, .vtable = &MailAttachmentHashes.vtable }, if (e.types) |*magics| magics else null);
+        if (hashes.found) |sig| return .{ .found = sig };
+        if (event) |ev| return .{ .limited = ev };
         return .clean;
     }
+
+    const MailAttachmentHashes = struct {
+        index: *const hashscan.HashIndex,
+        files: []?hashscan.FileHashes,
+        found: ?u32 = null,
+
+        const vtable: container.Visitor.VTable = .{ .enter = enter, .data = feed, .leave = leave, .notice = notice };
+
+        fn enter(ptr: *anyopaque, obj: *const container.Object) error{Stop}!void {
+            const hashes: *MailAttachmentHashes = @ptrCast(@alignCast(ptr));
+            if (hashes.found != null) return error.Stop;
+            if (obj.kind != .member) return;
+            hashes.files[obj.depth] = if (obj.size) |size| .init(hashes.index, size) else null;
+        }
+
+        fn feed(ptr: *anyopaque, obj: *const container.Object, bytes: []const u8) error{Stop}!void {
+            const hashes: *MailAttachmentHashes = @ptrCast(@alignCast(ptr));
+            if (hashes.found != null) return error.Stop;
+            if (obj.kind != .member) return;
+            if (hashes.files[obj.depth]) |*file| file.update(bytes);
+        }
+
+        fn leave(ptr: *anyopaque, obj: *const container.Object) void {
+            const hashes: *MailAttachmentHashes = @ptrCast(@alignCast(ptr));
+            if (obj.kind != .member or hashes.found != null) return;
+            if (hashes.files[obj.depth]) |*file| {
+                const result = file.finish(hashes.index);
+                if (result == .infected) hashes.found = result.infected;
+                hashes.files[obj.depth] = null;
+            }
+        }
+
+        fn notice(_: *anyopaque, _: container.Notice) void {}
+    };
 
     const MacroCollect = struct {
         s: *Scanner,

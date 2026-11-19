@@ -1,0 +1,6 @@
+# The same MIME structure carries a standard EICAR test file or a clean attachment.
+case mime-attachment-hash
+hdb 44d88612fea8a8f36de82e1278abb02f:68:Eicar-Test-Signature
+ndb Diff.Mail.Subject:4:*:5375626a6563743a204174746163686d656e7420636865636b
+sample "From: sender@example.org\r\nTo: receiver@example.org\r\nSubject: Attachment check\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=guardian\r\n\r\n" "--guardian\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=sample.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n" "WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNU\r\nLUZJTEUhJEgrSCo=\r\n--guardian--\r\n" => Diff.Mail.Subject Eicar-Test-Signature
+sample "From: sender@example.org\r\nTo: receiver@example.org\r\nSubject: Attachment check\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=guardian\r\n\r\n" "--guardian\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=sample.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n" "R3VhcmRpYW4gYmVuaWduIGZpeHR1cmU=\r\n--guardian--\r\n" => Diff.Mail.Subject
