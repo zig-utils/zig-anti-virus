@@ -370,34 +370,42 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
     for (corpus.paths.items) |p| try datas.append(gpa, try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31)));
     var ring: [pf.ring_len]pf.Candidate = undefined;
     const mb = @as(f64, @floatFromInt(corpus.bytes)) / 1e6;
-    // Best of `rounds` passes each.
-    var best1: u64 = std.math.maxInt(u64);
-    var best12: u64 = std.math.maxInt(u64);
-    var cands: u64 = 0;
-    var stats: pf.Stats = .{};
-    for (0..rounds) |round| {
-        var t = now(io);
-        cands = 0;
-        for (datas.items) |d| {
-            const part = index.partitionFor(targetOf(d)) orelse continue;
-            var pos: usize = 0;
-            while (pos < d.len) {
-                const n, const next = pf.stage1(part, d, pos, &ring);
-                cands += n;
-                pos = next;
+    // Keep every runnable variant's measurement; the dispatch winner alone cannot show
+    // whether a portable binary improves with the CPU-specific objects.
+    const Measurement = struct { best1: u64 = std.math.maxInt(u64), best12: u64 = std.math.maxInt(u64), cands: u64 = 0, stats: pf.Stats = .{} };
+    var measurements: [8]Measurement = @splat(.{});
+    var kbuf: [8]*const pf.Kernel = undefined;
+    const kernels = pf.runnableKernels(&kbuf);
+    for (kernels, measurements[0..kernels.len]) |kern, *m| {
+        for (0..rounds) |_| {
+            var t = now(io);
+            m.cands = 0;
+            for (datas.items) |d| {
+                const part = index.partitionFor(targetOf(d)) orelse continue;
+                var pos: usize = 0;
+                while (pos < d.len) {
+                    const n, const next = pf.stage1With(kern.run, part, d, pos, &ring);
+                    m.cands += n;
+                    pos = next;
+                }
             }
+            m.best1 = @min(m.best1, nsSince(io, t));
+            t = now(io);
+            var sink: CountSink = .{};
+            m.stats = .{};
+            for (datas.items) |d| {
+                const part = index.partitionFor(targetOf(d)) orelse continue;
+                var pos: usize = 0;
+                while (pos < d.len) {
+                    const n, const next = pf.stage1With(kern.run, part, d, pos, &ring);
+                    pos = next;
+                    m.stats.candidates += n;
+                    _ = pf.stage2(part, d, ring[0..n], &sink, &m.stats);
+                }
+            }
+            m.best12 = @min(m.best12, nsSince(io, t));
+            std.mem.doNotOptimizeAway(sink.n);
         }
-        best1 = @min(best1, nsSince(io, t));
-        t = now(io);
-        var sink: CountSink = .{};
-        stats = .{};
-        for (datas.items) |d| {
-            const part = index.partitionFor(targetOf(d)) orelse continue;
-            _ = pf.scan(part, d, &ring, &sink, &stats);
-        }
-        best12 = @min(best12, nsSince(io, t));
-        std.mem.doNotOptimizeAway(sink.n);
-        _ = round;
     }
     var gate_pass: u64 = 0;
     var gate_pos: u64 = 0;
@@ -459,8 +467,11 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
     }
     std.debug.print("gate: {d} first bytes pass {d:.1}%, {d} second bytes pass {d:.1}% (last file's partition)\n", .{ nf, 100 * @as(f64, @floatFromInt(first_pass)) / @as(f64, @floatFromInt(@max(gate_pos, 1))), ns, 100 * @as(f64, @floatFromInt(second_pass)) / @as(f64, @floatFromInt(@max(gate_pos, 1))) });
     std.debug.print("{d} files, {d:.1} MB, stride-one gate passes {d:.2}% of positions\n", .{ datas.items.len, mb, 100 * @as(f64, @floatFromInt(gate_pass)) / @as(f64, @floatFromInt(@max(gate_pos, 1))) });
-    std.debug.print("stage 1:     {d:.1} MB/s per core, {d:.1} candidates per MB\n", .{ mb / (@as(f64, @floatFromInt(best1)) / 1e9), @as(f64, @floatFromInt(cands)) / mb });
-    std.debug.print("stages 1+2:  {d:.1} MB/s per core, {d:.1} probes and {d:.1} verifies per MB\n", .{ mb / (@as(f64, @floatFromInt(best12)) / 1e9), @as(f64, @floatFromInt(stats.probes)) / mb, @as(f64, @floatFromInt(stats.verifies)) / mb });
+    std.debug.print("best of {d} rounds; active kernel {s}\n", .{ rounds, pf.activeKernel().name });
+    for (kernels, measurements[0..kernels.len]) |kern, m| {
+        std.debug.print("stage 1 [{s}]:    {d:.1} MB/s per core, {d:.1} candidates per MB\n", .{ kern.name, mb / (@as(f64, @floatFromInt(m.best1)) / 1e9), @as(f64, @floatFromInt(m.cands)) / mb });
+        std.debug.print("stages 1+2 [{s}]: {d:.1} MB/s per core, {d:.1} probes and {d:.1} verifies per MB\n", .{ kern.name, mb / (@as(f64, @floatFromInt(m.best12)) / 1e9), @as(f64, @floatFromInt(m.stats.probes)) / mb, @as(f64, @floatFromInt(m.stats.verifies)) / mb });
+    }
 }
 
 fn diff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
