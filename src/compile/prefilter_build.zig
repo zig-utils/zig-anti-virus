@@ -74,6 +74,25 @@ pub fn buildTable(gpa: std.mem.Allocator, programs: prog.Programs, specs: []cons
         const h = p.header;
         const spec = specs[i];
         if (!searched(p) or spec.q == 0) continue;
+        if (spec.expansion) |off| {
+            const expanded = atoms.expandWindow(p.pattern, h.anchor_part, off, spec.q) orelse return error.InvalidAtomExpansion;
+            var entry: pf.Entry = .{
+                .prog = @intCast(i),
+                .ext = 0,
+                .back = off,
+                .ext_len = 0,
+                .stride = 1,
+                .q = spec.q,
+                .flags = h.target << pf.entry_target_shift,
+            };
+            if (bestCheck(p, off, spec.q, &.{}, false)) |check| {
+                entry.flags |= pf.entry_check;
+                entry.ext = @intCast(checks.items.len);
+                try checks.append(gpa, check);
+            }
+            for (expanded.grams[0..expanded.len]) |g| try keyed.append(gpa, .{ .key = g, .entry = entry });
+            continue;
+        }
         const w = windowOf(p, spec);
         const lit = w.lit;
         const after = lit.len - spec.off - spec.q;
@@ -158,7 +177,6 @@ pub fn build(gpa: std.mem.Allocator, programs: prog.Programs, specs: []const pro
             try short.append(gpa, @intCast(i));
             continue;
         }
-        const w = windowOf(p, spec);
         const si = specIndex(spec.stride, spec.q);
         if (builders[si] == null) builders[si] = try sbbf.Builder.init(gpa, .{ .stride = spec.stride, .bits_per_key = 1, .seed = options.seed });
         const b = &builders[si].?;
@@ -168,6 +186,15 @@ pub fn build(gpa: std.mem.Allocator, programs: prog.Programs, specs: []const pro
             3 => pf.gate_q3,
             else => pf.gate_q2,
         };
+        if (spec.expansion) |off| {
+            const expanded = atoms.expandWindow(p.pattern, p.header.anchor_part, off, spec.q) orelse return error.InvalidAtomExpansion;
+            for (expanded.grams[0..expanded.len]) |g| {
+                try b.addGram(g);
+                gate[g & 0xffff] |= gate_bit;
+            }
+            continue;
+        }
+        const w = windowOf(p, spec);
         for (0..spec.stride) |k| {
             const g = w.window[k..][0..spec.q];
             if (!w.nocase) {

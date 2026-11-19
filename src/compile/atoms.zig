@@ -97,6 +97,8 @@ pub const Choice = struct {
     cost: f64 = tier_d_cost,
     /// Longest fixed literal run seen, for the tier histogram.
     longest: u16 = 0,
+    /// A contiguous window across short literal/mask/alternation ops, relative to the part.
+    expansion: ?u16 = null,
 };
 
 /// Every literal op whose distance from its part's start is fixed, in op order.
@@ -248,6 +250,10 @@ fn isBanned(banned: ?*const Banned, bytes: []const u8, nocase: bool) bool {
 /// The table key of a choice (null without an atom).
 pub fn choiceKey(c: Choice, p: ir.Pattern) ?u64 {
     if (c.q == 0 or c.anchor.op == prog.no_anchor) return null;
+    if (c.expansion) |off| {
+        const variants = expandWindow(p, c.anchor.part, off, c.q) orelse return null;
+        return @as(u64, c.q) << 32 | variants.grams[0];
+    }
     const o = p.ops[c.anchor.op];
     return keyId(p.bytes(o)[c.atom_off..][0..c.q], o.flags & ir.op_nocase != 0);
 }
@@ -260,6 +266,15 @@ pub fn deferredKey(a: prog_build.Anchor, p: ir.Pattern) ?u64 {
     const bytes = p.bytes(o);
     if (bytes.len < 2) return null;
     return keyId(bytes[0..@min(bytes.len, 4)], o.flags & ir.op_nocase != 0);
+}
+
+fn choiceBanned(c: Choice, p: ir.Pattern, banned: *const Banned, key: u64) bool {
+    if (c.expansion) |off| {
+        const expanded = expandWindow(p, c.anchor.part, off, c.q) orelse return true;
+        for (expanded.grams[0..expanded.len]) |g| if (banned.contains(@as(u64, c.q) << 32 | g)) return true;
+        return false;
+    }
+    return banned.contains(key);
 }
 
 /// `choose`, skipping windows whose key is in `banned`.
@@ -350,6 +365,9 @@ pub fn chooseAvoiding(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: 
             };
         }
     }
+    // Only short-literal programs need the extra compile-time search. Every expansion is
+    // bounded to sixteen distinct grams; the verifier still checks the original program.
+    if (best.longest < 4) best = chooseExpanded(model, costs, p, part0_only, banned, best);
     return best;
 }
 
@@ -381,7 +399,7 @@ pub const Planned = struct {
     pub fn atom(p: Planned, kind: ir.OffsetKind) prog_build.Atom {
         const c = p.choice;
         if (kind != .any or p.deferred or c.q == 0) return .{ .anchor = c.anchor };
-        return .{ .anchor = c.anchor, .spec = .{ .off = c.atom_off, .q = c.q, .stride = c.stride } };
+        return .{ .anchor = c.anchor, .spec = .{ .off = c.atom_off, .q = c.q, .stride = c.stride, .expansion = c.expansion } };
     }
 };
 
@@ -391,7 +409,7 @@ pub fn chooseFor(model: gm.Model, costs: Costs, in: prog_build.Input, crowd: ?*c
     const best = choose(model, costs, in.pattern, false);
     const cr = crowd orelse return best;
     const key = choiceKey(best, in.pattern) orelse return best;
-    if (!cr.banned.contains(key)) return best;
+    if (!choiceBanned(best, in.pattern, &cr.banned, key)) return best;
     // The cheapest window's key is crowded: the next cheapest whose key is not, unless it costs
     // more than `crowd_slack` beyond it (moving a family onto a common gram would cost every
     // benign file far more than the crowded key costs crafted ones).
@@ -557,6 +575,11 @@ pub const Crowd = struct {
     /// Record the key of one planned program.
     pub fn notePlanned(cr: *Crowd, in: prog_build.Input, o: Planned) !void {
         if (in.offset.kind != .any) return;
+        if (!o.deferred) if (o.choice.expansion) |off| {
+            const expanded = expandWindow(in.pattern, o.choice.anchor.part, off, o.choice.q) orelse return;
+            for (expanded.grams[0..expanded.len]) |g| try cr.note(@as(u64, o.choice.q) << 32 | g);
+            return;
+        };
         const key = (if (o.deferred) deferredKey(o.choice.anchor, in.pattern) else choiceKey(o.choice, in.pattern)) orelse return;
         try cr.note(key);
     }
@@ -629,6 +652,182 @@ pub const Logical = struct {
     first: u32,
     count: u32,
 };
+
+/// Compiler-only, exact variants of at most four contiguous bytes. No truncation is allowed:
+/// a seventeenth distinct gram rejects this window, leaving the ordinary literal fallback.
+pub const Expansion = struct {
+    grams: [16]u32 = @splat(0),
+    len: u8 = 1,
+
+    fn insert(e: *Expansion, gram: u32) bool {
+        for (e.grams[0..e.len]) |g| if (g == gram) return true;
+        if (e.len == e.grams.len) return false;
+        e.grams[e.len] = gram;
+        e.len += 1;
+        return true;
+    }
+
+    fn byte(e: *Expansion, value: u8, mask: u8, nocase: bool, shift: u5) bool {
+        if (mask == 0xff and (!nocase or !std.ascii.isAlphabetic(value))) {
+            for (e.grams[0..e.len]) |*g| g.* |= @as(u32, value) << shift;
+            return true;
+        }
+        var out: Expansion = .{ .len = 0 };
+        for (0..256) |n| {
+            const b: u8 = @intCast(n);
+            const matches = if (nocase and mask == 0xff)
+                std.ascii.toLower(b) == std.ascii.toLower(value)
+            else
+                b & mask == value & mask;
+            if (!matches) continue;
+            for (e.grams[0..e.len]) |g| if (!out.insert(g | @as(u32, b) << shift)) return false;
+        }
+        e.* = out;
+        return true;
+    }
+};
+
+fn fixedWidth(ops: []const ir.Op, i: usize) ?u32 {
+    const o = ops[i];
+    return switch (o.code) {
+        .lit, .masked => o.len,
+        .gapf => o.a,
+        .alt, .nalt => if (o.b & 0xffff == o.b >> 16) o.b & 0xffff else null,
+        .bound => ir.boundWidth(ops, i),
+        else => null,
+    };
+}
+
+/// Append only the overlapping portion of ops to a window. Keeping an alternative's whole
+/// branch together preserves correlations between its bytes instead of multiplying them.
+fn expandRange(p: ir.Pattern, ops: []const ir.Op, top_start: ?usize, start: u32, end: u32, shift_start: u32, inherited_nocase: bool, depth: u8, out: *Expansion) bool {
+    if (depth > 8) return false;
+    var delta: u32 = 0;
+    for (ops, 0..) |o, i| {
+        // A boundary at the start of a later part is still in the middle of the whole
+        // pattern and consumes a byte. Never infer its position from a sliced part.
+        const width = if (o.code == .bound)
+            ir.boundWidth(p.ops, (top_start orelse return false) + i)
+        else
+            fixedWidth(ops, i) orelse return false;
+        const next = delta + width;
+        if (next <= start) {
+            delta = next;
+            continue;
+        }
+        const lo = @max(start, delta);
+        const hi = @min(end, next);
+        const nocase = inherited_nocase or o.flags & ir.op_nocase != 0;
+        if (lo < hi) switch (o.code) {
+            .lit, .masked => {
+                if (o.flags & ir.op_negate != 0) return false;
+                for (lo..hi) |at| {
+                    const k = at - delta;
+                    const mask: u8 = if (o.code == .lit) 0xff else p.masks(o)[k];
+                    if (!out.byte(p.bytes(o)[k], mask, nocase, @intCast((shift_start + at - start) * 8))) return false;
+                }
+            },
+            .alt => {
+                var merged: Expansion = .{ .len = 0 };
+                for (p.alternatives(o)) |entry| {
+                    var branch = out.*;
+                    if (!expandRange(p, p.altOps(entry), null, lo - delta, hi - delta, shift_start + lo - start, nocase, depth + 1, &branch)) return false;
+                    for (branch.grams[0..branch.len]) |g| if (!merged.insert(g)) return false;
+                }
+                out.* = merged;
+            },
+            // A whole-byte wildcard already has 256 variants, outside this path's bound.
+            else => return false,
+        };
+        delta = next;
+        if (delta >= end) return true;
+    }
+    return delta >= end;
+}
+
+/// Reconstruct a chosen window in its fixed-length prefix of one part. This is also used by
+/// the prefilter builder, so selection and insertion cannot disagree about the variants.
+pub fn expandWindow(p: ir.Pattern, part: u8, off: u16, q_len: u8) ?Expansion {
+    if (q_len < 2 or q_len > 4) return null;
+    var first: usize = 0;
+    var part_index: usize = 0;
+    while (first < p.ops.len and part_index < part) : (first += 1) {
+        if (p.ops[first].code == .part_end) part_index += 1;
+    }
+    if (part_index != part) return null;
+    var out: Expansion = .{};
+    if (!expandRange(p, p.ops[first..], first, off, @as(u32, off) + q_len, 0, false, 0, &out)) return null;
+    return out;
+}
+
+fn fixedPrefixLen(p: ir.Pattern, part: u8) u32 {
+    var part_index: usize = 0;
+    var len: u32 = 0;
+    for (p.ops, 0..) |o, i| {
+        if (o.code == .part_end) {
+            if (part_index == part) return len;
+            part_index += 1;
+            continue;
+        }
+        if (part_index != part) continue;
+        len += fixedWidth(p.ops, i) orelse return len;
+        if (len >= 515) return 515;
+    }
+    return len;
+}
+
+fn chooseExpanded(model: gm.Model, costs: Costs, p: ir.Pattern, part0_only: bool, banned: ?*const Banned, initial: Choice) Choice {
+    var best = initial;
+    var literals: Literals = .{ .pattern = p, .part0_only = part0_only };
+    var last_part: ?u8 = null;
+    while (literals.next()) |lit| {
+        if (last_part == lit.part) continue;
+        last_part = lit.part;
+        // Selection work is bounded just like the 512-gram literal cost cache. Long bodies
+        // retain their ordinary atom; short-literal parts gain windows across their ops.
+        const prefix = fixedPrefixLen(p, lit.part);
+        for (0..@min(prefix -| 1, 512)) |off| {
+            for ([_]u8{ 4, 3, 2 }) |q_len| {
+                const expanded = expandWindow(p, lit.part, @intCast(off), q_len) orelse continue;
+                var probability: f64 = 0;
+                var gate_probability: f64 = 0;
+                var blocked = false;
+                for (expanded.grams[0..expanded.len], 0..) |g, vi| {
+                    if (banned) |b| if (b.contains(@as(u64, q_len) << 32 | g)) {
+                        blocked = true;
+                        break;
+                    };
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &bytes, g, .little);
+                    probability += switch (q_len) {
+                        4 => model.prob(g),
+                        3 => model.prob3(bytes[0..3]),
+                        else => model.prob2(bytes[0..2]),
+                    };
+                    var seen = false;
+                    for (expanded.grams[0..vi]) |prev| seen = seen or prev & 0xffff == g & 0xffff;
+                    if (!seen) gate_probability += model.prob2(bytes[0..2]);
+                }
+                if (blocked) continue;
+                const penalty = switch (q_len) {
+                    4 => costs.stride_penalty[0],
+                    3 => costs.q3_penalty,
+                    else => costs.q2_penalty,
+                };
+                const cost = penalty + (costs.probe_ns + costs.verify_ns) * probability + costs.gate_ns * gate_probability;
+                if (cost < best.cost) best = .{
+                    .stride = 1,
+                    .anchor = .{ .part = lit.part, .op = lit.op, .delta = lit.delta },
+                    .q = q_len,
+                    .cost = cost,
+                    .longest = initial.longest,
+                    .expansion = @intCast(off),
+                };
+            }
+        }
+    }
+    return best;
+}
 
 /// Tier counts for the coverage report and E3.
 pub const Histogram = struct {
@@ -757,6 +956,68 @@ test "case variants" {
     }
     try testing.expectEqual(@as(usize, 8), n);
     try testing.expect(seen_upper);
+}
+
+test "short windows expand masks and correlated alternatives within sixteen grams" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mask = try parse(a, "31a?81ed");
+    const expanded = expandWindow(mask, 0, 0, 4).?;
+    try testing.expectEqual(@as(u8, 16), expanded.len);
+    for (0..16) |n| {
+        const bytes = [4]u8{ 0x31, @as(u8, @intCast(0xa0 + n)), 0x81, 0xed };
+        try testing.expect(std.mem.indexOfScalar(u32, expanded.grams[0..expanded.len], std.mem.readInt(u32, &bytes, .little)) != null);
+    }
+    try testing.expect(expandWindow(try parse(a, "31??81ed"), 0, 0, 4) == null);
+    try testing.expect(expandWindow(try parse(a, "31a?8?ed"), 0, 0, 4) == null);
+    const alt = try parse(a, "31(28|29|1a|2b|2e|2f)81ed");
+    try testing.expectEqual(@as(u8, 6), expandWindow(alt, 0, 0, 4).?.len);
+    try testing.expectEqual(@as(u8, 1), expandWindow(try parse(a, "31(28|28|28)81ed"), 0, 0, 4).?.len);
+    try testing.expect(expandWindow(try parse(a, "31(00|01|02|03|04|05|06|07|08|09|0a|0b|0c|0d|0e|0f|10)81ed"), 0, 0, 4) == null);
+    const correlated = try parse(a, "31(2829|1a2b|2e2f)ed");
+    try testing.expectEqual(@as(u8, 3), expandWindow(correlated, 0, 0, 4).?.len);
+    const chosen = choose(gm.Model.default(), .{}, alt, false);
+    try testing.expect(chosen.q >= 3);
+    try testing.expect(chosen.expansion != null);
+    try testing.expect(choose(gm.Model.default(), .{}, mask, false).expansion != null);
+    // A variable-width branch cannot give later bytes a fixed distance from the part start.
+    const variable = try parse(a, "31(28|2929)81ed");
+    try testing.expect(expandWindow(variable, 0, 0, 4) == null);
+    // A whole-byte wildcard cannot be silently omitted from an ordinary contiguous gram.
+    try testing.expect(expandWindow(try parse(a, "e8??000000"), 0, 0, 4) == null);
+    for ([_][]const u8{ "4142*(B)31a?81ed", "4142*(L)31a?81ed", "4142*(W)31a?81ed" }) |body| {
+        const boundary = try parse(a, body);
+        try testing.expect(expandWindow(boundary, 1, 0, 4) == null);
+        try testing.expectEqual(@as(u8, 16), expandWindow(boundary, 1, 1, 4).?.len);
+    }
+    // Case variants participate in the same bound, including case flags on an alternative.
+    const raw = try parse(a, "41(42|43)44ed");
+    const ops = try a.dupe(ir.Op, raw.ops);
+    for (ops) |*o| o.flags |= ir.op_nocase;
+    const folded: ir.Pattern = .{ .ops = ops, .data = raw.data };
+    try testing.expectEqual(@as(u8, 16), expandWindow(folded, 0, 0, 4).?.len);
+}
+
+test "crowd records and avoids every expanded atom key" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const p = try parse(arena.allocator(), "31(28|29|1a|2b|2e|2f)81ed");
+    const costs: Costs = .{ .q3_penalty = 100, .q2_penalty = 100, .gate_ns = 0 };
+    const choice = choose(gm.Model.default(), costs, p, false);
+    try testing.expectEqual(@as(u8, 4), choice.q);
+    const expanded = expandWindow(p, choice.anchor.part, choice.expansion.?, choice.q).?;
+    var crowd = Crowd.init(testing.allocator, 1);
+    defer crowd.deinit();
+    try crowd.notePlanned(.{ .pattern = p, .sig = 0 }, .{ .choice = choice });
+    for (expanded.grams[0..expanded.len]) |g| try testing.expect(crowd.banned.contains(@as(u64, choice.q) << 32 | g));
+    // A later variant alone being crowded must reject the window too.
+    crowd.banned.clearRetainingCapacity();
+    const last = expanded.grams[expanded.len - 1];
+    try crowd.banned.put(testing.allocator, @as(u64, choice.q) << 32 | last, {});
+    try testing.expect(choiceBanned(choice, p, &crowd.banned, choiceKey(choice, p).?));
+    const free = chooseAvoiding(gm.Model.default(), costs, p, false, &crowd.banned);
+    try testing.expect(free.expansion == null or free.q != 4);
 }
 
 test "covers defer subsigs a cheaper partner implies" {

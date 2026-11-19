@@ -18,12 +18,19 @@ pub const Input = struct {
 
 pub const Atom = struct { anchor: Anchor, spec: AtomSpec = .{} };
 
-/// A program's prefilter atom: `stride + q - 1` bytes of its anchor literal from `off`, whose
-/// `q`-byte grams the filter of that stride and gram length holds (strides 1, 4 and 8 with
-/// 4-byte grams, stride 1 with 3- or 2-byte grams). `q` 0: none (pinned to an offset,
-/// deferred, or no literal of two bytes). Kept beside SUBSIG_PROG, not in it: only the
-/// compiler's prefilter builder reads it.
-pub const AtomSpec = packed struct(u32) { off: u16 = 0, stride: u8 = 0, q: u8 = 0 };
+/// A program's prefilter atom: `stride + q - 1` bytes of its anchor literal from `off`, or a
+/// bounded expanded window at `expansion`. The filter holds the window's `q`-byte grams:
+/// strides 1, 2, 3, 4 and 8 with 4-byte grams, stride 1 with 3- or 2-byte grams. Expanded
+/// windows use stride 1. `q` 0 means none (pinned, deferred, or no useful short window).
+/// Kept beside SUBSIG_PROG, not in it: only the compiler's prefilter builder reads it.
+pub const AtomSpec = struct {
+    off: u16 = 0,
+    stride: u8 = 0,
+    q: u8 = 0,
+    /// A bounded expanded window's offset from the anchor part's start. These variants are
+    /// reconstructed by the compiler, and use ordinary contiguous grams on disk.
+    expansion: ?u16 = null,
+};
 
 pub const Anchor = struct { part: u8 = 0, op: u16 = prog.no_anchor, delta: u16 = prog.no_anchor };
 

@@ -671,6 +671,9 @@ test "every planted atom is found: tiers A to D, nocase, wide, the end of the da
         "ff25a4{3}0000000000000000", // a 3-byte atom beats zeros
         "8185??f?ffff{4}81ad", // only 2-byte literals
         "6576616c28756e65736361706528", // text, stride 8
+        // Public main/daily body patterns promoted to four-byte atoms by bounded expansion.
+        "81c5????????31(28|29|1a|2b|2e|2f)81ed{-20}3b(c5|cd|d5|dd|f5|fd)0f82??ffffff",
+        "8d??????5?6a015?ffd?83??????0175??5?ff15",
     };
     var f = try fixture(&hexes);
     defer f.deinit();
@@ -715,8 +718,45 @@ test "the kernel and the scalar reference return the same candidates" {
     for (sets) |set| try kernelMatchesReference(set);
 }
 
+test "bounded short-atom variants preserve every masked and alternative match" {
+    const vm = @import("verify_vm.zig");
+    // Public ClamAV pattern syntax. Force four-byte selection so every variant's filter,
+    // table entry, part-relative back offset and VM confirmation are exercised together.
+    var f = try fixtureCosts(&.{ "31a?81ed", "31(28|29|1a|2b|2e|2f)81ed", "4142*31a?81ed", "4142*e8??31a?81ed", "4142*(B)31a?81ed", "4142*(L)31a?81ed", "4142*(W)31a?81ed" }, .{ .q3_penalty = 100, .q2_penalty = 100, .gate_ns = 0 });
+    defer f.deinit();
+    var ring: [ring_len]Candidate = undefined;
+    var c: Collect = .{ .gpa = testing.allocator };
+    defer c.got.deinit(testing.allocator);
+    // All possible byte values, odd alignments and an atom ending exactly at the buffer end.
+    for (0..256) |n| for ([_]usize{ 17, 18, 63, 125 }) |at| for ([_]u8{ ' ', '\n' }) |boundary| {
+        var data: [129]u8 = @splat(0x55);
+        @memcpy(data[0..2], "AB");
+        data[at - 2] = 0xe8;
+        data[at - 1] = boundary;
+        @memcpy(data[at..][0..4], &[_]u8{ 0x31, @intCast(n), 0x81, 0xed });
+        c.got.clearRetainingCapacity();
+        _ = scan(&f.part, &data, &ring, &c, null);
+        for (0..f.programs.count()) |pi| {
+            const program = f.programs.get(pi);
+            var reference_budget: vm.Budget = .{};
+            var reference = vm.Scanner.init(program, &data, .{ .size = data.len }, &reference_budget);
+            const expected = try reference.next();
+            var filtered: ?vm.Match = null;
+            var filtered_budget: vm.Budget = .{};
+            for (c.got.items) |candidate| {
+                if (candidate[0] != pi) continue;
+                if (try vm.verify(program, &data, vm.startWindow(program.offset(), .{ .size = data.len }).?, candidate[1], &filtered_budget)) |match| {
+                    filtered = match;
+                    break;
+                }
+            }
+            try testing.expectEqualDeep(expected, filtered);
+        }
+    };
+}
+
 fn kernelMatchesReference(sampled: []const u8) !void {
-    const hexes = [_][]const u8{ "13a7c95be2f1408d77e3b1aa", "5be2f1408d77e3", "c95be2f1", "ff25a4{3}0000000000000000", "8185??f?ffff{4}81ad", "4142434445464748494a4b", "000000ff", "73a7c95be2" };
+    const hexes = [_][]const u8{ "13a7c95be2f1408d77e3b1aa", "5be2f1408d77e3", "c95be2f1", "ff25a4{3}0000000000000000", "8185??f?ffff{4}81ad", "4142434445464748494a4b", "000000ff", "73a7c95be2", "31a?81ed", "31(28|29|1a|2b|2e|2f)81ed" };
     var f = try fixtureCosts(&hexes, .{ .sampled = sampled });
     defer f.deinit();
     var prng = std.Random.DefaultPrng.init(11);

@@ -107,3 +107,65 @@ rare 3-byte opcode gets the 3-byte atom.
 - "Type-0 duplication costs a few MB" [E] (P4.04): avoided. One atom table is shared by every
   partition (entries carry their target); each partition only repeats type 0's filters, about
   0.4 MB per partition, 4.7 MB in all.
+
+## Bounded short-window expansion follow-up (2026-11-18)
+
+Partial implementation of zig-utils/zig-anti-virus#107: short-literal programs can select a
+contiguous 2-, 3- or 4-byte window across fixed-width masks and alternatives. At most 16
+distinct variants are emitted into the existing filters and atom table. Alternatives retain
+the correlation between their bytes; exceeding the bound rejects the entire window, and
+variable-width alternatives do not provide a fixed position for later windows. The original
+verify program remains the authority. Boundary widths use whole-pattern positions, including
+the consumed byte at the start of a later part. Selection considers at most 512 starting
+positions per part, and programs with a literal of four bytes or more keep their existing
+selection path.
+This adds no filter kind, disk layout change, or runtime allocation.
+
+Recompiled main 63 and daily 28187, including built-ins, with Zig
+0.17.0-dev.1857 in `fast` mode on an Apple M3 Pro with 18 GiB RAM: 1,628,441 programs.
+Compared the existing local database with
+the rebuilt database using `prefilter scan <db> B1 --rounds 1`, on all 8,398 B1 files
+(355.9 MB):
+
+| Counter per MB | Before | Expanded windows |
+|---|---:|---:|
+| All candidates | 1,460.2 | 1,450.6 |
+| Sampled stride-3 candidates | 1,212.4 | 1,208.2 |
+| Stride-one 4-byte candidates | 69.5 | 69.7 |
+| Stride-one 3-byte candidates | 35.7 | 35.7 |
+| Stride-one 2-byte candidates | 142.6 | 137.1 |
+| All verifies | 212.9 | 212.6 |
+
+Combined stride-one candidates fall from 247.8 to 242.5 per MB. Both scans report the same
+11 PUA detections and seven PCRE step limits. The rebuild also includes the optional-alternative
+preservation fix from #110, so the full-table differences above do not isolate expansion
+alone; in particular the sampled filter also changes slightly. Single-pass times are not
+evidence of a throughput improvement.
+
+The rebuilt histogram has 5,343 tier-D programs: 2,316 (43.3%) still searched through 3- or
+2-byte atoms, two through expanded 4-byte atoms, 606 deferred and 2,419 anchored. **The under-10%
+acceptance criterion remains unmet.** Sparse grams across whole-byte wildcards, including the
+`e8??000000` family, remain outstanding. Enumerating these as contiguous grams would require
+256 variants and is explicitly refused by this bounded path.
+
+The shared table gains 20 entries and 320 bytes; the whole PREFILTER section grows from
+26,536,768 to 26,537,088 bytes. Compiler-only `AtomSpec` grows from four to eight bytes, adding
+6,513,764 bytes for this program count. A direct optimized compile measured with
+`/usr/bin/time -l` took 10.21 seconds, with 555,974,656 bytes maximum RSS and 412,795,792 bytes
+peak memory footprint. This is one measurement of the updated compiler, not a before/after
+memory comparison.
+
+Correctness checks: all 256 values of a masked/alternative byte are planted at four offsets,
+including odd alignments and the end of the buffer, then compared with the scalar VM scanner.
+Both full public main/daily body patterns promoted to four-byte atoms are also planted at
+40 offsets each, including the end of the buffer.
+The tests also exercise later anchor parts, leading `(B)`/`(L)`/`(W)` boundaries, nonzero
+atom-back offsets, the 16-variant bound, duplicate alternatives, correlated alternative bytes,
+case variants and crowd tracking of every expanded key. The native kernels agree with the
+scalar stage-one reference on B1,
+B2 and S1 plus random buffers: 11,162 files, 1,473.7 MB, 3,021,243 candidates, both runnable
+aarch64 variants.
+An additional 32 real logical signatures (31 with deferred subsigs) have zero verdict
+mismatches: 23 detected by both paths and nine where the reference exhausted logical state
+while the filtered path detected the signature. This smaller sample supplements the exhaustive
+expanded-window tests; it does not repeat the historical 1,988-rule deferral experiment above.
