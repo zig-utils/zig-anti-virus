@@ -411,8 +411,22 @@ Database pages are clean and reclaimable, so RSS and PSS are reported but never 
 - `IDSESSION`/`END`, with request-number prefixed replies
 
 **Concurrency:**
-- One event loop per listener group: epoll or io_uring on Linux, kqueue on macOS.
+- `rt.ioloop.Loop` multiplexes Unix and TCP listeners using epoll on Linux and
+  kqueue on macOS. The caller drives the loop on its existing thread.
+- Each slot has a 64 KiB buffer in a pre-reserved region. Idle connections do
+  not touch those pages. The loop frames commands and submits complete requests
+  to the worker pool. When the injector is full, the loop pauses socket reads
+  and waits for the pool to signal that space is available.
+- Idle and command deadlines use a monotonic clock. Shutdown closes listeners
+  and idle sockets, then drains accepted jobs and writes their replies.
 - INSTREAM is scanned incrementally as chunks arrive, so p99 after the last byte covers only finalize and container work.
+
+**Event-loop verification:** `zig build test -Dtest-filter='event loop'`
+exercises fragmented and pipelined echo over TCP and Unix, idle and command
+timeouts, injector backpressure, and shutdown with a worker still running.
+The 10,000-idle-socket run grew process RSS by about 1.3 MiB on Linux arm64 and
+macOS arm64. Both runs held two threads throughout, the caller and one worker.
+The large test needs a soft open-file limit of at least 20,100.
 
 ### 9.2 Native protocol `zavp/1`
 

@@ -15,6 +15,15 @@ pub const Job = struct {
 
 pub const Submit = enum { accepted, full, closed };
 
+/// A producer can subscribe to the full-to-writable transition. The callback
+/// runs with the injector locked and must only signal its producer. Keep the
+/// waiter at a stable address until it is removed with unwatchSpace.
+pub const SpaceWaiter = struct {
+    context: *anyopaque,
+    wake: *const fn (*anyopaque) void,
+    next: ?*SpaceWaiter = null,
+};
+
 pub const Options = struct {
     workers: ?usize = null,
     pin: bool = false,
@@ -108,6 +117,7 @@ pub const Pool = struct {
     injector: []*Job,
     head: usize = 0,
     queued: usize = 0,
+    space_waiters: ?*SpaceWaiter = null,
 
     pub fn init(gpa: Allocator, io: Io, options: Options) !*Pool {
         if (options.pin and builtin.os.tag != .linux) return error.CpuPinningUnavailable;
@@ -166,8 +176,41 @@ pub const Pool = struct {
         if (pool.queued == 0) return null;
         const job = pool.injector[pool.head];
         pool.head = (pool.head + 1) % pool.injector.len;
+        const was_full = pool.queued == pool.injector.len;
         pool.queued -= 1;
+        if (was_full) pool.notifySpace();
         return job;
+    }
+
+    pub fn watchSpace(pool: *Pool, waiter: *SpaceWaiter) void {
+        pool.lock.lockUncancelable(pool.io);
+        defer pool.lock.unlock(pool.io);
+        waiter.next = pool.space_waiters;
+        pool.space_waiters = waiter;
+    }
+
+    pub fn unwatchSpace(pool: *Pool, waiter: *SpaceWaiter) void {
+        pool.lock.lockUncancelable(pool.io);
+        defer pool.lock.unlock(pool.io);
+        var link = &pool.space_waiters;
+        while (link.*) |entry| : (link = &entry.next) {
+            if (entry != waiter) continue;
+            link.* = entry.next;
+            entry.next = null;
+            return;
+        }
+        unreachable;
+    }
+
+    pub fn injectorFull(pool: *Pool) bool {
+        pool.lock.lockUncancelable(pool.io);
+        defer pool.lock.unlock(pool.io);
+        return pool.queued == pool.injector.len and !pool.closing.load(.monotonic);
+    }
+
+    fn notifySpace(pool: *Pool) void {
+        var waiter = pool.space_waiters;
+        while (waiter) |entry| : (waiter = entry.next) entry.wake(entry.context);
     }
 
     fn wake(pool: *Pool, count: u32) void {
@@ -184,6 +227,7 @@ pub const Pool = struct {
     pub fn drain(pool: *Pool) void {
         pool.lock.lockUncancelable(pool.io);
         pool.closing.store(true, .release);
+        pool.notifySpace();
         pool.lock.unlock(pool.io);
         pool.wakeAll();
         for (pool.workers) |*worker| {
