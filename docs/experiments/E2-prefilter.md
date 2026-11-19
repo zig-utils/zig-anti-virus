@@ -126,6 +126,22 @@ To reproduce, use `zig build prefilter -Doptimize=ReleaseFast -- stages <db> <co
 both stages for every runnable variant. `zig build bench -- <results.json>` now keeps
 all variant names in its JSON artifact; previously only console output kept those rows.
 
+## PE partition after short-atom expansion
+
+The Apple M3 Pro scanned the full B1 and B2 corpora with the PE partition forced
+(8,410 files, 722.3 MB). The database used ClamAV main 63 and daily 28187. This
+run used ReleaseFast with Zig `0.17.0-dev.1857+3c46da14d` and the best of five
+rounds. The benchmark ran alongside other work on the same machine.
+
+| ARM kernel | Stage one MB/s | Stages one and two MB/s | Candidates per MB |
+|---|---:|---:|---:|
+| aarch64_crypto | 1,142.1 | 683.3 | 6,837.4 |
+| aarch64_baseline | 1,179.0 | 854.5 | 6,837.4 |
+
+Both kernels recorded 18,565.9 probes and 509 verifies per MB. The stride-one
+gate passed 0.83% of positions. Both runs fell short of the 1 GB/s target for
+the two stages together. Real-corpus x86_64 and clamd measurements remain open.
+
 ## Against the other designs
 
 The alternatives were measured in zig-regex (docs/BENCHMARKS.md, binary literal sets of 100k
