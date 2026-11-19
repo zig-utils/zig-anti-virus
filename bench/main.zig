@@ -18,6 +18,19 @@ fn hashLookup() void {
     if (lookup_table.lookup(1000 + (lookup_i % 4096), d)) |sig| sink +%= sig;
 }
 
+var worker_deque: zav.rt.deque.Deque(u8, 128) = .{};
+var deque_job: u8 = 0;
+
+const deque_benchmark_name = "runtime deque, 128 uncontended push/pop pairs";
+
+/// Time a batch so the clock resolution does not dominate individual operations.
+fn dequePushPop() void {
+    for (0..128) |_| {
+        if (!worker_deque.push(&deque_job)) unreachable;
+        std.mem.doNotOptimizeAway(worker_deque.pop() orelse unreachable);
+    }
+}
+
 var anchored_index: zav.match.anchored.Index = undefined;
 var anchored_programs: zav.match.prog.Programs = undefined;
 var anchored_file: [4096]u8 = undefined;
@@ -135,6 +148,13 @@ pub fn main(init: std.process.Init) !void {
     // `zig build bench -- <out.json> e7 [filter]`: only the decoder experiment
     // (docs/experiments/E7), optionally only the corpus files whose name contains `filter`.
     if (args.len > 2 and std.mem.eql(u8, args[2], "e7")) return decoderBenchmarks(init.io, init.gpa, if (args.len > 3) args[3] else "");
+    if (args.len > 2 and std.mem.eql(u8, args[2], "deque")) {
+        var suite = bench.BenchmarkSuite.init(init.gpa, init.io);
+        defer suite.deinit();
+        try suite.add(deque_benchmark_name, dequePushPop);
+        suite.setBaseline(out_path);
+        return suite.run();
+    }
     try std.Io.Dir.cwd().createDirPath(init.io, "zig-out/bench-data");
     dir_global = try std.Io.Dir.cwd().openDir(init.io, "zig-out/bench-data", .{});
     defer dir_global.close(init.io);
@@ -175,6 +195,7 @@ pub fn main(init: std.process.Init) !void {
     var suite = bench.BenchmarkSuite.init(init.gpa, init.io);
     defer suite.deinit();
     try suite.add("db open 200 MB (warm cache)", dbOpen);
+    try suite.add(deque_benchmark_name, dequePushPop);
 
     hash_input = try init.gpa.alloc(u8, hash_input_len);
     defer init.gpa.free(hash_input);

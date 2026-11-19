@@ -307,6 +307,12 @@ miss -> read first 4 KiB -> file-type trie
 
 **Workers:** one per physical core. Each owns a scratch reservation, a Chase-Lev deque, and padded epoch and stats slots.
 
+`zig build bench -Doptimize=ReleaseFast -- zig-out/deque.json deque` measures
+128 uncontended push and last-item pop pairs per sample. On Apple M3 Pro,
+the mean was 693 ns per batch, or 2.7 ns per operation including benchmark
+loop overhead. A single deque handled 10 million jobs exactly once with
+one owner and ten thieves in a separate ReleaseSafe run on that machine.
+
 **Injector and backpressure:**
 - A bounded MPMC injector holds 4N jobs. When it is full, the event loop stops reading sockets.
 - Directory walkers split subdirectories into new jobs only while their deque is short.
