@@ -1,0 +1,5 @@
+SYNTHETIC INERT TOKENS - never execute
+/tmp/.mountfs
+xmrig
+wget
+chmod +x

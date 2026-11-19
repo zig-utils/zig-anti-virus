@@ -97,6 +97,14 @@ pub fn main(init: std.process.Init) !void {
             try yaraRule(random);
             cases += 1;
         }
+        if (selected(only, "guardianPack")) {
+            try guardianPack(gpa.allocator(), random);
+            cases += 1;
+        }
+        if (selected(only, "guardianMetadata")) {
+            try guardianMetadata(gpa.allocator(), random);
+            cases += 1;
+        }
         if (selected(only, "yaraCond")) {
             yaraCond(random);
             cases += 1;
@@ -1317,3 +1325,39 @@ const Formats = struct {
         }
     }
 };
+
+/// Mutate authenticated records too, so signature rejection cannot hide parser defects.
+fn guardianPack(gpa: std.mem.Allocator, random: std.Random) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x34));
+    const seed = try zav.compile.guardian.bundle.encode(a, .{ .version = 1, .entries = &.{
+        .{ .path = "php/meta.toml", .bytes = zav.compile.guardian.metadata.fixture },
+        .{ .path = "php/probe.yar", .bytes = "rule Probe { strings: $a = \"probe\" condition: $a }" },
+    } }, kp);
+    var buf: [4096]u8 = undefined;
+    @memcpy(buf[0..seed.len], seed);
+    const bytes = mutate(random, &buf, seed.len, "/.[]0123456789");
+    if (bytes.len >= 104 and random.boolean()) {
+        const sig = try kp.sign(bytes[0 .. bytes.len - 64], null);
+        @memcpy(bytes[bytes.len - 64 ..], &sig.toBytes());
+    }
+    _ = zav.compile.guardian.bundle.decode(a, bytes, &.{.{ .public_key = kp.public_key.toBytes() }}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+}
+
+fn guardianMetadata(gpa: std.mem.Allocator, random: std.Random) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var buf: [4096]u8 = undefined;
+    const seed = zav.compile.guardian.metadata.fixture;
+    @memcpy(buf[0..seed.len], seed);
+    const text = mutate(random, &buf, seed.len, "[]'\"=,#\n");
+    _ = zav.compile.guardian.metadata.parse(arena.allocator(), text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+}

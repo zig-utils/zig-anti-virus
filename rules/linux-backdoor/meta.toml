@@ -1,0 +1,5 @@
+category = "linux-backdoor"
+severity = "high"
+references = ["https://www.microsoft.com/en-us/security/blog/2022/05/19/rise-in-xorddos-a-deeper-look-at-the-stealthy-ddos-malware-targeting-linux-devices/"]
+false_positive_notes = "Incident response indicators and synthetic test data may contain all three paths."
+owner = "Guardian maintainers"

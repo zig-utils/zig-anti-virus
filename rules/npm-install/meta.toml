@@ -1,0 +1,5 @@
+category = "npm-install"
+severity = "high"
+references = ["https://github.blog/security/supply-chain-security/our-plan-for-a-more-secure-npm-supply-chain/"]
+false_positive_notes = "Authorized credential diagnostic or package publishing tools may contain the same terms."
+owner = "Guardian maintainers"

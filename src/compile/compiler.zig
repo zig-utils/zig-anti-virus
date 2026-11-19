@@ -29,6 +29,7 @@ const cdb = @import("cdb.zig");
 const container = @import("../match/container.zig");
 const regex_pool = @import("../match/regex_pool.zig");
 const yara = @import("yara.zig");
+const guardian = @import("guardian/root.zig");
 const yara_cond = @import("../match/yara_cond.zig");
 const prog = @import("../match/prog.zig");
 const filters = @import("filters.zig");
@@ -340,6 +341,44 @@ pub const Compiler = struct {
         }
     }
 
+    /// Compile an explicitly selected local authoring pack after full validation. A failed pack
+    /// contributes no rules. Distribution callers use addGuardianBundle to enforce trust first.
+    pub fn addGuardianPack(c: *Compiler, pack: guardian.Pack) !void {
+        const arena = c.arena.allocator();
+        try guardian.validate(arena, pack);
+        var rules: std.ArrayList(yara.Rule) = .empty;
+        defer rules.deinit(c.gpa);
+        var rejected: std.ArrayList(ir.Rejection) = .empty;
+        defer rejected.deinit(c.gpa);
+        for (pack.entries) |entry| {
+            if (!std.mem.endsWith(u8, entry.path, ".yar")) continue;
+            const first = rules.items.len;
+            const text = try arena.dupe(u8, entry.bytes);
+            try yara.parse(c.gpa, arena, entry.path, text, .{ .rules = &rules, .rejected = &rejected });
+            if (rejected.items.len != 0 or rules.items.len == first) return error.InvalidGuardianRule;
+            if (rules.items.len > guardian.max_rules) return error.PackLimit;
+            const family = entry.path[0..std.mem.indexOfScalar(u8, entry.path, '/').?];
+            for (rules.items[first..]) |*rule| {
+                rule.name = try std.fmt.allocPrint(arena, "Guardian.{s}.{s}", .{ family, rule.name });
+                rule.source = .guardian;
+                if (rule.private) return error.InvalidGuardianRule;
+            }
+        }
+        for (rules.items, 0..) |rule, i| {
+            for (rules.items[0..i]) |prior| if (eql(prior.name, rule.name)) return error.DuplicateGuardianRule;
+            for (c.yara_rules.items) |prior| if (eql(prior.name, rule.name)) return error.DuplicateGuardianRule;
+        }
+        try c.yara_rules.appendSlice(c.gpa, rules.items);
+        c.sources.guardian_rules = @max(c.sources.guardian_rules, @as(u32, @intCast(pack.version)));
+        c.signatures_seen = true;
+    }
+
+    /// Verify the signed source bundle against explicit distributor keys before parsing any rule.
+    pub fn addGuardianBundle(c: *Compiler, bytes: []const u8, trusted: []const guardian.bundle.TrustedKey) !void {
+        const pack = try guardian.bundle.decode(c.arena.allocator(), bytes, trusted);
+        try c.addGuardianPack(pack);
+    }
+
     /// Add the signatures every database carries (EICAR).
     pub fn addBuiltin(c: *Compiler) !void {
         for (builtin_rules.rules()) |rule| try c.addHashRule(&rule);
@@ -475,12 +514,12 @@ pub const Compiler = struct {
         defer yara_sigs.deinit(c.gpa);
         for (c.yara_rules.items) |*rule| {
             if (c.skipReason(rule.name, rule.text, 0, 0)) |reason| {
-                try c.coverage.skip(c.gpa, "yara", reason);
+                try c.coverage.skip(c.gpa, if (rule.source == .guardian) rule.name else "yara", reason);
                 continue;
             }
             try kept_yara.append(c.gpa, rule);
-            try yara_sigs.append(c.gpa, try c.names.intern(rule.name, .{}, .yara));
-            try c.coverage.include(c.gpa, "yara", 1);
+            try yara_sigs.append(c.gpa, try c.names.intern(rule.name, .{}, rule.source));
+            try c.coverage.include(c.gpa, if (rule.source == .guardian) rule.name else "yara", 1);
         }
         var kept_magics: std.ArrayList(ir.FtmRule) = .empty;
         defer kept_magics.deinit(c.gpa);
@@ -533,7 +572,7 @@ pub const Compiler = struct {
             }
             const subsigs = try arena.alloc(ir.LogicalSubsig, rule.strings.len);
             for (subsigs) |*sub| sub.* = .{ .hex = .{ .pattern = .{ .ops = &.{}, .data = &.{} } } };
-            const shell: ir.LogicalRule = .{ .name = rule.name, .tdb = .{}, .expr = &.{}, .subsigs = subsigs, .source = .yara };
+            const shell: ir.LogicalRule = .{ .name = rule.name, .tdb = .{}, .expr = &.{}, .subsigs = subsigs, .source = rule.source };
             try c.logicals.add(.{ .rule = &shell, .sig = sig, .prog_first = first, .prog_count = c.programs.count() - first, .yara = true });
             var flags: u8 = 0;
             if (rule.always) flags |= yara_cond.flag_always;

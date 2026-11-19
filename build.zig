@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     zav.addImport("mime", mime);
 
     const zig_cli = b.dependency("cli", .{ .target = target, .optimize = optimize }).module("zig_cli");
+    zav.addImport("zig_cli", zig_cli);
 
     // Executables: the CLI and the daemon.
     var zav_exe: ?*std.Build.Step.Compile = null;
@@ -67,6 +68,7 @@ pub fn build(b: *std.Build) void {
     tree_tests.addImport("xml", xml);
     tree_tests.addImport("regex", regex);
     tree_tests.addImport("mime", mime);
+    tree_tests.addImport("zig_cli", zig_cli);
     const test_filters = b.option([]const []const u8, "test-filter", "Run only module-tree tests whose names contain this") orelse &.{};
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_tests, .filters = test_filters })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = capiModule(b, target, optimize, zav) })).step);
@@ -112,6 +114,22 @@ pub fn build(b: *std.Build) void {
             if (c.err.len > 0) run.expectStdErrMatch(c.err);
             test_step.dependOn(&run.step);
         }
+    }
+
+    // Public Guardian CLI seam: compile the shipped source pack and expose every rule in coverage.
+    if (zav_exe) |exe| {
+        const compile_pack = b.addRunArtifact(exe);
+        compile_pack.addArgs(&.{ "compile", "--no-builtin", "--guardian" });
+        compile_pack.addDirectoryArg(b.path("rules"));
+        compile_pack.addArg("--out");
+        const pack_db = compile_pack.addOutputFileArg("guardian.zavdb");
+        compile_pack.expectExitCode(0);
+        const coverage_pack = b.addRunArtifact(exe);
+        coverage_pack.addArgs(&.{ "coverage", "--allow-unsigned" });
+        coverage_pack.addFileArg(pack_db);
+        coverage_pack.expectExitCode(0);
+        coverage_pack.expectStdOutMatch("zav coverage: 7 included, 0 skipped");
+        test_step.dependOn(&coverage_pack.step);
     }
 
     // The differential suite against libclamav: zav-diff checks zav's verdicts on every case in

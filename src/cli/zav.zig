@@ -62,9 +62,21 @@ fn buildCommands(gpa: std.mem.Allocator) !*Command {
     _ = try compile.addOption(Option.init("allow-unverified", "allow-unverified", "Accept CLD and unsigned containers", .bool));
     _ = try compile.addOption(Option.init("no-builtin", "no-builtin", "Leave out the built-in signatures", .bool));
     _ = try compile.addOption(Option.init("malwarebazaar", "malwarebazaar", "MalwareBazaar CSV export (opt-in feed)", .string).withRepeatable(true));
+    _ = try compile.addOption(Option.init("guardian", "guardian", "Local Guardian source directory (explicit authoring trust)", .string));
+    _ = try compile.addOption(Option.init("guardian-version", "guardian-version", "Local Guardian pack version (default 1)", .string));
+    _ = try compile.addOption(Option.init("guardian-bundle", "guardian-bundle", "Signed Guardian source bundle", .string).withRepeatable(true));
+    _ = try compile.addOption(Option.init("guardian-key", "guardian-key", "Trusted distributor Ed25519 public key (64 hex digits)", .string).withRepeatable(true));
     _ = try compile.addArgument(Argument.init("sources", "CVD/CLD containers and signature files", .string).withVariadic(true).withRequired(false));
     _ = compile.setActionWithCode(compileAction);
     _ = try root.addCommand(compile);
+
+    const pack = try Command.init(gpa, "rule-pack", "Sign a Guardian source directory for distribution");
+    _ = try pack.addOption(Option.init("source", "source", "Guardian source directory", .string));
+    _ = try pack.addOption(Option.init("version", "version", "Positive monotonic pack version", .string));
+    _ = try pack.addOption(Option.init("signing-key", "signing-key", "Private Ed25519 seed file (exactly 32 raw bytes)", .string));
+    _ = try pack.addOption(Option.init("out", "out", "Output signed source bundle", .string));
+    _ = pack.setActionWithCode(rulePackAction);
+    _ = try root.addCommand(pack);
 
     const info = try Command.init(gpa, "info", "Show a database's header, sources and sections");
     _ = try info.addOption(Option.init("allow-unsigned", "allow-unsigned", "Accept an unsigned database", .bool));
@@ -215,6 +227,27 @@ fn compileAction(ctx: *Command.ParseContext) !u8 {
         try compiler.addMalwareBazaar(std.fs.path.basename(path), text, 0);
     }
 
+    if (ctx.getOption("guardian")) |path| {
+        var dir = try cwd.openDir(app.io, path, .{ .iterate = true, .follow_symlinks = false });
+        defer dir.close(app.io);
+        const version = try std.fmt.parseInt(u64, ctx.getOption("guardian-version") orelse "1", 10);
+        const pack = try zav.compile.guardian.readDirectory(compiler.arena.allocator(), app.io, dir, version);
+        try compiler.addGuardianPack(pack);
+    }
+    var trusted: std.ArrayList(zav.db.reader.TrustedKey) = .empty;
+    defer trusted.deinit(app.gpa);
+    for (ctx.getOptionValues("guardian-key")) |hex| {
+        var key: [32]u8 = undefined;
+        if (hex.len != 64) return error.InvalidGuardianPublicKey;
+        _ = std.fmt.hexToBytes(&key, hex) catch return error.InvalidGuardianPublicKey;
+        try trusted.append(app.gpa, .{ .public_key = key });
+    }
+    for (ctx.getOptionValues("guardian-bundle")) |path| {
+        const bytes = try cwd.readFileAlloc(app.io, path, app.gpa, .limited(zav.compile.guardian.bundle.max_bytes + 1));
+        defer app.gpa.free(bytes);
+        try compiler.addGuardianBundle(bytes, trusted.items);
+    }
+
     app.io.random(&nonce);
     const summary = try compiler.write(app.io, cwd, out_path, .{ .db_version = std.mem.readInt(u64, &nonce, .little) >> 1 });
     if (ctx.wantsJson()) {
@@ -222,6 +255,35 @@ fn compileAction(ctx: *Command.ParseContext) !u8 {
     } else {
         try app.out.print("{s}: {d} signatures, {d} hash rules, {d} allowlist entries, {d} duplicates dropped\n", .{ out_path, summary.signatures, summary.hash_rules, summary.allowlist_rules, summary.duplicates });
     }
+    return 0;
+}
+
+fn rulePackAction(ctx: *Command.ParseContext) !u8 {
+    const source = ctx.getOption("source") orelse return error.MissingSource;
+    const version = try std.fmt.parseInt(u64, ctx.getOption("version") orelse return error.MissingVersion, 10);
+    const key_path = ctx.getOption("signing-key") orelse return error.MissingSigningKey;
+    const out = ctx.getOption("out") orelse return error.MissingOutput;
+    var arena: std.heap.ArenaAllocator = .init(app.gpa);
+    defer arena.deinit();
+    const cwd = std.Io.Dir.cwd();
+    var dir = try cwd.openDir(app.io, source, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(app.io);
+    const pack = try zav.compile.guardian.readDirectory(arena.allocator(), app.io, dir, version);
+    // Do not sign an invalid YARA pack: validate through the same compiler path as consumers.
+    var compiler = zav.compile.compiler.Compiler.init(app.gpa);
+    defer compiler.deinit();
+    try compiler.addGuardianPack(pack);
+    const seed = try cwd.readFileAlloc(app.io, key_path, app.gpa, .limited(33));
+    defer {
+        std.crypto.secureZero(u8, seed);
+        app.gpa.free(seed);
+    }
+    if (seed.len != 32) return error.InvalidSigningKey;
+    var kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed[0..32].*);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    const bytes = try zav.compile.guardian.bundle.encode(arena.allocator(), pack, kp);
+    try cwd.writeFile(app.io, .{ .sub_path = out, .data = bytes });
+    try app.out.print("{s}: Guardian pack version {d}, {d} source files\n", .{ out, version, pack.entries.len });
     return 0;
 }
 

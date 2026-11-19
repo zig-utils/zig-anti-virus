@@ -1,0 +1,6 @@
+SYNTHETIC INERT TOKENS - never execute
+postinstall
+child_process
+.npmrc
+process.env
+https.request

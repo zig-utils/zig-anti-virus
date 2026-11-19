@@ -1,0 +1,1 @@
+wget https://example.invalid/release.tar.gz; chmod +x app

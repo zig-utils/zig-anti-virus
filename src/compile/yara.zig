@@ -35,6 +35,7 @@ pub const StringDef = struct {
 };
 
 pub const Rule = struct {
+    source: ir.Source = .yara,
     name: []const u8,
     strings: []const StringDef,
     cond: []const yc.CondOp,

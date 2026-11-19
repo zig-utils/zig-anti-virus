@@ -1,0 +1,5 @@
+category = "webshell"
+severity = "high"
+references = ["https://www.microsoft.com/en-us/security/blog/2020/02/04/ghost-in-the-shell-investigating-web-shell-attacks/"]
+false_positive_notes = "Legacy diagnostic pages using unsafe request evaluation require manual review."
+owner = "Guardian maintainers"

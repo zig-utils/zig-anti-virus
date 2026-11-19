@@ -1,0 +1,5 @@
+SYNTHETIC INERT TOKENS - never execute
+document.querySelector
+cardnumber
+cvv
+navigator.sendBeacon

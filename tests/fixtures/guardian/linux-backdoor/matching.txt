@@ -1,0 +1,4 @@
+SYNTHETIC INERT TOKENS - never execute
+/etc/cron.hourly/gcc.sh
+/lib/libudev.so
+/var/run/gcc.pid

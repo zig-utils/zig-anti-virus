@@ -1,0 +1,5 @@
+category = "miner-dropper"
+severity = "high"
+references = ["https://www.microsoft.com/en-us/security/blog/2019/05/23/uncovering-linux-based-cyberattack-using-azure-security-center/"]
+false_positive_notes = "Security reports and research scripts that reproduce the reported hidden staging path can match."
+owner = "Guardian maintainers"
