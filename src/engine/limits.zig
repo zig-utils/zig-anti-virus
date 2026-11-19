@@ -68,6 +68,8 @@ pub const Event = enum(u8) {
     /// One file's verify calls passed their count budget, proportional to its size
     /// (verify_vm.Budget): crafted candidate density.
     verify_count,
+    /// A container header exceeds its bounded variable-length field budget.
+    container_header,
 };
 
 /// Per-scan accounting. Lives in scratch; resetting it is O(1).

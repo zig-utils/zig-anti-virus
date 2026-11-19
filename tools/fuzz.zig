@@ -1124,7 +1124,7 @@ const Formats = struct {
         .{ .name = "fmt.tar", .inputs = archives(".tar") },
         .{ .name = "fmt.cpio", .inputs = archives(".cpio") },
         .{ .name = "fmt.zip", .inputs = archives(".zip") ++ documents(".zip") },
-        .{ .name = "fmt.ole2", .inputs = archives(".doc") },
+        .{ .name = "fmt.ole2", .inputs = archives(".doc") ++ &[_][]const u8{zav.fmt.ole2.native_fixture} },
         .{ .name = "fmt.ooxml", .inputs = archives(".docx") ++ archives(".docm") },
         .{ .name = "fmt.pe", .inputs = exes(".exe") },
         .{ .name = "fmt.elf", .inputs = exes(".elf") },

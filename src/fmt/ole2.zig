@@ -2,7 +2,8 @@
 //! DIFAT array and the DIFAT chain), the mini FAT and mini stream, and the directory's red-black
 //! trees. Every stream becomes a child, read by following its sector chain, so nothing is copied
 //! whole. VBA projects (a "VBA" storage with a "dir" stream) also yield each module's source,
-//! decompressed with MS-OVBA (vba.zig), as a derived child.
+//! decompressed with MS-OVBA (vba.zig), as a derived child. Ole10Native streams also expose
+//! their native data and documented Packager payloads as recursively parsed children.
 //!
 //! Chains are untrusted: every walk is bounded by the number of sectors the file can hold, so a
 //! loop ends; directory traversal is bounded by entry count and depth and marks visited entries.
@@ -14,10 +15,17 @@ const vba = @import("vba.zig");
 const Walker = container.Walker;
 const Error = container.Error;
 
+/// Benign reproducible Packager seed shared by public-interface tests and fmt.ole2 fuzzing.
+pub const native_fixture = @embedFile("fixtures/archive-native.doc.bin");
+
 pub const magic = "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 const end_of_chain: u32 = 0xfffffffe;
 const free_sect: u32 = 0xffffffff;
 const no_stream: u32 = 0xffffffff;
+// OLE1 Package CLSID {0003000C-0000-0000-C000-000000000046}, in CFB byte order.
+// Primary interoperability reference: Apache POI's ClassIDPredefined.OLE_V1_PACKAGE:
+// https://github.com/apache/poi/blob/trunk/poi/src/main/java/org/apache/poi/hpsf/ClassIDPredefined.java
+const package_clsid = [_]u8{ 0x0c, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46 };
 
 pub const max_entries = 65536;
 const max_depth = 32;
@@ -120,6 +128,7 @@ pub const ChainReader = struct {
     sector: u32,
     left: u64,
     steps: u64 = 0,
+    sector_pos: u64 = 0,
     /// For mini streams: the mini-stream reader state (mini stream is itself a FAT chain).
     err: bool = false,
     interface: Io.Reader,
@@ -142,19 +151,23 @@ pub const ChainReader = struct {
                 c.err = true;
                 return 0;
             }
-            const n: usize = @intCast(@min(dest.len, f.h.sectorSize(), c.left));
-            f.src.readAllAt(f.io, f.sectorOffset(c.sector), dest[0..n]) catch {
+            const n: usize = @intCast(@min(dest.len, f.h.sectorSize() - c.sector_pos, c.left));
+            f.src.readAllAt(f.io, f.sectorOffset(c.sector) + c.sector_pos, dest[0..n]) catch {
                 c.err = true;
                 return 0;
             };
             c.left -= n;
-            c.sector = f.next(c.sector) orelse end_of_chain;
-            c.steps += 1;
+            c.sector_pos += n;
+            if (c.sector_pos == f.h.sectorSize()) {
+                c.sector = f.next(c.sector) orelse end_of_chain;
+                c.sector_pos = 0;
+                c.steps += 1;
+            }
             return n;
         }
         // Mini sector: find its offset in the mini stream, then that position in the FAT chain.
         const mss: u64 = @as(u64, 1) << f.h.mini_shift;
-        const pos = @as(u64, c.sector) * mss;
+        const pos = @as(u64, c.sector) * mss + c.sector_pos;
         if (pos >= f.root_size) {
             c.err = true;
             return 0;
@@ -163,14 +176,18 @@ pub const ChainReader = struct {
             c.err = true;
             return 0;
         };
-        const n: usize = @intCast(@min(dest.len, mss, c.left));
+        const n: usize = @intCast(@min(dest.len, mss - c.sector_pos, c.left, f.root_size - pos));
         f.src.readAllAt(f.io, off, dest[0..n]) catch {
             c.err = true;
             return 0;
         };
         c.left -= n;
-        c.sector = miniNext(f, c.sector) orelse end_of_chain;
-        c.steps += 1;
+        c.sector_pos += n;
+        if (c.sector_pos == mss) {
+            c.sector = miniNext(f, c.sector) orelse end_of_chain;
+            c.sector_pos = 0;
+            c.steps += 1;
+        }
         return n;
     }
 };
@@ -211,6 +228,7 @@ const Entry = struct {
     name: [64]u8,
     name_len: usize,
     kind: u8,
+    package: bool,
     left: u32,
     right: u32,
     child: u32,
@@ -225,6 +243,7 @@ fn readEntry(f: *File, id: u32, dir_cache: *DirCursor) ?Entry {
         .name = undefined,
         .name_len = 0,
         .kind = b[66],
+        .package = std.mem.eql(u8, b[80..96], &package_clsid),
         .left = std.mem.readInt(u32, b[68..72], .little),
         .right = std.mem.readInt(u32, b[72..76], .little),
         .child = std.mem.readInt(u32, b[76..80], .little),
@@ -293,7 +312,7 @@ pub fn walk(w: *Walker, src: Source) Error!void {
     const buf = w.alloc(u8, container.block_len) orelse return;
     var ctx: Ctx = .{ .w = w, .f = &f, .dir = &dir, .visited = visited, .buf = buf };
     _ = ctx.mark(0);
-    try ctx.storage(root.child, 0, 0, false);
+    try ctx.storage(root.child, 0, 0, false, root.package);
     if (ctx.damaged) w.notice(.malformed, "ole2: broken chain or directory");
 }
 
@@ -308,7 +327,7 @@ const Ctx = struct {
 
     /// Visit a storage's children (a red-black tree rooted at `id`), iteratively in-order
     /// with an explicit bounded stack.
-    fn storage(c: *Ctx, id: u32, storage_id: u32, depth: u8, is_vba: bool) Error!void {
+    fn storage(c: *Ctx, id: u32, storage_id: u32, depth: u8, is_vba: bool, is_package: bool) Error!void {
         if (depth >= max_depth) return;
         var stack: [64]u32 = undefined;
         var sp: usize = 0;
@@ -342,7 +361,7 @@ const Ctx = struct {
                 c.damaged = true;
                 break;
             };
-            try c.entry(eid, e, depth, is_vba, &vba_dir);
+            try c.entry(eid, e, depth, is_vba, is_package, &vba_dir);
             cur = e.right;
         }
         if (vba_dir) |d| try c.vbaProject(d, storage_id);
@@ -363,28 +382,68 @@ const Ctx = struct {
         return true;
     }
 
-    fn entry(c: *Ctx, eid: u32, e: Entry, depth: u8, is_vba: bool, vba_dir: *?Entry) Error!void {
+    fn entry(c: *Ctx, eid: u32, e: Entry, depth: u8, is_vba: bool, is_package: bool, vba_dir: *?Entry) Error!void {
         const name = e.name[0..e.name_len];
         switch (e.kind) {
             1 => {
                 c.w.path.push(name);
                 defer c.w.path.pop();
-                try c.storage(e.child, eid, depth + 1, std.ascii.eqlIgnoreCase(name, "VBA"));
+                try c.storage(e.child, eid, depth + 1, std.ascii.eqlIgnoreCase(name, "VBA"), e.package);
             },
             2 => {
                 if (is_vba and std.ascii.eqlIgnoreCase(name, "dir")) vba_dir.* = e;
-                try c.stream(e, name);
+                try c.stream(e, name, is_package);
             },
             else => {},
         }
     }
 
-    fn stream(c: *Ctx, e: Entry, name: []const u8) Error!void {
-        if (e.size == 0) return;
+    fn stream(c: *Ctx, e: Entry, name: []const u8, is_package: bool) Error!void {
+        if (e.size == 0 and !std.ascii.eqlIgnoreCase(name, "\x01Ole10Native")) return;
         const mini = e.size < c.f.h.mini_cutoff;
         var reader: ChainReader = .init(c.f, e.start, e.size, mini, c.buf);
         try c.w.child(name, .{ .stream = .{ .reader = &reader.interface, .len_hint = e.size } }, .member);
         // Whatever the child left unread (a limit, a skip) does not matter: the reader is ours.
+        if (reader.err) c.damaged = true;
+        if (std.ascii.eqlIgnoreCase(name, "\x01Ole10Native") and e.size <= c.w.tracker.limits.max_file_size) {
+            c.w.path.push(name);
+            defer c.w.path.pop();
+            try c.native(e, is_package);
+        }
+    }
+
+    /// [MS-OLEDS] 2.3.6: NativeDataSize:u32le followed by exactly that many native bytes.
+    /// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-oleds/cc825ec3-f0ed-4023-97f6-13c323ac1172
+    fn native(c: *Ctx, e: Entry, is_package: bool) Error!void {
+        const w = c.w;
+        var reader: ChainReader = .init(c.f, e.start, e.size, e.size < c.f.h.mini_cutoff, c.buf);
+        const size = reader.interface.takeInt(u32, .little) catch return w.notice(.malformed, "ole2: native size header");
+        if (e.size < 4 or size > e.size - 4) return w.notice(.malformed, "ole2: native size exceeds stream");
+        const buf = w.alloc(u8, 4096) orelse return;
+        defer w.free(buf);
+        var native_reader = reader.interface.limited(.limited64(size), buf);
+        w.notice(.embedded, "ole2: native data");
+        try w.child("native", .{ .stream = .{ .reader = &native_reader.interface, .len_hint = size } }, .member);
+        if (reader.err) c.damaged = true;
+
+        // [MS-OLEDS] 1.3.3: the owner storage CLSID identifies the creating application.
+        // NativeData is application-specific. Structurally valid Packager data is extracted
+        // even with a changed CLSID; failed optional recognition is malformed only for a
+        // declared Package. Header-work exhaustion remains an explicit limit in either case.
+        reader = .init(c.f, e.start, e.size, e.size < c.f.h.mini_cutoff, c.buf);
+        reader.interface.discardAll(4) catch return;
+        native_reader = reader.interface.limited(.limited64(size), buf);
+        var header: PackageHeader = .{ .reader = &native_reader.interface, .left = size };
+        const marker = header.int(u16) catch return if (is_package) w.notice(.malformed, "ole2: truncated Packager marker");
+        if (marker != 2) return;
+        const package = header.parse() catch |err| return switch (err) {
+            error.HeaderLimit => w.limit(.container_header),
+            error.Malformed => if (is_package) w.notice(.malformed, "ole2: Packager header or payload size"),
+        };
+        const payload_buf = w.alloc(u8, 4096) orelse return;
+        defer w.free(payload_buf);
+        var payload = native_reader.interface.limited(.limited64(package.size), payload_buf);
+        try w.child(package.name(), .{ .stream = .{ .reader = &payload.interface, .len_hint = package.size } }, .member);
         if (reader.err) c.damaged = true;
     }
 
@@ -458,3 +517,358 @@ const Ctx = struct {
         return null;
     }
 };
+
+/// Packager's variable header is described in Microsoft's Office extraction sample README:
+/// https://github.com/microsoftarchive/msdn-code-gallery-microsoft/blob/master/OneCodeTeam/Extract%20embedded%20files%20from%20Office%20documents%20%28CSOfficeDocumentFileExtractor%29/README.md
+/// Implemented from the field descriptions, without copying sample code. Optional Unicode
+/// names after the payload are not used; they remain covered by the raw and native scans.
+const PackageHeader = struct {
+    reader: *Io.Reader,
+    left: u64,
+    const ParseError = error{ Malformed, HeaderLimit };
+    const max_string = 4096;
+    const Package = struct {
+        label: [256]u8 = undefined,
+        label_len: usize = 0,
+        size: u32 = 0,
+
+        fn name(p: *const Package) []const u8 {
+            const label = p.label[0..p.label_len];
+            const start = if (std.mem.lastIndexOfAny(u8, label, "/\\")) |i| i + 1 else 0;
+            const base = label[start..];
+            return if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) "package" else base;
+        }
+    };
+
+    fn int(h: *PackageHeader, comptime T: type) ParseError!T {
+        if (h.left < @sizeOf(T)) return error.Malformed;
+        const result = h.reader.takeInt(T, .little) catch return error.Malformed;
+        h.left -= @sizeOf(T);
+        return result;
+    }
+
+    /// Scan a NUL-terminated ANSI string with a fixed work cap; only the label needs keeping.
+    fn string(h: *PackageHeader, label: ?*Package) ParseError!void {
+        for (0..max_string) |_| {
+            const b = try h.int(u8);
+            if (b == 0) return;
+            if (label) |p| if (p.label_len < p.label.len) {
+                p.label[p.label_len] = b;
+                p.label_len += 1;
+            };
+        }
+        return error.HeaderLimit;
+    }
+
+    fn parse(h: *PackageHeader) ParseError!Package {
+        var p: Package = .{};
+        try h.string(&p);
+        try h.string(null);
+        _ = try h.int(u32); // Unknown field, ignored.
+        const path_size = try h.int(u32);
+        if (path_size > h.left) return error.Malformed;
+        if (path_size > max_string) return error.HeaderLimit;
+        if (path_size == 0) return error.Malformed;
+        const path = h.reader.take(@intCast(path_size)) catch return error.Malformed;
+        h.left -= path_size;
+        if (path[path.len - 1] != 0) return error.Malformed;
+        p.size = try h.int(u32);
+        if (p.size > h.left) return error.Malformed;
+        return p;
+    }
+};
+
+// Synthetic CFB fixtures use one FAT and directory sector, followed by a regular stream.
+// mini_cutoff=0 keeps tiny malformed vectors on the same regular-chain path.
+fn nativeFixture(native: []const u8) ![]u8 {
+    const gpa = std.testing.allocator;
+    const sectors = (native.len + 511) / 512;
+    const bytes = try gpa.alloc(u8, (3 + sectors) * 512);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..8], magic);
+    std.mem.writeInt(u16, bytes[30..32], 9, .little);
+    std.mem.writeInt(u16, bytes[32..34], 6, .little);
+    std.mem.writeInt(u32, bytes[48..52], 1, .little);
+    std.mem.writeInt(u32, bytes[60..64], end_of_chain, .little);
+    std.mem.writeInt(u32, bytes[68..72], end_of_chain, .little);
+    @memset(bytes[76..512], 0xff);
+    std.mem.writeInt(u32, bytes[76..80], 0, .little);
+    @memset(bytes[512..1024], 0xff);
+    std.mem.writeInt(u32, bytes[512..516], 0xfffffffd, .little);
+    std.mem.writeInt(u32, bytes[516..520], end_of_chain, .little);
+    for (0..sectors) |i| std.mem.writeInt(u32, bytes[520 + i * 4 ..][0..4], if (i + 1 == sectors) end_of_chain else @intCast(i + 3), .little);
+    const names = [_][]const u8{ "Root Entry", "\x01Ole10Native" };
+    for (names, 0..) |name, i| {
+        const entry = bytes[1024 + i * 128 ..][0..128];
+        for (name, 0..) |b, j| std.mem.writeInt(u16, entry[j * 2 ..][0..2], b, .little);
+        std.mem.writeInt(u16, entry[64..66], @intCast((name.len + 1) * 2), .little);
+        entry[66] = if (i == 0) 5 else 2;
+        if (i == 0) @memcpy(entry[80..96], &package_clsid);
+        std.mem.writeInt(u32, entry[68..72], no_stream, .little);
+        std.mem.writeInt(u32, entry[72..76], no_stream, .little);
+        std.mem.writeInt(u32, entry[76..80], if (i == 0) 1 else no_stream, .little);
+        std.mem.writeInt(u32, entry[116..120], if (i == 0) end_of_chain else 2, .little);
+        std.mem.writeInt(u64, entry[120..128], if (i == 0) 0 else native.len, .little);
+    }
+    @memcpy(bytes[1536..][0..native.len], native);
+    return bytes;
+}
+
+fn nativeEnvelope(data: []const u8) ![]u8 {
+    const out = try std.testing.allocator.alloc(u8, data.len + 4);
+    std.mem.writeInt(u32, out[0..4], @intCast(data.len), .little);
+    @memcpy(out[4..], data);
+    return out;
+}
+
+test "OLE native data becomes a recursively parsed child, preserving the raw stream" {
+    const gz = @import("fixtures/fixtures.zig").gzip_vectors[0];
+    const native = try nativeEnvelope(gz.compressed);
+    defer std.testing.allocator.free(native);
+    const doc = try nativeFixture(native);
+    defer std.testing.allocator.free(doc);
+    var rig: @import("scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    try rig.scanBoth(doc, "embedded.doc");
+    const raw = rig.rec.find("embedded.doc/?Ole10Native") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(native.len, raw.bytes);
+    try std.testing.expectEqual(std.hash.Crc32.hash(native), raw.crc);
+    const child = rig.rec.find("embedded.doc/?Ole10Native/native/gzip") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(gz.plain_len, child.bytes);
+    try std.testing.expectEqual(gz.plain_crc, child.crc);
+    try std.testing.expect(!rig.rec.has(.malformed));
+    try std.testing.expectEqual(@as(usize, 0), rig.scratch.used());
+}
+
+fn packageEnvelope(data: []const u8, label: []const u8) ![]u8 {
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "\x02\x00");
+    try body.appendSlice(gpa, label);
+    try body.appendSlice(gpa, "\x00source\x00\x00\x00\x00\x00\x05\x00\x00\x00temp\x00");
+    var size: [4]u8 = undefined;
+    std.mem.writeInt(u32, &size, @intCast(data.len), .little);
+    try body.appendSlice(gpa, &size);
+    try body.appendSlice(gpa, data);
+    // The optional Unicode-name trailer must never leak into the payload child.
+    try body.appendSlice(gpa, "\x00\x00\x00\x00trailer");
+    return nativeEnvelope(body.items);
+}
+
+fn nativeMiniFixture(native: []const u8) ![]u8 {
+    const regular = try nativeFixture(native);
+    defer std.testing.allocator.free(regular);
+    const bytes = try std.testing.allocator.alloc(u8, regular.len + 512);
+    @memcpy(bytes[0..regular.len], regular);
+    const minifat_sector: u32 = @intCast(regular.len / 512 - 1);
+    std.mem.writeInt(u32, bytes[56..60], 4096, .little);
+    std.mem.writeInt(u32, bytes[60..64], minifat_sector, .little);
+    std.mem.writeInt(u32, bytes[512 + minifat_sector * 4 ..][0..4], end_of_chain, .little);
+    std.mem.writeInt(u32, bytes[1024 + 116 ..][0..4], 2, .little);
+    std.mem.writeInt(u64, bytes[1024 + 120 ..][0..8], (native.len + 63) / 64 * 64, .little);
+    std.mem.writeInt(u32, bytes[1152 + 116 ..][0..4], 0, .little);
+    const mini_count = (native.len + 63) / 64;
+    @memset(bytes[regular.len..], 0xff);
+    for (0..mini_count) |i| std.mem.writeInt(u32, bytes[regular.len + i * 4 ..][0..4], if (i + 1 == mini_count) end_of_chain else @intCast(i + 1), .little);
+    return bytes;
+}
+
+test "OLE native Packager payload has exact bounds in regular and mini FAT streams" {
+    const gz = @import("fixtures/fixtures.zig").gzip_vectors[0];
+    const native = try packageEnvelope(gz.compressed, "..\\unsafe/native.gz");
+    defer std.testing.allocator.free(native);
+    for ([_]bool{ false, true }) |mini| {
+        const doc = if (mini) try nativeMiniFixture(native) else try nativeFixture(native);
+        defer std.testing.allocator.free(doc);
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(doc, "package.doc");
+        const raw = rig.rec.find("package.doc/?Ole10Native") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(std.hash.Crc32.hash(native), raw.crc);
+        const payload = rig.rec.find("package.doc/?Ole10Native/native.gz") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(gz.compressed.len, payload.bytes);
+        try std.testing.expectEqual(std.hash.Crc32.hash(gz.compressed), payload.crc);
+        const child = rig.rec.find("package.doc/?Ole10Native/native.gz/native") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(gz.plain_len, child.bytes);
+        try std.testing.expectEqual(gz.plain_crc, child.crc);
+        try std.testing.expect(!rig.rec.has(.malformed));
+        try std.testing.expect(rig.rec.has(.embedded));
+    }
+}
+
+test "OLE native malformed sizes and truncated Packager fields preserve raw scanning" {
+    const native = try packageEnvelope("benign package payload", "payload.bin");
+    defer std.testing.allocator.free(native);
+    const header_len = native.len - "benign package payload".len - 11;
+    // Every header cut, including each byte of the outer DWORD, ASCIIZ strings,
+    // temporary-path length/string and final data-size DWORD.
+    for (0..header_len) |cut| {
+        const truncated = try std.testing.allocator.dupe(u8, native[0..cut]);
+        defer std.testing.allocator.free(truncated);
+        if (cut >= 4) std.mem.writeInt(u32, truncated[0..4], @intCast(cut - 4), .little);
+        const doc = try nativeFixture(truncated);
+        defer std.testing.allocator.free(doc);
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(doc, "truncated.doc");
+        const raw = rig.rec.find("truncated.doc/?Ole10Native") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(cut, raw.bytes);
+        try std.testing.expect(rig.rec.has(.malformed));
+        try std.testing.expect(rig.rec.find("truncated.doc/?Ole10Native/payload.bin") == null);
+    }
+    // Outer length cannot reach into sector padding; checked by subtraction, no wraparound.
+    const bad = try std.testing.allocator.dupe(u8, native);
+    defer std.testing.allocator.free(bad);
+    for ([_]u32{ @intCast(native.len - 3), 0xffffffff }) |size| {
+        std.mem.writeInt(u32, bad[0..4], size, .little);
+        const doc = try nativeFixture(bad);
+        defer std.testing.allocator.free(doc);
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(doc, "oversize.doc");
+        try std.testing.expect(rig.rec.has(.malformed));
+        try std.testing.expect(rig.rec.find("oversize.doc/?Ole10Native/native") == null);
+    }
+    for ([_]u32{ @intCast(native.len - header_len + 1), 0xffffffff }) |size| {
+        @memcpy(bad, native);
+        std.mem.writeInt(u32, bad[header_len - 4 ..][0..4], size, .little);
+        const doc = try nativeFixture(bad);
+        defer std.testing.allocator.free(doc);
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(doc, "bad-payload.doc");
+        try std.testing.expect(rig.rec.has(.malformed));
+        try std.testing.expect(rig.rec.find("bad-payload.doc/?Ole10Native/native") != null);
+        try std.testing.expect(rig.rec.find("bad-payload.doc/?Ole10Native/payload.bin") == null);
+    }
+}
+
+test "OLE native hostile header lengths raise an explicit header limit" {
+    const gpa = std.testing.allocator;
+    const oversized = try gpa.alloc(u8, 2 + PackageHeader.max_string + 1);
+    defer gpa.free(oversized);
+    @memset(oversized, 'a');
+    oversized[0] = 2;
+    oversized[1] = 0;
+    oversized[oversized.len - 1] = 0;
+    const long_label = try nativeEnvelope(oversized);
+    defer gpa.free(long_label);
+    const ordinary = try packageEnvelope("benign", "x");
+    defer gpa.free(ordinary);
+    const path_offset = 19;
+    const long_path = try gpa.alloc(u8, ordinary.len + 4097 - 5);
+    defer gpa.free(long_path);
+    @memcpy(long_path[0..path_offset], ordinary[0..path_offset]);
+    std.mem.writeInt(u32, long_path[path_offset..][0..4], 4097, .little);
+    @memset(long_path[path_offset + 4 ..][0..4097], 't');
+    long_path[path_offset + 4 + 4096] = 0;
+    @memcpy(long_path[path_offset + 4 + 4097 ..], ordinary[path_offset + 4 + 5 ..]);
+    std.mem.writeInt(u32, long_path[0..4], @intCast(long_path.len - 4), .little);
+    for ([_][]const u8{ long_label, long_path }) |bytes| {
+        const doc = try nativeFixture(bytes);
+        defer gpa.free(doc);
+        // Unknown application data still reports an exhausted marker-2 header work budget.
+        if (bytes.ptr == long_label.ptr) @memset(doc[1024 + 80 ..][0..16], 0);
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        try rig.scanBoth(doc, "hostile.doc");
+        const raw = rig.rec.find("hostile.doc/?Ole10Native") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(bytes.len, raw.bytes);
+        try std.testing.expect(rig.rec.hasLimit(.container_header));
+    }
+    // A length outside the native object is malformed, before any limit check or skip.
+    std.mem.writeInt(u32, ordinary[path_offset..][0..4], 0xffffffff, .little);
+    const doc = try nativeFixture(ordinary);
+    defer gpa.free(doc);
+    var rig: @import("scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    try rig.scanBoth(doc, "bad-length.doc");
+    try std.testing.expect(rig.rec.has(.malformed));
+    try std.testing.expect(!rig.rec.hasLimit(.container_header));
+}
+
+test "OLE native children obey recursion and file count limits" {
+    const native = try packageEnvelope(@import("fixtures/fixtures.zig").gzip_vectors[0].compressed, "payload.gz");
+    defer std.testing.allocator.free(native);
+    const doc = try nativeFixture(native);
+    defer std.testing.allocator.free(doc);
+    const Limits = @import("../engine/limits.zig").Limits;
+    for ([_]Limits{ .{ .max_files = 1 }, .{ .max_recursion = 1 } }, 0..) |lim, i| {
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(lim);
+        defer rig.deinit();
+        try rig.scanBoth(doc, "limited.doc");
+        try std.testing.expect(rig.rec.find("limited.doc/?Ole10Native") != null);
+        try std.testing.expect(rig.rec.hasLimit(if (i == 0) .files else .recursion));
+        try std.testing.expect(rig.rec.find("limited.doc/?Ole10Native/payload.gz/payload") == null);
+    }
+}
+
+test "OLE native nested benign marker reaches the public detection visitor with changed CLSID" {
+    const marker = "GUARDIAN_BENIGN_NATIVE_CHILD";
+    for ([_]bool{ true, false }) |declared_package| {
+        const doc = try std.testing.allocator.dupe(u8, native_fixture);
+        defer std.testing.allocator.free(doc);
+        if (!declared_package) @memset(doc[1024 + 80 ..][0..16], 0);
+        try std.testing.expect(std.mem.indexOf(u8, doc, marker) == null);
+        var rig: @import("scan.zig").TestRig = undefined;
+        try rig.init(.{});
+        defer rig.deinit();
+        rig.rec.stop_at = marker;
+        try std.testing.expectError(error.Halted, rig.walker.scan(.{ .memory = doc }, "detected.doc"));
+        try std.testing.expectEqual(container.Halt.stop, rig.walker.halt.?);
+        try std.testing.expect(rig.rec.find("detected.doc/?Ole10Native/payload.gz/payload") != null);
+    }
+}
+
+test "OLE native short sector reads preserve payload bytes and broken chains are malformed" {
+    const data = try std.testing.allocator.alloc(u8, 9001);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i * 17 + i / 19);
+    const native = try nativeEnvelope(data);
+    defer std.testing.allocator.free(native);
+    const doc = try nativeFixture(native);
+    defer std.testing.allocator.free(doc);
+    var rig: @import("scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    try rig.scanBoth(doc, "sectors.doc");
+    const child = rig.rec.find("sectors.doc/?Ole10Native/native") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(data.len, child.bytes);
+    try std.testing.expectEqual(std.hash.Crc32.hash(data), child.crc);
+    try std.testing.expect(!rig.rec.has(.malformed));
+
+    // The declared stream remains long, but its sector chain ends after the first sector.
+    std.mem.writeInt(u32, doc[520..524], end_of_chain, .little);
+    var broken: @import("scan.zig").TestRig = undefined;
+    try broken.init(.{});
+    defer broken.deinit();
+    try broken.scanBoth(doc, "broken.doc");
+    try std.testing.expect(broken.rec.has(.malformed));
+    const prefix = broken.rec.find("broken.doc/?Ole10Native/native") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 508), prefix.bytes);
+}
+
+test "OLE native unknown application data beginning with two has no guessed malformed notice" {
+    const native = try nativeEnvelope("\x02\x00application-specific native bytes");
+    defer std.testing.allocator.free(native);
+    const doc = try nativeFixture(native);
+    defer std.testing.allocator.free(doc);
+    @memset(doc[1024 + 80 ..][0..16], 0);
+    var rig: @import("scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    try rig.scanBoth(doc, "unknown.doc");
+    const child = rig.rec.find("unknown.doc/?Ole10Native/native") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(native.len - 4, child.bytes);
+    try std.testing.expect(!rig.rec.has(.malformed));
+    try std.testing.expect(!rig.rec.hasLimit(.container_header));
+}

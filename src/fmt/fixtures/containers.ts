@@ -48,6 +48,49 @@ function both32(v: number): number[] {
   return [...le32(v), ...be32(v)]
 }
 
+// Benign Ole10Native seed. Rebuild only this asset (without the large fixture suite):
+// bun -e 'import { oleNativeFixture } from "./src/fmt/fixtures/containers.ts"; await Bun.write("src/fmt/fixtures/archive-native.doc.bin", oleNativeFixture())'
+// Layout: [MS-CFB] v3 with one directory, FAT, mini FAT and root mini-stream sector.
+// The Packager header follows the Microsoft Office extraction sample linked in ole2.zig.
+export function oleNativeFixture(): Uint8Array {
+  const payload = zlib.gzipSync(enc.encode('GUARDIAN_BENIGN_NATIVE_CHILD'))
+  const label = enc.encode('payload.gz\0')
+  const source = enc.encode('source\0')
+  const temp = enc.encode('temp\0')
+  const native = Uint8Array.from([
+    ...le16(2), ...label, ...source, ...le32(0), ...le32(temp.length), ...temp,
+    ...le32(payload.length), ...payload,
+  ])
+  const stream = Uint8Array.from([...le32(native.length), ...native])
+  const out = new Uint8Array(5 * 512)
+  const dv = new DataView(out.buffer)
+  out.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+  for (const [offset, value] of [[24, 0x3e], [26, 3], [28, 0xfffe], [30, 9], [32, 6]]) dv.setUint16(offset, value, true)
+  for (const [offset, value] of [[44, 1], [48, 1], [56, 4096], [60, 3], [64, 1], [68, 0xfffffffe]]) dv.setUint32(offset, value, true)
+  out.fill(0xff, 76, 512)
+  dv.setUint32(76, 0, true)
+  out.fill(0xff, 512, 1024)
+  for (let i = 0; i < 4; i++) dv.setUint32(512 + 4 * i, i === 0 ? 0xfffffffd : 0xfffffffe, true)
+  for (const [i, name] of ['Root Entry', '\x01Ole10Native'].entries()) {
+    const at = 1024 + i * 128
+    for (let j = 0; j < name.length; j++) dv.setUint16(at + 2 * j, name.charCodeAt(j), true)
+    dv.setUint16(at + 64, 2 * (name.length + 1), true)
+    out[at + 66] = i === 0 ? 5 : 2
+    out[at + 67] = 1
+    if (i === 0) out.set([0x0c, 0, 3, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46], at + 80)
+    dv.setUint32(at + 68, 0xffffffff, true)
+    dv.setUint32(at + 72, 0xffffffff, true)
+    dv.setUint32(at + 76, i === 0 ? 1 : 0xffffffff, true)
+    dv.setUint32(at + 116, i === 0 ? 2 : 0, true)
+    dv.setBigUint64(at + 120, BigInt(i === 0 ? Math.ceil(stream.length / 64) * 64 : stream.length), true)
+  }
+  out.set(stream, 1536)
+  out.fill(0xff, 2048)
+  const miniCount = Math.ceil(stream.length / 64)
+  for (let i = 0; i < miniCount; i++) dv.setUint32(2048 + 4 * i, i + 1 === miniCount ? 0xfffffffe : i + 1, true)
+  return out
+}
+
 // ---------------------------------------------------------------------------------------------
 // ISO 9660 (ECMA-119) with a Joliet supplementary volume descriptor, Rock Ridge NM names and an
 // El Torito boot catalog. 2048-byte logical blocks throughout.
