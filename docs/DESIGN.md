@@ -10,6 +10,9 @@ How sure each claim is:
 
 Every [E] figure is provisional until an experiment replaces it with a measurement. Database counts come from E0 ([census](experiments/E0-census.md): main 63, daily 28187, bytecode 339).
 
+The [P3 hash gate](experiments/P3-hash-gate.md) records complete hash-rule lookup coverage,
+raw benign-file scans, the EICAR verdict and the measured hash-only memory envelope.
+
 ## 0. Decisions
 
 1. **Compile offline, mmap at runtime.**

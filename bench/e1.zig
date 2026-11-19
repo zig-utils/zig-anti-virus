@@ -1,6 +1,7 @@
 //! E1 (docs/DESIGN.md section 14): what the hash index costs and how much hashing it avoids.
 //!
 //!     zig build e1 -- <compiled.zavdb> <clamav-db-dir> <corpus-root>...
+//!     zig build e1 -- <compiled.zavdb> <clamav-db-dir> --check-only
 //!
 //! 1. Every hash line of the CVDs in `<clamav-db-dir>` is looked up in the compiled database
 //!    through the scan path's structures (need map, hot and cold tables, SIGMETA): each must be
@@ -47,10 +48,18 @@ pub fn main(init: std.process.Init) !void {
     const open_ns = t_open.durationTo(Io.Clock.awake.now(io)).toNanoseconds();
     try w.print("## Open\n\nreader.open plus HashIndex.load, warm page cache: {d:.2} ms.\n\n", .{@as(f64, @floatFromInt(open_ns)) / 1e6});
 
-    // 1. Every real hash line, looked up.
+    // 1. Every real hash line, looked up. Apply the same explicit ignore/flevel policy as
+    // compilation, so an unexplained missing rule fails the gate rather than looking expected.
+    var filters = zav.compile.compiler.Compiler.init(gpa);
+    defer filters.deinit();
+    for ([_][]const u8{ "main.cvd", "daily.cvd" }) |name| {
+        const path = try std.fs.path.join(gpa, &.{ args[2], name });
+        defer gpa.free(path);
+        try filters.preloadIgnores(io, cwd, path, .{});
+    }
     var probes: std.ArrayList(Probe) = .empty;
     defer probes.deinit(gpa);
-    var check: Check = .{ .index = &index, .probes = &probes, .gpa = gpa };
+    var check: Check = .{ .index = &index, .probes = &probes, .gpa = gpa, .ignore = &filters.ignore };
     var db_dir = try cwd.openDir(io, args[2], .{});
     defer db_dir.close(io);
     for ([_][]const u8{ "main.cvd", "daily.cvd" }) |name| {
@@ -63,9 +72,11 @@ pub fn main(init: std.process.Init) !void {
         try r.seekTo(zav.compile.cvd.header_len);
         try zav.compile.cvd.walk(gpa, header, &r.interface, .{}, &check);
     }
-    try w.print("## Every hash signature (P3.15)\n\n- hash lines: {d}\n- found under their own name: {d}\n- found under the name of an identical rule: {d}\n- not found: {d} (expected: the hash rules the coverage report lists as ignored)\n\n", .{
-        check.lines, check.same, check.other, check.missing,
+    try w.print("## Every hash signature (P3.15)\n\n- hash lines: {d}\n- found under their own name: {d}\n- found under the name of an identical rule: {d}\n- explicitly ignored or outside the functionality level: {d}\n- unexpectedly missing: {d}\n\n", .{
+        check.lines, check.same, check.other, check.filtered, check.missing,
     });
+    if (check.lines == 0 or check.missing != 0) return error.HashGateFailed;
+    if (std.mem.eql(u8, args[3], "--check-only")) return;
 
     // 2. Lookup cost on the real MD5 tables.
     try w.writeAll("## Lookup cost\n\nNanoseconds per lookup, one thread, mean over the whole set (warm: second pass).\n\n| tables | probes | warm hit | warm miss (populated size) | cold hit |\n|---|---:|---:|---:|---:|\n");
@@ -121,10 +132,12 @@ const Check = struct {
     index: *const zav.engine.hashscan.HashIndex,
     probes: *std.ArrayList(Probe),
     gpa: std.mem.Allocator,
+    ignore: *const zav.compile.filters.Ignore,
     lines: u64 = 0,
     same: u64 = 0,
     other: u64 = 0,
     missing: u64 = 0,
+    filtered: u64 = 0,
 
     pub fn member(c: *Check, name: []const u8, _: u64, reader: *Io.Reader) !void {
         const ext = name[std.mem.lastIndexOfScalar(u8, name, '.').? + 1 ..];
@@ -137,6 +150,10 @@ const Check = struct {
             if (line.len == 0 or line[0] == '#') continue;
             const rule = try zav.compile.hashsig.parseLine(fmt, line);
             c.lines += 1;
+            if (zav.compile.filters.skipReason(&rule, c.ignore, zav.compile.filters.engine_flevel) != null) {
+                c.filtered += 1;
+                continue;
+            }
             const t = hashidx.tableVariant(rule.algo, rule.scope);
             const table = c.index.tables[t] orelse {
                 c.missing += 1;
