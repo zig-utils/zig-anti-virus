@@ -9,8 +9,7 @@
 //!   double-quoted, with `"` and `\` escaped;
 //! - adjacent string literals joined with `+` are folded into one (`"ev"+"al"` is `"eval"`);
 //! - `unescape("...")` of a literal is decoded (%XX and %uXXXX), and
-//!   `String.fromCharCode(n, ...)` of numeric literals becomes the string it builds; both then
-//!   take part in folding;
+//!   standalone scripts also fold `String.fromCharCode(n, ...)` with numeric arguments;
 //! - identifiers declared with var, function names and function parameters are
 //!   numbered in declaration order within their active scope. Property names after `.` keep
 //!   their spelling.
@@ -53,6 +52,7 @@ pub const Normalizer = struct {
     lex: Lex = .start,
     word: [max_word]u8 = undefined,
     word_len: usize = 0,
+    html_number: HtmlNumber = .integer,
     quote: u8 = 0,
     esc: u8 = 0,
     esc_val: u32 = 0,
@@ -95,6 +95,7 @@ pub const Normalizer = struct {
         previous_value: u16,
         previous_binding: u16,
     };
+    const HtmlNumber = enum { integer, fraction, exponent_start, exponent_digits };
     const Decl = enum { none, var_next, var_list, func_name, func_params };
     const Function = struct {
         saved_decl: Decl,
@@ -156,7 +157,8 @@ pub const Normalizer = struct {
                 try n.startToken(c);
             },
             .number => {
-                if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_') {
+                const continued = if (n.html_output) n.htmlNumberChar(c) else std.ascii.isAlphanumeric(c) or c == '.' or c == '_';
+                if (continued) {
                     if (n.word_len < max_word) {
                         n.word[n.word_len] = c;
                         n.word_len += 1;
@@ -164,7 +166,7 @@ pub const Normalizer = struct {
                     return;
                 }
                 n.lex = .start;
-                try n.token(.number, n.word[0..n.word_len]);
+                try n.endNumber();
                 try n.startToken(c);
             },
             .string => try n.stringByte(c),
@@ -205,6 +207,59 @@ pub const Normalizer = struct {
         }
     }
 
+    /// The HTML lexer recognizes an exponent only after a decimal point.
+    fn htmlNumberChar(n: *Normalizer, c: u8) bool {
+        if (std.ascii.isDigit(c)) {
+            if (n.html_number == .exponent_start) n.html_number = .exponent_digits;
+            return true;
+        }
+        n.html_number = switch (n.html_number) {
+            .integer => if (c == '.') .fraction else return false,
+            .fraction => if (c == 'e' or c == 'E') .exponent_start else return false,
+            .exponent_start => if (c == '+' or c == '-') .exponent_digits else return false,
+            .exponent_digits => return false,
+        };
+        return true;
+    }
+
+    fn endNumber(n: *Normalizer) Error!void {
+        const text = n.word[0..n.word_len];
+        if (!n.html_output) return n.token(.number, text);
+        var out: [std.fmt.float.min_buffer_size]u8 = undefined;
+        if (n.html_number == .integer) {
+            const value = std.fmt.parseInt(i64, text, 10) catch std.math.maxInt(i64);
+            const limited: i32 = @truncate(value);
+            return n.token(.number, std.fmt.bufPrint(&out, "{d}", .{limited}) catch unreachable);
+        }
+        const value = std.fmt.parseFloat(f64, text) catch blk: {
+            const exponent = std.mem.indexOfAny(u8, text, "eE") orelse return n.token(.number, text);
+            break :blk std.fmt.parseFloat(f64, text[0..exponent]) catch return n.token(.number, text);
+        };
+        return n.token(.number, formatHtmlFloat(value, &out));
+    }
+
+    /// libclamav writes floating-point tokens with six significant digits (`%g`).
+    fn formatHtmlFloat(value: f64, out: *[std.fmt.float.min_buffer_size]u8) []const u8 {
+        var scientific: [std.fmt.float.min_buffer_size]u8 = undefined;
+        const repr = std.fmt.float.render(&scientific, value, .{ .precision = 5 }) catch unreachable;
+        const e = std.mem.indexOfScalar(u8, repr, 'e') orelse {
+            @memcpy(out[0..repr.len], repr);
+            return out[0..repr.len];
+        };
+        const exponent = std.fmt.parseInt(i16, repr[e + 1 ..], 10) catch unreachable;
+        if (exponent >= -4 and exponent < 6) {
+            const places: usize = @intCast(5 - exponent);
+            const decimal = std.fmt.float.render(out, value, .{ .mode = .decimal, .precision = places }) catch unreachable;
+            return if (places == 0) decimal else trimDecimal(decimal);
+        }
+        const sign: u8 = if (exponent < 0) '-' else '+';
+        return std.fmt.bufPrint(out, "{s}e{c}{d:0>2}", .{ trimDecimal(repr[0..e]), sign, @abs(exponent) }) catch unreachable;
+    }
+
+    fn trimDecimal(text: []const u8) []const u8 {
+        return std.mem.trimEnd(u8, std.mem.trimEnd(u8, text, "0"), ".");
+    }
+
     fn regexByte(n: *Normalizer, c: u8) Error!void {
         try n.put(c);
         if (n.regex_escape) {
@@ -234,7 +289,9 @@ pub const Normalizer = struct {
     fn startToken(n: *Normalizer, c: u8) Error!void {
         switch (c) {
             ' ', '\t', '\n', '\r', 0x0b, 0x0c, 0 => {},
+            '#', '@', '\\' => if (!n.html_output) try n.token(.punct, &.{c}),
             '"', '\'', '`' => {
+                if (n.html_output and c == '`') return;
                 n.lex = .string;
                 n.quote = c;
                 n.slen = 0;
@@ -243,6 +300,7 @@ pub const Normalizer = struct {
             '/' => n.lex = .slash,
             '0'...'9' => {
                 n.lex = .number;
+                n.html_number = .integer;
                 n.word[0] = c;
                 n.word_len = 1;
             },
@@ -562,7 +620,7 @@ pub const Normalizer = struct {
             n.call = .unescape;
             return;
         }
-        if (kind == .word and std.mem.eql(u8, t, "String")) {
+        if (!n.html_output and kind == .word and std.mem.eql(u8, t, "String")) {
             n.call = .string;
             return;
         }

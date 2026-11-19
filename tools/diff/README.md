@@ -119,13 +119,17 @@ The HTML `javascript` form folds ASCII case after normalization. ClamAV 1.5.4
 numbers names declared with `var`, function names, and function parameters.
 At the end of a function, aliases from the enclosing scope are visible again.
 `let` and `const` declarations keep their names. The HTML form discards block
-comments and strips `//` delimiters while tokenizing their text.
+comments and strips `//` delimiters while tokenizing their text. Integer
+suffixes are separate tokens and decimal literals use six significant digits.
+The lexer skips backticks, `#`, `@`, and backslashes between tokens. It preserves
+them inside strings when the escape rules allow.
 
-On 674 script-bearing pages derived from the B1 manifest, function scoping and
-line-comment tokenization raised the count of byte-identical JavaScript outputs
-from 29 to 86. Both other HTML forms agreed on all 674 pages. The remaining
-examples include hexadecimal literals and quotes in line comments, so the
-JavaScript comparison still fails with `--strict-js`.
+On 674 script-bearing pages derived from the B1 manifest, function scoping
+and line-comment tokenization raised exact agreement from 29 to 86 pages.
+Numeric and punctuation handling raised it to 149 pages. Both other HTML
+forms agreed on all 674 pages. Remaining differences include slash handling
+in line comments and escaped line breaks in strings. The JavaScript comparison
+still fails with `--strict-js`.
 
 ### Named HTML references
 

@@ -634,6 +634,20 @@ test "HTML JavaScript retains line comment tokens and drops block comments" {
     try std.testing.expectEqualStrings("<script>if(a){clear note.var n000=2;}</script>", s.forms[2].items);
 }
 
+test "HTML JavaScript normalizes numeric tokens as ClamAV does" {
+    const s = try Scanner.init(std.testing.allocator, std.testing.io);
+    defer s.deinit();
+    try s.normalizeHtml("<html><script>check(0xff,10n,1_000,1e+6,1.50,1.5e-6,1.e5,0.5ex,3..toFixed,000909,4294967295,1.23e999);String.fromCharCode(65);</script></html>");
+    try std.testing.expectEqualStrings("<script>check(0 xff,10 n,1 _000,1 e+6,1.5,1.5e-06,100000,0.5 x,3.tofixed,909,-1,inf);string.fromcharcode(65);</script>", s.forms[2].items);
+}
+
+test "HTML JavaScript strips unknown punctuators between tokens" {
+    const s = try Scanner.init(std.testing.allocator, std.testing.io);
+    defer s.deinit();
+    try s.normalizeHtml("<html><script>var a=1; @route(`Hello ${a}!`); foo#bar; foo\\bar; // #source\nprint(\"`#@~\");</script></html>");
+    try std.testing.expectEqualStrings("<script>var n000=1;route(hello ${n000}!);foo bar;foo bar;source print(\"`#@~\");</script>", s.forms[2].items);
+}
+
 fn testEngine(tmp: *std.testing.TmpDir, files: []const [2][]const u8) !Engine {
     const Compiler = @import("../compile/compiler.zig").Compiler;
     var c = Compiler.init(std.testing.allocator);
