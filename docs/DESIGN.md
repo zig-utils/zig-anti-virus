@@ -424,9 +424,10 @@ Database pages are clean and reclaimable, so RSS and PSS are reported but never 
 **Event-loop verification:** `zig build test -Dtest-filter='event loop'`
 exercises fragmented and pipelined echo over TCP and Unix, idle and command
 timeouts, injector backpressure, and shutdown with a worker still running.
-The 10,000-idle-socket run grew process RSS by about 1.3 MiB on Linux arm64 and
-macOS arm64. Both runs held two threads throughout, the caller and one worker.
-The large test needs a soft open-file limit of at least 20,100.
+The 10,000-idle-socket run grew server RSS by less than 2 MiB on Linux arm64
+and macOS arm64. Both runs held two threads, the caller and one worker.
+The client driver runs in a separate process. Each process needs a soft
+open-file limit of at least 10,100.
 
 ### 9.2 Native protocol `zavp/1`
 

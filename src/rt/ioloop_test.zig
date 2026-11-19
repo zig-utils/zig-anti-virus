@@ -23,7 +23,7 @@ const Endpoint = union(enum) {
         };
     }
 
-    fn bind(endpoint: *Endpoint, loop: *rt.Loop) !void {
+    fn listen(endpoint: *Endpoint) !Fd {
         const socket = c.socket(endpoint.address().family, c.SOCK.STREAM, 0);
         try check(socket);
         errdefer close(socket);
@@ -33,6 +33,12 @@ const Endpoint = union(enum) {
             var len = endpoint.size();
             try check(c.getsockname(socket, @ptrCast(&endpoint.tcp), &len));
         }
+        return socket;
+    }
+
+    fn bind(endpoint: *Endpoint, loop: *rt.Loop) !void {
+        const socket = try endpoint.listen();
+        errdefer close(socket);
         try loop.addListener(socket);
     }
 
@@ -278,12 +284,76 @@ const Usage = struct {
     }
 };
 
+const IdleClients = struct {
+    pid: c.pid_t,
+    control: Fd,
+
+    fn start(endpoint: *const Endpoint, listener: Fd, count: usize) !IdleClients {
+        var pipe: [2]Fd = undefined;
+        try check(c.pipe(&pipe));
+        errdefer for (pipe) |fd| close(fd);
+        const pid = c.fork();
+        try check(pid);
+        if (pid == 0) {
+            close(listener);
+            close(pipe[1]);
+            c._exit(hold(endpoint.address(), endpoint.size(), count, pipe[0]));
+        }
+        close(pipe[0]);
+        return .{ .pid = pid, .control = pipe[1] };
+    }
+
+    /// The child only uses POSIX calls between fork and _exit. It retains the
+    /// peer sockets until the parent closes the control pipe.
+    fn hold(address: *const c.sockaddr, size: c.socklen_t, count: usize, control: Fd) c_int {
+        for (0..count) |_| {
+            for (0..1000) |_| {
+                const fd = c.socket(address.family, c.SOCK.STREAM, 0);
+                if (fd < 0) return 1;
+                const result = c.connect(fd, address, size);
+                const err = std.posix.errno(result);
+                if (err == .SUCCESS) break;
+                close(fd);
+                switch (err) {
+                    .INTR => continue,
+                    .AGAIN, .CONNREFUSED => {
+                        var events = [_]c.pollfd{.{ .fd = control, .events = c.POLL.IN }};
+                        if (c.poll(&events, events.len, 3) != 0) return 2;
+                    },
+                    else => return 3,
+                }
+            } else return 4;
+        }
+        var buf: [1]u8 = undefined;
+        while (true) switch (std.posix.errno(c.read(control, &buf, buf.len))) {
+            .SUCCESS => return 0,
+            .INTR => continue,
+            else => return 5,
+        };
+    }
+
+    fn stop(clients: *IdleClients, graceful: bool) !void {
+        if (clients.control < 0) return;
+        if (!graceful) _ = c.kill(clients.pid, .KILL);
+        close(clients.control);
+        clients.control = -1;
+        var status: c_int = undefined;
+        while (true) {
+            const result = c.waitpid(clients.pid, &status, 0);
+            if (std.posix.errno(result) == .INTR) continue;
+            try check(result);
+            if (graceful) try testing.expectEqual(@as(c_int, 0), status);
+            return;
+        }
+    }
+};
+
 test "event loop holds 10000 idle connections without creating threads" {
     if (!rt.supported) return error.SkipZigTest;
     const count = 10_000;
     var limits: c.rlimit = undefined;
     try check(c.getrlimit(.NOFILE, &limits));
-    const required = count * 2 + 100;
+    const required = count + 100;
     var raised = false;
     if (limits.cur < required) {
         if (limits.max < required or c.setrlimit(.NOFILE, &.{ .cur = required, .max = limits.max }) != 0)
@@ -292,27 +362,25 @@ test "event loop holds 10000 idle connections without creating threads" {
     }
     defer if (raised) check(c.setrlimit(.NOFILE, &limits)) catch unreachable;
 
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var endpoint = try Endpoint.localUnix(tmp);
+    const listener = try endpoint.listen();
+    var owns_listener = true;
+    defer if (owns_listener) close(listener);
+    var clients = try IdleClients.start(&endpoint, listener, count);
+    defer clients.stop(false) catch {};
+
     const pool = try jobs.Pool.init(testing.allocator, testing.io, .{ .workers = 1 });
     defer pool.deinit();
     var echo: Echo = .{};
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
     const before = try Usage.sample();
     const loop = try rt.Loop.init(testing.allocator, pool, echo.handler(), .{ .max_connections = count });
     defer loop.deinit();
-    var endpoint = try Endpoint.localUnix(tmp);
-    try endpoint.bind(loop);
-    const clients = try testing.allocator.alloc(Fd, count);
-    defer testing.allocator.free(clients);
-    var connected: usize = 0;
-    defer for (clients[0..connected]) |fd| close(fd);
-    while (connected < count) {
-        clients[connected] = try endpoint.connect();
-        connected += 1;
-        if (connected % 32 == 0) _ = try loop.step(0);
-    }
-    for (0..100) |_| {
-        if (loop.connectionCount() == count) break;
+    try loop.addListener(listener);
+    owns_listener = false;
+    const deadline = std.Io.Clock.awake.now(testing.io).nanoseconds + 5 * std.time.ns_per_s;
+    while (loop.connectionCount() < count and std.Io.Clock.awake.now(testing.io).nanoseconds < deadline) {
         _ = try loop.step(20);
     }
     try testing.expectEqual(@as(usize, count), loop.connectionCount());
@@ -325,4 +393,5 @@ test "event loop holds 10000 idle connections without creating threads" {
     try testing.expectEqual(before.threads, after.threads);
     loop.requestStop();
     try loop.run();
+    try clients.stop(true);
 }
