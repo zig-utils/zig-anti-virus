@@ -1,0 +1,74 @@
+name: Prefilter benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: '0.17.0-dev.1857+3c46da14d'
+
+jobs:
+  native:
+    name: E2 (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/clamav-db
+          key: clamav-db-${{ github.run_id }}
+          restore-keys: clamav-db-
+      - name: Prepare ClamAV inputs
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          python3 -m venv "$RUNNER_TEMP/cvd-tools"
+          "$RUNNER_TEMP/cvd-tools/bin/pip" install --quiet cvdupdate
+          mkdir -p "$HOME/clamav-db"
+          cvd="$RUNNER_TEMP/cvd-tools/bin/cvd"
+          "$cvd" config set --dbdir "$HOME/clamav-db"
+          "$cvd" update
+          mkdir -p "$RUNNER_TEMP/e2"
+          {
+            git rev-parse HEAD
+            zig version
+            uname -sr
+            lscpu
+            sha256sum "$HOME/clamav-db/main.cvd" "$HOME/clamav-db/daily.cvd" | sed 's|  .*/|  |'
+            for input in main daily; do
+              head -c 512 "$HOME/clamav-db/$input.cvd" | cut -d: -f1-6
+              printf '\n'
+            done
+          } | tee "$RUNNER_TEMP/e2/inputs.txt"
+      - name: Verify and materialize the B1 and B2 manifests
+        run: bun bench/fetch.ts B1 B2 --out "$RUNNER_TEMP/corpus"
+      - name: Build the full atom set and measure the PE partition
+        run: |
+          bench_dir="$RUNNER_TEMP/e2"
+          db="$RUNNER_TEMP/e2.zavdb"
+          zig build prefilter -Doptimize=ReleaseFast -- compile "$db" "$HOME/clamav-db/main.cvd" "$HOME/clamav-db/daily.cvd" 2>&1 | tee "$bench_dir/compile.txt"
+          core=$(awk '/^Cpus_allowed_list:/ {split($2, ids, /[-,]/); print ids[1]}' /proc/self/status)
+          printf 'Pinned CPU %s\n' "$core" | tee -a "$bench_dir/inputs.txt"
+          for corpus in B1 B2; do
+            taskset -c "$core" ./zig-out/bin/prefilter stages "$db" "$RUNNER_TEMP/corpus/$corpus" --partition 1 --rounds 5 2>&1 | tee "$bench_dir/$corpus.txt"
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2-${{ matrix.arch }}
+          path: ${{ runner.temp }}/e2/

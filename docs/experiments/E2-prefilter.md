@@ -142,6 +142,22 @@ Both kernels recorded 18,565.9 probes and 509 verifies per MB. The stride-one
 gate passed 0.83% of positions. Both runs fell short of the 1 GB/s target for
 the two stages together. Real-corpus x86_64 and clamd measurements remain open.
 
+### Hosted measurements
+
+The manual `Prefilter benchmark` workflow measures B1 and B2 separately on
+native Linux x86_64 and aarch64 runners. It pins each benchmark process to one
+allowed logical CPU and records the CPU topology, Zig version, commit, and CVD
+checksums. The timed stage-one-plus-two loop uses the same disabled telemetry
+setting as a normal scan. A separate pass records candidate and probe counts.
+Earlier tables include the cost of collecting those counters during the timed
+pass. The workflow uploads measurements only. Compare CVD checksums when
+interpreting results from the two runners.
+
+A local run with this timing method over combined B1 and B2 measured 850.9 MB/s
+for the ARM crypto kernel and 850.1 MB/s for the ARM baseline through stages
+one and two. The candidate, probe and verify counts per MB matched the previous
+combined run. The 1 GB/s target remains unmet on this ARM measurement.
+
 ## Against the other designs
 
 The alternatives were measured in zig-regex (docs/BENCHMARKS.md, binary literal sets of 100k

@@ -409,21 +409,12 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
             }
             m.best1 = @min(m.best1, nsSince(io, t));
             t = now(io);
-            var sink: CountSink = .{};
-            m.stats = .{};
-            for (datas.items) |d| {
-                const part = index.partitionFor(targetOf(d)) orelse continue;
-                var pos: usize = 0;
-                while (pos < d.len) {
-                    const n, const next = pf.stage1With(kern.run, part, d, pos, &ring);
-                    pos = next;
-                    m.stats.candidates += n;
-                    _ = pf.stage2(part, d, ring[0..n], &sink, &m.stats);
-                }
-            }
+            const checksum = probeCorpus(&index, datas.items, kern, &ring, null);
             m.best12 = @min(m.best12, nsSince(io, t));
-            std.mem.doNotOptimizeAway(sink.n);
+            std.mem.doNotOptimizeAway(checksum);
         }
+        // Gather diagnostic counts separately so timed scans use the production path.
+        _ = probeCorpus(&index, datas.items, kern, &ring, &m.stats);
     }
     var gate_pass: u64 = 0;
     var gate_pos: u64 = 0;
@@ -490,6 +481,21 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
         std.debug.print("stage 1 [{s}]:    {d:.1} MB/s per core, {d:.1} candidates per MB\n", .{ kern.name, mb / (@as(f64, @floatFromInt(m.best1)) / 1e9), @as(f64, @floatFromInt(m.cands)) / mb });
         std.debug.print("stages 1+2 [{s}]: {d:.1} MB/s per core, {d:.1} probes and {d:.1} verifies per MB\n", .{ kern.name, mb / (@as(f64, @floatFromInt(m.best12)) / 1e9), @as(f64, @floatFromInt(m.stats.probes)) / mb, @as(f64, @floatFromInt(m.stats.verifies)) / mb });
     }
+}
+
+fn probeCorpus(index: *const bodyscan.BodyIndex, datas: []const []u8, kern: *const pf.Kernel, ring: *[pf.ring_len]pf.Candidate, stats: ?*pf.Stats) u64 {
+    var sink: CountSink = .{};
+    for (datas) |data| {
+        const part = index.partitionFor(targetOf(data)) orelse continue;
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const n, const next = pf.stage1With(kern.run, part, data, pos, ring);
+            pos = next;
+            if (stats) |s| s.candidates += n;
+            _ = pf.stage2(part, data, ring[0..n], &sink, stats);
+        }
+    }
+    return sink.n;
 }
 
 fn diff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
