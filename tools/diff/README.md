@@ -79,6 +79,19 @@ case messages and all 2,752 messages in the manifest-backed S1 corpus using the
 case's signatures. The named-attachment path and the zig-mime evasion fixtures
 are covered in `src/fmt/mime.zig`.
 
+### Inline JavaScript
+
+The HTML `javascript` form folds ASCII case after normalization. In the native
+ClamAV 1.5.4 comparison, `let` and `const` declarations keep their names while
+`var` declarations use numbered names. The regular-expression, string literal,
+property, and declaration tests preserve those observed bytes.
+
+On 674 script-bearing pages derived from the B1 manifest, the strict comparison
+improved from 1 to 29 byte-identical JavaScript outputs. Both other HTML forms
+agreed on all pages. The remaining examples include differences in function
+parameter numbering and comment handling, so the JavaScript comparison still
+fails with `--strict-js`.
+
 ### Named HTML references
 
 `src/fmt/html_named_refs.zig` contains the 743 names recognised by the official

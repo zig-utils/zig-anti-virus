@@ -10,7 +10,7 @@
 //! - `unescape("...")` of a literal is decoded (%XX and %uXXXX), and
 //!   `String.fromCharCode(n, ...)` of numeric literals becomes the string it builds; both then
 //!   take part in folding;
-//! - identifiers declared with var, let, const, function names and function parameters are
+//! - identifiers declared with var, function names and function parameters are
 //!   renamed in order of declaration to n000, n001, ... wherever they appear later (not after a
 //!   `.`, where they are property names).
 //!
@@ -41,6 +41,7 @@ const Prev = enum { none, operand, dot, other };
 
 pub const Normalizer = struct {
     out: Output,
+    fold_ascii_case: bool = false,
     // Output buffering.
     obuf: [4096]u8 = undefined,
     olen: usize = 0,
@@ -87,6 +88,11 @@ pub const Normalizer = struct {
 
     pub fn init(out: Output) Normalizer {
         return .{ .out = out };
+    }
+
+    /// libclamav's HTML `javascript` file stores ASCII lowercase output.
+    pub fn initHtml(out: Output) Normalizer {
+        return .{ .out = out, .fold_ascii_case = true };
     }
 
     pub fn feed(n: *Normalizer, data: []const u8) Error!void {
@@ -359,7 +365,7 @@ pub const Normalizer = struct {
     }
 
     fn declKeyword(n: *Normalizer, t: []const u8) Error!void {
-        if (std.mem.eql(u8, t, "var") or std.mem.eql(u8, t, "let") or std.mem.eql(u8, t, "const")) {
+        if (std.mem.eql(u8, t, "var")) {
             n.decl = .var_next;
             n.var_depth = n.depth;
         } else if (std.mem.eql(u8, t, "function")) {
@@ -596,7 +602,9 @@ pub const Normalizer = struct {
 
     fn flushOut(n: *Normalizer) Error!void {
         if (n.olen == 0) return;
-        try n.out.write(n.out.ctx, n.obuf[0..n.olen]);
+        const chunk = n.obuf[0..n.olen];
+        if (n.fold_ascii_case) _ = std.ascii.lowerString(chunk, chunk);
+        try n.out.write(n.out.ctx, chunk);
         n.olen = 0;
     }
 };
@@ -747,7 +755,7 @@ test "scripts in HTML and PDF reach the normaliser as js children" {
     var rig: scan.TestRig = undefined;
     try rig.init(.{});
     defer rig.deinit();
-    try rig.scanBoth("<html><body><script>var p = 'ev' + 'al'; window[p]('1');</script></body></html>", "p.html");
+    try rig.scanBoth("<html><body><script>var P = 'EV' + 'AL'; window[P]('1');</script></body></html>", "p.html");
     const want = "var n000=\"eval\";window[n000](\"1\");";
     var crc = std.hash.Crc32.init();
     crc.update(want);

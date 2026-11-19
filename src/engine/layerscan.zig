@@ -566,7 +566,7 @@ pub const JavascriptFile = struct {
         j.scripts += 1;
         j.tail_len = 0;
         try j.write("<script>");
-        j.js = .init(.{ .ctx = j, .write = jsOut });
+        j.js = .initHtml(.{ .ctx = j, .write = jsOut });
     }
 
     fn data(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
@@ -611,6 +611,21 @@ fn textType(data: []const u8) types.ClType {
 }
 
 // Tests --------------------------------------------------------------------------------------------
+
+test "HTML JavaScript lowercases output and keeps const and let names" {
+    const s = try Scanner.init(std.testing.allocator, std.testing.io);
+    defer s.deinit();
+    try s.normalizeHtml(
+        "<html><script>Object.defineProperty(window, \"Caps\", {value: \"ABC\"});console.Log(/AB+/g);</script>" ++
+            "<script>const LOWER = \"TEST\"; let UPPER = LOWER; var Mixed = UPPER; Use(Mixed);</script></html>",
+    );
+    // Observed with the official ClamAV 1.5.4 binary on the two scripts.
+    try std.testing.expectEqualStrings(
+        "<script>object.defineproperty(window,\"caps\",{value:\"abc\"});console.log(/ab+/g);</script>\n" ++
+            "<script>const lower=\"test\";let upper=lower;var n000=upper;use(n000);</script>",
+        s.forms[2].items,
+    );
+}
 
 fn testEngine(tmp: *std.testing.TmpDir, files: []const [2][]const u8) !Engine {
     const Compiler = @import("../compile/compiler.zig").Compiler;

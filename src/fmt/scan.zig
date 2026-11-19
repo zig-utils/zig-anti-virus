@@ -450,7 +450,7 @@ const HtmlSink = struct {
                     s.open = true;
                 } else try s.jsOut("\n");
                 try s.jsOut("<script>");
-                s.js.?.* = .init(.{ .ctx = s, .write = jsWrite });
+                s.js.?.* = .initHtml(.{ .ctx = s, .write = jsWrite });
             },
         }
     }
