@@ -648,6 +648,13 @@ test "HTML JavaScript strips unknown punctuators between tokens" {
     try std.testing.expectEqualStrings("<script>var n000=1;route(hello ${n000}!);foo bar;foo bar;source print(\"`#@~\");</script>", s.forms[2].items);
 }
 
+test "HTML JavaScript maps whitespace and NUL bytes after string folding" {
+    const s = try Scanner.init(std.testing.allocator, std.testing.io);
+    defer s.deinit();
+    try s.normalizeHtml("<html><script>output(\"A\\nB\\t C \" + \"\\r \\f\");output(\"first\tline\ncontinued\rlast\");output(unescape(\"%00%09%08\"));</script></html>");
+    try std.testing.expectEqualStrings("<script>output(\"a b  c    \");output(\"first line continued last\");output(\"\x01 \x08\");</script>", s.forms[2].items);
+}
+
 fn testEngine(tmp: *std.testing.TmpDir, files: []const [2][]const u8) !Engine {
     const Compiler = @import("../compile/compiler.zig").Compiler;
     var c = Compiler.init(std.testing.allocator);

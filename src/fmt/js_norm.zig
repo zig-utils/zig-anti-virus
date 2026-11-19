@@ -324,7 +324,7 @@ pub const Normalizer = struct {
                 } else if (c == n.quote) {
                     n.lex = .start;
                     try n.endString();
-                } else if ((c == '\n' or c == '\r') and n.quote != '`') {
+                } else if (!n.html_output and (c == '\n' or c == '\r') and n.quote != '`') {
                     // An unterminated literal ends at the line break.
                     n.lex = .start;
                     try n.endString();
@@ -733,7 +733,13 @@ pub const Normalizer = struct {
     fn flushOut(n: *Normalizer) Error!void {
         if (n.olen == 0) return;
         const chunk = n.obuf[0..n.olen];
-        if (n.html_output) _ = std.ascii.lowerString(chunk, chunk);
+        if (n.html_output) for (chunk) |*byte_value| {
+            byte_value.* = switch (byte_value.*) {
+                0 => 1,
+                '\t'...'\r' => ' ',
+                else => std.ascii.toLower(byte_value.*),
+            };
+        };
         try n.out.write(n.out.ctx, chunk);
         n.olen = 0;
     }

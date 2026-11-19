@@ -122,14 +122,16 @@ At the end of a function, aliases from the enclosing scope are visible again.
 comments and strips `//` delimiters while tokenizing their text. Integer
 suffixes are separate tokens and decimal literals use six significant digits.
 The lexer skips backticks, `#`, `@`, and backslashes between tokens. It preserves
-them inside strings when the escape rules allow.
+them inside strings when the escape rules allow. The emitted HTML JavaScript
+form maps ASCII whitespace to spaces and NUL to byte `01`, including inside
+folded strings.
 
 On 674 script-bearing pages derived from the B1 manifest, function scoping
 and line-comment tokenization raised exact agreement from 29 to 86 pages.
-Numeric and punctuation handling raised it to 149 pages. Both other HTML
-forms agreed on all 674 pages. Remaining differences include slash handling
-in line comments and escaped line breaks in strings. The JavaScript comparison
-still fails with `--strict-js`.
+Numeric and punctuation handling raised it to 149 pages, and string whitespace
+raised it to 176. Both other HTML forms agreed on all 674 pages. Remaining
+differences include slash handling in line comments and spacing around `++`.
+The JavaScript comparison still fails with `--strict-js`.
 
 ### Named HTML references
 
