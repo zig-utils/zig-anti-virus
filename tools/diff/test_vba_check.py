@@ -46,6 +46,7 @@ if mode == "error":
 is_zav = sys.argv[1] == "scan"
 db = sys.argv[sys.argv.index("--sigs" if is_zav else "-d") + 1]
 files = sys.argv[sys.argv.index("--") + 1:] if is_zav else sys.argv[sys.argv.index("-d") + 2:]
+files = [f for f in files if not f.startswith("--cvdcertsdir=")]
 sigs = [line.split(":") for line in pathlib.Path(db).read_text().splitlines() if line]
 found = False
 for f in files:
@@ -73,7 +74,8 @@ sys.exit(int(found))
             cmd += ["--known", str(known)]
         cmd += [str(p) for p in (paths or [self.sample])]
         return subprocess.run(cmd, capture_output=True, text=True,
-                              env=dict(os.environ, PYTHONPATH=str(self.root), FAKE_MODE=mode))
+                              env=dict(os.environ, PYTHONPATH=str(self.root), FAKE_MODE=mode,
+                                       CLAMAV_CERTS=str(self.root / "certs")))
 
     def known(self):
         digest = hashlib.sha256(self.sample.read_bytes()).hexdigest()
