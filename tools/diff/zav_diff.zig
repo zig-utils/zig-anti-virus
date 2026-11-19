@@ -13,6 +13,8 @@
 //!       Scan files with a database compiled from signature files and print clamscan's line
 //!       format. --per-sig compiles every signature line on its own and reports all that match
 //!       (clamscan --allmatch); the default reports the first detection.
+//!   zav-diff members PATH...
+//!       Report the format walk, object sizes, CRC32 values and notices as JSON lines.
 //!
 //! Case files hold the grammar (see tools/diff/README.md):
 //!
@@ -395,6 +397,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "normalize")) return normalizeCmd(app, rest);
     if (std.mem.eql(u8, cmd, "types")) return typesCmd(app, rest);
     if (std.mem.eql(u8, cmd, "vba")) return vbaCmd(app, rest);
+    if (std.mem.eql(u8, cmd, "members")) return membersCmd(app, rest);
     if (std.mem.eql(u8, cmd, "roundtrip")) return roundtripCmd(app, rest);
     return usage(app);
 }
@@ -405,6 +408,7 @@ fn usage(app: App) !u8 {
         \\       zav-diff materialize --out DIR CASES...
         \\       zav-diff scan [--tmp DIR] [--per-sig] --sigs FILE... -- PATH...
         \\       zav-diff rejects FILE...
+        \\       zav-diff members PATH...
         \\
     );
     return 2;
@@ -975,6 +979,44 @@ fn vbaCmd(app: App, args: []const []const u8) !u8 {
             .parse = zav.fmt.scan.parse,
         };
         w.scan(.{ .memory = bytes }, std.fs.path.basename(path)) catch {};
+        scratch.reset();
+    }
+    return 0;
+}
+
+/// Walk each positional source with the scanner's normal limits. Keep notices beside the
+/// checksums so a partial extraction cannot be mistaken for a clean, complete comparison.
+fn membersCmd(app: App, paths: []const []const u8) !u8 {
+    if (paths.len == 0) return usage(app);
+    const engine = zav.engine;
+    const cwd = Io.Dir.cwd();
+    var scratch = try engine.scratch.Scratch.init(engine.scratch.default_reservation);
+    defer scratch.deinit();
+    var budget = engine.budget.Budget.init(64 * 1024 * 1024);
+    for (paths) |path| {
+        const file = try cwd.openFile(app.io, path, .{});
+        defer file.close(app.io);
+        const size = (try file.stat(app.io)).size;
+        var tracker = engine.limits.Tracker.init(.{});
+        var rec: engine.container.Recorder = .{ .gpa = app.gpa };
+        defer rec.deinit();
+        var walker: engine.container.Walker = .{
+            .io = app.io,
+            .scratch = &scratch,
+            .tracker = &tracker,
+            .budget = &budget,
+            .spill_dir = cwd,
+            .visitor = rec.visitor(),
+            .parse = zav.fmt.scan.parse,
+        };
+        walker.scan(.{ .file = .{ .file = file, .len = size } }, std.fs.path.basename(path)) catch {};
+        try std.json.Stringify.value(.{
+            .input = path,
+            .halt = walker.halt,
+            .objects = rec.objects.items,
+            .notices = rec.notices.items,
+        }, .{}, app.out);
+        try app.out.writeByte('\n');
         scratch.reset();
     }
     return 0;

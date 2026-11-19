@@ -79,6 +79,40 @@ case messages and all 2,752 messages in the manifest-backed S1 corpus using the
 case's signatures. The named-attachment path and the zig-mime evasion fixtures
 are covered in `src/fmt/mime.zig`.
 
+### Phase-three archive members
+
+`zav-diff members FILE...` walks positional sources through the format dispatcher
+with the default limits. Each JSON line lists the objects with their paths, sizes,
+and CRC32 checksums, plus any notices and the walk's stop reason. Use ClamAV 1.5.4
+with `--leave-temps --bytecode=no` and a signature that does not match the files.
+Compare extracted member sizes and CRC32 values with the retained temporary files.
+ClamAV also retains normalization artifacts, which should be excluded from member
+counts. For NSIS, compare the `nulsft-tmp.*` outputs with the immediate children of
+zav's `overlay` object. The parser walk checks extraction. The scan pipeline in
+[Guardian P6.03](https://github.com/zig-utils/zig-anti-virus/issues/61) covers
+end-to-end matching on the extracted children.
+
+| Input | Member comparison against ClamAV 1.5.4 |
+| --- | --- |
+| CAB, MSZIP and LZX fixtures | All 7 members agreed by size and CRC32. |
+| ISO 9660, primary, Joliet and Rock Ridge fixtures | All 9 file members agreed. zav also emitted the Joliet fixture's El Torito boot image. |
+| DMG, mixed-codec UDIF fixture | The 512-byte first partition agreed. The second was 31,744 bytes in zav and 20,480 in ClamAV. |
+| CHM, generated LZX fixture | zav emitted 6 file members. ClamAV recognized the format and retained no members. |
+| NSIS, generated deflate and bzip2 fixtures | All 16 immediate members agreed, including the installer headers. |
+| NSIS, generated LZMA fixtures | ClamAV retained one of four members for the non-solid case and none for the solid case. |
+
+On the [Python 3.10.11 Windows help file](https://www.python.org/downloads/release/python-31011/),
+all 554 nonempty CHM members from zav matched ClamAV's saved output and 7-Zip
+17.05 by size and CRC32. 7-Zip also emitted the zero-byte `#ITBITS` entry.
+The CHM's SHA-256 is `e66d2ce1b8a1cd16ae31e6f0e60ad1ce5edcf7851890bdee9333bfc52eb95561`.
+
+On the [Notepad++ 8.8.9 x64 installer](https://github.com/notepad-plus-plus/notepad-plus-plus/releases/tag/v8.8.9),
+zav matched all 256 immediate NSIS outputs retained by ClamAV. The parser also
+emitted an empty data block and descended into a nested ZIP. 7-Zip identifies
+the installer as solid LZMA. Its SHA-256 is
+`2dd5473736ef51e4340cae005e3fc8cdf0e42ec649bc6ed186484a79be409928`.
+Detection parity by format still needs a corpus run.
+
 ### Inline JavaScript
 
 The HTML `javascript` form folds ASCII case after normalization. ClamAV 1.5.4
