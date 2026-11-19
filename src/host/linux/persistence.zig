@@ -916,17 +916,19 @@ test "a baseline run followed by an added authorized key reports exactly that ke
     try writeUsers(&fx);
     const key1 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl ops@laptop\n";
     const key2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFXmP7X2g8sYVmHRsXHnYb5yVJjaJMdHaHiSVQxMkSl evil@box\n";
-    try fx.file("/home/alice/.ssh/authorized_keys", key1);
+    try fx.fileMode("/home/alice/.ssh/authorized_keys", key1, 0o600);
     try fx.dir("/state");
     var state = try fx.tmp.dir.openDir(std.testing.io, "state", .{});
     defer state.close(std.testing.io);
 
-    var first = scan.Scan.init(std.testing.allocator, fx.host(.linux), .{ .only = &.{"access.ssh_keys"}, .state_dir = state, .update_baseline = true, .context = .{ .role = .server } });
-    try first.runChecks(&checks);
-    try std.testing.expectEqual(@as(usize, 0), first.findings.items.len);
-    first.deinit();
+    {
+        var first = scan.Scan.init(std.testing.allocator, fx.host(.linux), .{ .only = &.{"access.ssh_keys"}, .state_dir = state, .update_baseline = true, .context = .{ .role = .server } });
+        defer first.deinit();
+        try first.runChecks(&checks);
+        try std.testing.expectEqual(@as(usize, 0), first.findings.items.len);
+    }
 
-    try fx.file("/home/alice/.ssh/authorized_keys", key1 ++ key2);
+    try fx.fileMode("/home/alice/.ssh/authorized_keys", key1 ++ key2, 0o600);
     var second = scan.Scan.init(std.testing.allocator, fx.host(.linux), .{ .only = &.{"access.ssh_keys"}, .state_dir = state, .context = .{ .role = .server } });
     defer second.deinit();
     try second.runChecks(&checks);
