@@ -118,10 +118,12 @@ jobs:
           db="$RUNNER_TEMP/db"
           python3 tools/diff/realdb.py gate --db $db/main --db $db/daily --out "$RUNNER_TEMP/gate"
           python3 tools/diff/gate.py --cvd "$HOME/clamav-db/main.cvd" --cvd "$HOME/clamav-db/daily.cvd" --db $db/main --db $db/daily --tmp "$RUNNER_TEMP/gz" --show 120 "$RUNNER_TEMP/gate"
+      - name: VBA differential checker regression tests
+        run: python3 -m unittest discover -s tools/diff -p test_vba_check.py
       - name: VBA source against olevba on generated OLE2 documents (P5.11)
         run: |
           python3 tools/diff/gen_vba.py "$RUNNER_TEMP/vba" --count 400
-          python3 tools/diff/vba_check.py "$RUNNER_TEMP/vba" src/fmt/fixtures/archive-macro.doc.bin src/fmt/fixtures/archive-macro.docm.bin
+          python3 tools/diff/vba_check.py --known tests/differential/known-vba.json "$RUNNER_TEMP/vba" src/fmt/fixtures/archive-macro.doc.bin src/fmt/fixtures/archive-macro.docm.bin
       - name: File typing against clamscan --debug on 10,000 system files (P4.13)
         run: |
           db="$RUNNER_TEMP/db"

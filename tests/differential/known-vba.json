@@ -1,0 +1,383 @@
+{
+  "description": "P5.11 generated VBA corpus: ClamAV 1.5.4 misses the selected macro signature in these exact documents; zav extracts source byte-identical to olevba and finds the expected signature. No engine detection is suppressed. Every entry must still occur exactly once, and both complete signature sets must match.",
+  "generator": "python3 tools/diff/gen_vba.py OUT --count 400 --seed 49",
+  "evidence": "Differential run 44407461144: 402 files, 1406/1406 module sources identical, 374 macro signatures, 327 found by both, 47 ClamAV misses. Reproduced with official ClamAV 1.5.4 on macOS. See zig-utils/zig-anti-virus#49. All 47 selected signatures are also found by ClamAV on the corresponding olevba-extracted source directly, confirming reader/exposure differences rather than wrong zav matches.",
+  "differences": [
+    {
+      "file": "v0011.doc",
+      "sha256": "0da8b5dc4a5de3bbbc95eb1fd78ac90629c5b6fe21f53d638f86654759270c9e",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.0da8b5dc4a5de3bbbc95eb1fd78ac90629c5b6fe21f53d638f86654759270c9e"
+      ]
+    },
+    {
+      "file": "v0022.doc",
+      "sha256": "9ea7ea341dc6d5772838efa4f7f215193733957ad4ca8c34fddf36c6cccd06dd",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.9ea7ea341dc6d5772838efa4f7f215193733957ad4ca8c34fddf36c6cccd06dd"
+      ]
+    },
+    {
+      "file": "v0043.doc",
+      "sha256": "c790a4d694c084a86305349e880bd3cdaa5d411a6e5534c9cd5cea2832d849b9",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.c790a4d694c084a86305349e880bd3cdaa5d411a6e5534c9cd5cea2832d849b9"
+      ]
+    },
+    {
+      "file": "v0045.doc",
+      "sha256": "6e3ff91cfb09bbe58dd3309d7431c24f89ea813dc983684befdc6cd74a054867",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.6e3ff91cfb09bbe58dd3309d7431c24f89ea813dc983684befdc6cd74a054867"
+      ]
+    },
+    {
+      "file": "v0053.doc",
+      "sha256": "f0cb3fde8b43b6eefaeb258456dbcd9a0cb7c54b04248dee45da70279034a2d6",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.f0cb3fde8b43b6eefaeb258456dbcd9a0cb7c54b04248dee45da70279034a2d6"
+      ]
+    },
+    {
+      "file": "v0054.doc",
+      "sha256": "b40f0c7e2939b05d4d3401dfce6ae4a7c8770f57b9ccee03683f8d9c6bbdb642",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.b40f0c7e2939b05d4d3401dfce6ae4a7c8770f57b9ccee03683f8d9c6bbdb642"
+      ]
+    },
+    {
+      "file": "v0058.doc",
+      "sha256": "c45a4e9f37603bf39799003d797367d40ee17a1d0f8a467d9758c6d2b6559df6",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.c45a4e9f37603bf39799003d797367d40ee17a1d0f8a467d9758c6d2b6559df6"
+      ]
+    },
+    {
+      "file": "v0064.doc",
+      "sha256": "70db0734a371bdecc1b894728197b80f5dda1dee5fe388ceddee330d0924e744",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.70db0734a371bdecc1b894728197b80f5dda1dee5fe388ceddee330d0924e744"
+      ]
+    },
+    {
+      "file": "v0083.doc",
+      "sha256": "dc47e238f41bc8d73ba2b22d6014ba83007e1c6e9848a5325b15266257eb60aa",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.dc47e238f41bc8d73ba2b22d6014ba83007e1c6e9848a5325b15266257eb60aa"
+      ]
+    },
+    {
+      "file": "v0088.doc",
+      "sha256": "70280ab41b210dc9132eba7722e35bc08c2f7380158f064416a5f1d29c2a4c4a",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.70280ab41b210dc9132eba7722e35bc08c2f7380158f064416a5f1d29c2a4c4a"
+      ]
+    },
+    {
+      "file": "v0096.doc",
+      "sha256": "4172f6a0dae3fcdde139b99f1b69823c97f5a5850a14c8940191af131a3fd305",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.4172f6a0dae3fcdde139b99f1b69823c97f5a5850a14c8940191af131a3fd305"
+      ]
+    },
+    {
+      "file": "v0097.doc",
+      "sha256": "78b91a54d3664576cdbadf0284a786d8445c489c1bb3136e065e974a8a20f8d4",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.78b91a54d3664576cdbadf0284a786d8445c489c1bb3136e065e974a8a20f8d4"
+      ]
+    },
+    {
+      "file": "v0099.doc",
+      "sha256": "3b3c546a34969807148932e000d36acb77e29dd632e558ed6cfc12c876133ef6",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.3b3c546a34969807148932e000d36acb77e29dd632e558ed6cfc12c876133ef6"
+      ]
+    },
+    {
+      "file": "v0122.doc",
+      "sha256": "732be0d01ce97c9b1433833f07d1a875dcdfdea345b863f9b1026c418b44119f",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.732be0d01ce97c9b1433833f07d1a875dcdfdea345b863f9b1026c418b44119f"
+      ]
+    },
+    {
+      "file": "v0136.doc",
+      "sha256": "b3a43fe8f3823d56c5b40c89a6850559c628c79385aea29a027e0bf340cb54b0",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.b3a43fe8f3823d56c5b40c89a6850559c628c79385aea29a027e0bf340cb54b0"
+      ]
+    },
+    {
+      "file": "v0143.doc",
+      "sha256": "e60235695abc99778b16d965a14bf14067cedf7b063f5b5d22212fa4c5a20a47",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.e60235695abc99778b16d965a14bf14067cedf7b063f5b5d22212fa4c5a20a47"
+      ]
+    },
+    {
+      "file": "v0146.doc",
+      "sha256": "1880c1377b1707769573f9aae868402e39945ded1389b903209858ae9ed054a2",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.1880c1377b1707769573f9aae868402e39945ded1389b903209858ae9ed054a2"
+      ]
+    },
+    {
+      "file": "v0154.doc",
+      "sha256": "b3325dcaeae352d27f39318610670ee125b9d89437b1296e27ec6bdc6a5e203c",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.b3325dcaeae352d27f39318610670ee125b9d89437b1296e27ec6bdc6a5e203c"
+      ]
+    },
+    {
+      "file": "v0159.doc",
+      "sha256": "0b5130e00dbafebdf8ed1cc6f8525377528fd463140dd220f58349c11cf6b955",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.0b5130e00dbafebdf8ed1cc6f8525377528fd463140dd220f58349c11cf6b955"
+      ]
+    },
+    {
+      "file": "v0165.doc",
+      "sha256": "fc0eef2de05e7628996524d8d436503e575b2795e4f6221cbce3ff026d68adc9",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.fc0eef2de05e7628996524d8d436503e575b2795e4f6221cbce3ff026d68adc9"
+      ]
+    },
+    {
+      "file": "v0168.doc",
+      "sha256": "3544004c7df5d00d24ff564385326781c4e696d5b0b6c0d965547613cd80eac0",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.3544004c7df5d00d24ff564385326781c4e696d5b0b6c0d965547613cd80eac0"
+      ]
+    },
+    {
+      "file": "v0188.doc",
+      "sha256": "7cb54afac48942d591fbb5a07f3f842fad2f396c6a4e37cc7b8c910632f58cca",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.7cb54afac48942d591fbb5a07f3f842fad2f396c6a4e37cc7b8c910632f58cca"
+      ]
+    },
+    {
+      "file": "v0193.doc",
+      "sha256": "9a59ef8b6aff16006a3b7c1839269f3efc4a556771a1673539d439a3dbaced64",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.9a59ef8b6aff16006a3b7c1839269f3efc4a556771a1673539d439a3dbaced64"
+      ]
+    },
+    {
+      "file": "v0205.doc",
+      "sha256": "8077a3e1930e0d8f0c139b755c9f0abdb52cfdf04e788de4a8571401bc49a58a",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.8077a3e1930e0d8f0c139b755c9f0abdb52cfdf04e788de4a8571401bc49a58a"
+      ]
+    },
+    {
+      "file": "v0212.doc",
+      "sha256": "6a9c1073741c7f83afd0fc8f47168444bd1e7f6f5b19082249911ac9415a87f1",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.6a9c1073741c7f83afd0fc8f47168444bd1e7f6f5b19082249911ac9415a87f1"
+      ]
+    },
+    {
+      "file": "v0216.doc",
+      "sha256": "82a58c00d47dc58ddc9c9f9fad89147d4d44aa6db6423412ba64f47e66dde291",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.82a58c00d47dc58ddc9c9f9fad89147d4d44aa6db6423412ba64f47e66dde291"
+      ]
+    },
+    {
+      "file": "v0250.doc",
+      "sha256": "240ef6b96a4cfb7306eecce77f3fe3965afe75319c49e6c909e5e9ce14b0c6a3",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.240ef6b96a4cfb7306eecce77f3fe3965afe75319c49e6c909e5e9ce14b0c6a3"
+      ]
+    },
+    {
+      "file": "v0256.doc",
+      "sha256": "9cbf11f344e9b92f9e8571f9c72cda24ec99d31cce79a758745b760b6fa7146a",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.9cbf11f344e9b92f9e8571f9c72cda24ec99d31cce79a758745b760b6fa7146a"
+      ]
+    },
+    {
+      "file": "v0272.doc",
+      "sha256": "b2bfcba185de8a98dfd54e0f4294077895c14eb64933709c86e541b6b54b4c10",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.b2bfcba185de8a98dfd54e0f4294077895c14eb64933709c86e541b6b54b4c10"
+      ]
+    },
+    {
+      "file": "v0274.doc",
+      "sha256": "fbf246c833c1e5849d4780ff63e1c77acd48a1835541666946e6e5e6ca1fb95d",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.fbf246c833c1e5849d4780ff63e1c77acd48a1835541666946e6e5e6ca1fb95d"
+      ]
+    },
+    {
+      "file": "v0283.doc",
+      "sha256": "101155a53132d8da6bded1be24ab8f58c54ec720978673af0b05f17b9526652c",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.101155a53132d8da6bded1be24ab8f58c54ec720978673af0b05f17b9526652c"
+      ]
+    },
+    {
+      "file": "v0292.doc",
+      "sha256": "8212880710260e35f426f90f748e8d3eff5beabfa507aaaf63a5fc6772efcaf1",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.8212880710260e35f426f90f748e8d3eff5beabfa507aaaf63a5fc6772efcaf1"
+      ]
+    },
+    {
+      "file": "v0304.doc",
+      "sha256": "6b4d692fd80490e117fef925deb18afd7c9a7f0cf9ed2f87a980c682c8ebc08a",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.6b4d692fd80490e117fef925deb18afd7c9a7f0cf9ed2f87a980c682c8ebc08a"
+      ]
+    },
+    {
+      "file": "v0314.doc",
+      "sha256": "128759aa69285349e743391c7b9914fb36c221df7731302a4f2f4a8910b7c8e9",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.128759aa69285349e743391c7b9914fb36c221df7731302a4f2f4a8910b7c8e9"
+      ]
+    },
+    {
+      "file": "v0320.doc",
+      "sha256": "899d67bdcbfd37763acd44177377238dc6e4fb2ad397754b27a72860732448b0",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.899d67bdcbfd37763acd44177377238dc6e4fb2ad397754b27a72860732448b0"
+      ]
+    },
+    {
+      "file": "v0324.doc",
+      "sha256": "a180c75ebc0a79ba41e521246841f6f17d743c051394ee5c0f22ecddfbeb994e",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.a180c75ebc0a79ba41e521246841f6f17d743c051394ee5c0f22ecddfbeb994e"
+      ]
+    },
+    {
+      "file": "v0327.doc",
+      "sha256": "e6ad79b9076c20f9ea62a214f02b2a88bc38224ce161591db444a72f827372e6",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.e6ad79b9076c20f9ea62a214f02b2a88bc38224ce161591db444a72f827372e6"
+      ]
+    },
+    {
+      "file": "v0336.doc",
+      "sha256": "c9773b2273cc7313cfb2e481b13a17dbfb5de49809f5245a6d27c49602467a51",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.c9773b2273cc7313cfb2e481b13a17dbfb5de49809f5245a6d27c49602467a51"
+      ]
+    },
+    {
+      "file": "v0338.doc",
+      "sha256": "e33bfa746e0f9b19ab37df93a36c1d2e88dbd3724ed640e707a1ec263a020eb0",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.e33bfa746e0f9b19ab37df93a36c1d2e88dbd3724ed640e707a1ec263a020eb0"
+      ]
+    },
+    {
+      "file": "v0341.doc",
+      "sha256": "fa8c340d834f4fcf5a438802dd6da6f32c912aeaf1e36aefbf7ee94ac836eeaf",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.fa8c340d834f4fcf5a438802dd6da6f32c912aeaf1e36aefbf7ee94ac836eeaf"
+      ]
+    },
+    {
+      "file": "v0350.doc",
+      "sha256": "148bbb765b51df2cfb7d160a6986572376f47644afb6dae47fd468651b1bef30",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.148bbb765b51df2cfb7d160a6986572376f47644afb6dae47fd468651b1bef30"
+      ]
+    },
+    {
+      "file": "v0355.doc",
+      "sha256": "e0373cf4cdeae71455a7c1fa95d5b6c01328a9acffa908bbedc40e3ded1d7b38",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.e0373cf4cdeae71455a7c1fa95d5b6c01328a9acffa908bbedc40e3ded1d7b38"
+      ]
+    },
+    {
+      "file": "v0357.doc",
+      "sha256": "5ff3444f2c62d87c17320e416889d400869d96db71abc3381d22867acc26001b",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.5ff3444f2c62d87c17320e416889d400869d96db71abc3381d22867acc26001b"
+      ]
+    },
+    {
+      "file": "v0390.doc",
+      "sha256": "3416fbe43a8623de7363c4916bb1858796a05f671a3024b495f739075037f400",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.3416fbe43a8623de7363c4916bb1858796a05f671a3024b495f739075037f400"
+      ]
+    },
+    {
+      "file": "v0392.doc",
+      "sha256": "37bbb39c54f80bae77a67d6547276051d427f6a434b3d90e3fe8ef4c71f3e2b5",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.37bbb39c54f80bae77a67d6547276051d427f6a434b3d90e3fe8ef4c71f3e2b5"
+      ]
+    },
+    {
+      "file": "v0397.doc",
+      "sha256": "9d498214131b2270bc5e6a35175b6e7183b178acda347cca36d00c7ab6aec629",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.9d498214131b2270bc5e6a35175b6e7183b178acda347cca36d00c7ab6aec629"
+      ]
+    },
+    {
+      "file": "v0398.doc",
+      "sha256": "ee73ec3d286696a910d5c176f580ed06aff5222788de2998c68bde64bb861f65",
+      "clamscan": [],
+      "zav": [
+        "Diff.Macro.ee73ec3d286696a910d5c176f580ed06aff5222788de2998c68bde64bb861f65"
+      ]
+    }
+  ]
+}

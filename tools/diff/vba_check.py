@@ -12,12 +12,17 @@ with the Python that has oletools. Exit 0 when every module agrees.
 
 With --clamscan, macro signatures are checked too: one .ndb signature per file, 16 random
 characters from a string literal in one of its modules, and clamscan and zav-diff scan must both
-report exactly that file's signature. The signatures use target type 0 (`--target`): libclamav
+report exactly that file's signature. --known accepts only the exact named, content-pinned
+scanner differences in its JSON file; missing/stale entries and new differences fail.
+The signatures use target type 0 (`--target`): libclamav
 matches module sources with target 2 only when its legacy reader understands _VBA_PROJECT, and
 otherwise scans the dumped project as a script, where target-0 signatures still apply.
 """
 import argparse
+import hashlib
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -29,7 +34,8 @@ def files_under(paths):
         if os.path.isfile(p):
             yield p
         else:
-            for d, _, names in os.walk(p):
+            for d, dirs, names in os.walk(p):
+                dirs.sort()
                 for n in sorted(names):
                     yield os.path.join(d, n)
 
@@ -42,25 +48,36 @@ def main():
     ap.add_argument("--certs", default=os.environ.get("CLAMAV_CERTS"))
     ap.add_argument("--work", default=".zav-diff-vba")
     ap.add_argument("--target", default="0")
+    ap.add_argument("--known", help="JSON file of exact, content-pinned macro scan differences")
+    ap.add_argument("--timeout", type=float, default=120, help="seconds per scanner invocation")
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args()
-    files = list(files_under(args.paths))
+    if args.timeout <= 0:
+        ap.error("--timeout must be positive")
+    if args.known and not args.clamscan:
+        ap.error("--known requires --clamscan")
+    files = list(dict.fromkeys(os.path.abspath(f) for f in files_under(args.paths)))
+    if not files:
+        ap.error("no input files")
     zav = {}
-    out = subprocess.run([args.zav_diff, "vba"] + files, stdout=subprocess.PIPE, check=True).stdout.decode()
+    out = run_tool([args.zav_diff, "vba"] + files, args.timeout, (0,)).decode()
     for line in out.splitlines():
         f, stream, hexsrc = line.split("\t")
         zav[(f, stream.rsplit("/", 1)[-1])] = bytes.fromhex(hexsrc)
     ole = {}
     for f in files:
+        vp = None
         try:
             vp = VBA_Parser(f)
             if not vp.detect_vba_macros():
                 continue
             for _, stream, _, code in vp.extract_macros():
                 ole[(f, stream.replace("\\", "/").rsplit("/", 1)[-1])] = code.encode("cp1252", "replace") if isinstance(code, str) else code
-            vp.close()
         except Exception as e:  # olevba refuses the file: count it, zav's view stands alone
             ole[(f, "(olevba error)")] = repr(e).encode()
+        finally:
+            if vp is not None:
+                vp.close()
     shown = agree = 0
     keys = sorted(set(zav) | set(ole))
     for k in keys:
@@ -79,46 +96,117 @@ def main():
     return 0 if ok else 1
 
 
+def run_tool(cmd, timeout, allowed):
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=dict(os.environ, LC_ALL="C"), timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("%s timed out after %g seconds" % (cmd[0], timeout)) from e
+    if result.returncode not in allowed:
+        raise RuntimeError("%s exited %d: %s" % (cmd[0], result.returncode,
+                           result.stderr.decode("utf-8", "replace").strip()))
+    return result.stdout
+
+
+def scan_results(cmd, files, timeout, unofficial=False):
+    out = run_tool(cmd, timeout, (0, 1))
+    results = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        # Both tools print one OK or one or more FOUND lines per input. ERROR, LIMITED,
+        # unknown paths and missing output must not be mistaken for clean verdicts.
+        match = re.fullmatch(r"(.+): (OK|(.+) FOUND)", line)
+        if not match:
+            raise RuntimeError("invalid scanner result: " + line)
+        path = os.path.abspath(match.group(1))
+        if path not in files:
+            raise RuntimeError("scanner reported an unknown input: " + path)
+        name = match.group(3)
+        if name is None:
+            if path in results:
+                raise RuntimeError("duplicate scanner verdict: " + path)
+            results[path] = set()
+        else:
+            if path in results and not results[path]:
+                raise RuntimeError("conflicting scanner verdicts: " + path)
+            if unofficial:
+                if name.endswith(".UNOFFICIAL"):
+                    name = name[:-11]
+            results.setdefault(path, set()).add(name)
+    missing = set(files) - results.keys()
+    if missing:
+        raise RuntimeError("scanner omitted inputs: " + ", ".join(sorted(missing)))
+    return results
+
+
+def known_differences(path):
+    if not path:
+        return {}
+    with open(path) as fh:
+        data = json.load(fh)
+    known = {}
+    for entry in data["differences"]:
+        key = (entry["file"], entry["sha256"])
+        if key in known or not re.fullmatch(r"[0-9a-f]{64}", key[1]):
+            raise ValueError("duplicate or invalid known difference: " + str(key))
+        known[key] = (set(entry["clamscan"]), set(entry["zav"]))
+    return known
+
+
 def signatures(args, files, ole):
-    import re
     os.makedirs(args.work, exist_ok=True)
-    want, lines = {}, []
-    for i, f in enumerate(files):
+    want, identities, lines = {}, {}, {}
+    for f in files:
+        with open(f, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        identities[f] = (os.path.basename(f), digest)
         mods = [v for (g, _), v in ole.items() if g == f]
         pieces = [m.group(1)[:16] for v in mods for m in re.finditer(rb'"([0-9a-z]{16,})"', v)]
+        want[f] = set()
         if not pieces:
             continue
-        name = "Diff.Macro.%d" % i
-        lines.append("%s:%s:*:%s" % (name, args.target, pieces[len(pieces) // 2].hex()))
-        want[os.path.basename(f)] = name
+        # Content identity keeps signatures stable when unrelated files are added or directories
+        # arrive in a different order. Full paths, rather than basenames, key scan verdicts.
+        name = "Diff.Macro." + digest
+        lines[name] = "%s:%s:*:%s" % (name, args.target, pieces[len(pieces) // 2].hex())
+        want[f] = {name}
     db = os.path.join(args.work, "macro.ndb")
+    if not lines:
+        raise RuntimeError("no macro signatures generated")
     with open(db, "w") as fh:
-        fh.write("\n".join(lines) + "\n")
-    found = re.compile(r"^(.*): (.+) FOUND$")
+        fh.write("\n".join(lines.values()) + "\n")
+    known = known_differences(args.known)
     cmd = [args.clamscan, "--no-summary", "--allmatch", "--bytecode=no", "-d", db]
     if args.certs:
         cmd.append("--cvdcertsdir=" + args.certs)
-    clam, zav = {}, {}
-    out = subprocess.run(cmd + files, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, LC_ALL="C")).stdout
-    for l in out.decode("utf-8", "replace").splitlines():
-        m = found.match(l)
-        if m:
-            clam.setdefault(os.path.basename(m.group(1)), set()).add(m.group(2).replace(".UNOFFICIAL", ""))
-    out = subprocess.run([args.zav_diff, "scan", "--tmp", os.path.join(args.work, "tmp"), "--sigs", db, "--"] + files, stdout=subprocess.PIPE).stdout
-    for l in out.decode("utf-8", "replace").splitlines():
-        m = found.match(l)
-        if m:
-            zav.setdefault(os.path.basename(m.group(1)), set()).add(m.group(2))
-    agree = 0
-    for f, name in sorted(want.items()):
-        c, z = clam.get(f, set()), zav.get(f, set())
-        if name in c and name in z:
-            agree += 1
-        else:
-            print("MACRO %s: expected %s, clamscan %s, zav %s" % (f, name, sorted(c), sorted(z)))
-    print("vba_check.py: macro signatures: %d files, %d detected by both" % (len(want), agree))
-    return agree == len(want)
+    clam = scan_results(cmd + files, files, args.timeout, unofficial=True)
+    zav = scan_results([args.zav_diff, "scan", "--tmp", os.path.join(args.work, "tmp"),
+                        "--sigs", db, "--"] + files, files, args.timeout)
+    agree = bad = 0
+    seen = set()
+    for f, expected in sorted(want.items()):
+        c, z = clam[f], zav[f]
+        key = identities[f]
+        if c == z == expected:
+            agree += bool(expected)
+            continue
+        # A known ClamAV miss cannot waive a wrong or missing zav detection. Compare the
+        # complete sets, including extra signatures, and require each exception exactly once.
+        if z == expected and key in known and known[key] == (c, z) and key not in seen:
+            seen.add(key)
+            continue
+        bad += 1
+        print("MACRO %s: expected %s, clamscan %s, zav %s" % (f, sorted(expected), sorted(c), sorted(z)))
+    for key in sorted(known.keys() - seen):
+        bad += 1
+        print("STALE known macro difference: %s sha256=%s" % key)
+    print("vba_check.py: macro signatures: %d files, %d detected by both, %d known differences" %
+          (sum(bool(names) for names in want.values()), agree, len(seen)))
+    return bad == 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, ValueError, KeyError) as e:
+        print("vba_check.py: " + str(e), file=sys.stderr)
+        sys.exit(1)
