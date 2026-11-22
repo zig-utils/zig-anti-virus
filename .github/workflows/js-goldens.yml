@@ -1,0 +1,45 @@
+name: JavaScript normaliser goldens
+
+# Records what the official ClamAV release's JavaScript normaliser writes (the `javascript` file
+# clamscan --leave-temps keeps) for probe pages and every script in the B1 corpus, and uploads
+# the pairs as an artifact. src/fmt/js_norm.zig is brought to parity with them black-box:
+# only outputs are kept, no ClamAV source is read. See tools/diff/js_goldens.py.
+
+on:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: '0.17.0-dev.1857+3c46da14d'
+  CLAMAV_VERSION: '1.5.4'
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
+          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb"
+          echo "CLAMSCAN=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')" >> "$GITHUB_ENV"
+          echo "CLAMAV_CERTS=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")" >> "$GITHUB_ENV"
+      - name: Pages
+        run: |
+          bun bench/fetch.ts B1 --out "$RUNNER_TEMP/corpus"
+          python3 tools/diff/js_goldens.py pages "$RUNNER_TEMP/pages" --probes --manifest bench/corpus/B1.json --corpus "$RUNNER_TEMP/corpus/B1"
+      - name: Record
+        run: python3 tools/diff/js_goldens.py record "$RUNNER_TEMP/goldens" "$RUNNER_TEMP/pages"
+      - name: Compare
+        run: |
+          zig build diff-tool -Doptimize=ReleaseSafe
+          python3 tools/diff/js_goldens.py compare "$RUNNER_TEMP/goldens" --show 30 || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: js-goldens
+          path: ${{ runner.temp }}/goldens
