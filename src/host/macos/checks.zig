@@ -453,9 +453,9 @@ test "live: macOS checks run on this host; a clean CI runner has no high or crit
     defer out.deinit();
     try s.writeJson(&out.writer, .{});
     try @import("../schema.zig").expectValid(std.testing.allocator, scan.report_schema, out.written());
-    // Only a CI runner is a known-clean image; developer machines carry real findings and other
-    // processes may install launchd jobs while the suite runs.
-    if (!@import("../host.zig").onCi()) return;
+    // Only a hosted CI runner is a known-clean image; developer machines and self-hosted runners
+    // carry real findings, and other processes may install launchd jobs while the suite runs.
+    if (!@import("../host.zig").onCleanCi()) return;
     var bad = false;
     for (s.findings.items) |f| if (f.severity.atLeast(.high)) {
         std.debug.print("macos on CI: {s} {t} {s} {?s}\n", .{ f.check, f.severity, f.title, f.subject });

@@ -130,19 +130,26 @@ fn mapError(e: anyerror) ReadError {
     };
 }
 
-/// True when running under CI (GitHub Actions and most others set CI=true). Live tests make
-/// clean-machine assertions only there: a developer machine is not a clean image, and other work
-/// running on it (agents, launchd jobs being installed) must not make the suite flaky.
-pub fn onCi() bool {
+/// True on a clean CI image: CI=true (GitHub Actions and most others set it) on a runner that is
+/// not self-hosted. Live tests make clean-machine assertions only there. A developer machine is
+/// not a clean image, and neither is a self-hosted runner (RUNNER_ENVIRONMENT=self-hosted, set by
+/// GitHub's own self-hosted runner and by ReviewOS's): it is long-lived, may run other work beside
+/// the job, and its job directories live under /tmp, so the build runner executing from there is a
+/// true `process.temp_exec` finding about the machine rather than a fault in the suite.
+pub fn onCleanCi() bool {
+    return envIs("CI", "true") and !envIs("RUNNER_ENVIRONMENT", "self-hosted");
+}
+
+fn envIs(comptime name: []const u8, comptime value: []const u8) bool {
     if (builtin.os.tag.isDarwin()) {
-        const v = std.c.getenv("CI") orelse return false;
-        return std.mem.eql(u8, std.mem.span(v), "true");
+        const v = std.c.getenv(name ++ "") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), value);
     }
     if (builtin.os.tag == .linux) {
         var buf: [64 * 1024]u8 = undefined;
         const env = std.Io.Dir.cwd().readFile(std.testing.io, "/proc/self/environ", &buf) catch return false;
         var it = std.mem.splitScalar(u8, env, 0);
-        while (it.next()) |kv| if (std.mem.eql(u8, kv, "CI=true")) return true;
+        while (it.next()) |kv| if (std.mem.eql(u8, kv, name ++ "=" ++ value)) return true;
     }
     return false;
 }

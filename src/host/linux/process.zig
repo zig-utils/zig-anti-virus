@@ -676,9 +676,9 @@ test "live: no subprocesses, and a renamed miner in /dev/shm is reported" {
 
     try std.testing.expect(hasFinding(&s, "process.miner", pid));
     try std.testing.expect(hasFinding(&s, "process.temp_exec", pid));
-    // Everything else on a clean CI image is quiet in the fast tier (developer machines are not
-    // clean images, so only CI asserts it).
-    for (s.findings.items) |f| if (f.pid != pid and @import("../host.zig").onCi()) {
+    // Everything else on a clean CI image is quiet in the fast tier (developer machines and
+    // self-hosted runners are not clean images, so only hosted CI asserts it).
+    for (s.findings.items) |f| if (f.pid != pid and @import("../host.zig").onCleanCi()) {
         std.debug.print("unexpected finding on a clean host: {s} {s} {?s}\n", .{ f.check, f.title, f.subject });
         return error.TestUnexpectedResult;
     };
