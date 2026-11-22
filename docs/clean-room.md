@@ -108,7 +108,7 @@ Known differences: two XDP/MHTML magics followed by a self-extractor marker in t
 (the first document type wins in clamscan); a disk image magic inside a fully formed RAR or
 PDF header; one OLE2 file that clamscan leaves as MSOLE2.
 
-## Text normaliser (`src/fmt/text_norm.zig`)
+## Text normalisation (`src/fmt/text_norm.zig`)
 
 - All 256 byte values between letters: 09-0D and 20 become one collapsed space, `A-Z` lower
   case, 21-7F kept, everything else dropped, and a dropped byte does not end a whitespace run
@@ -120,7 +120,7 @@ PDF header; one OLE2 file that clamscan leaves as MSOLE2.
   while its output plus one more page fits in 128 KiB (checked on seven ratios). On Apple
   silicon the page is 16 KiB, so rounds are counted in 16 KiB pages; on x86-64 Linux 4 KiB.
 
-## HTML normaliser (`src/fmt/html_norm.zig`, `src/fmt/html_named_refs.zig`)
+## HTML normalisation (`src/fmt/html_norm.zig`, `src/fmt/html_named_refs.zig`)
 
 - Chunks: a single space at offsets 8191, 16382, 24573 of a document without other
   whitespace is dropped, and with periodic whitespace the drop points move: a chunk is 8191
@@ -136,8 +136,8 @@ PDF header; one OLE2 file that clamscan leaves as MSOLE2.
   quoted value a second whitespace run leaves the value and a `>` after whitespace ends the
   tag (probes over every combination of quote, leading `>`, whitespace, `<i>` in values).
 - References: names from `html_named_refs.zig` (generated, below) decoded only with `;` (and
-  at the end of the input); numeric references with or without `;`, `x` anywhere switching to
-  hex, digits until the value would overflow 64 bits; code points below FF as one byte
+  at the end of the input); numeric references with or without `;`, `x` switching to hex while
+  the value is still 0, digits until the value would overflow 64 bits; code points below FF as one byte
   (lower-cased only after `;`), U+3002 U+FE52 U+FF0E as `.`, others as `&#xhhhh;`, values over
   FFFF reduced to 16 bits; unknown names written back in lower case (case-sensitive table).
 - notags: text only, every tag and reference a space, spaces collapsed; a reference there runs

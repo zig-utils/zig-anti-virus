@@ -127,6 +127,8 @@ pub const Normalizer = struct {
     /// A value has started with `data:` and the next byte decides.
     dpending: bool = false,
     data_escape: u8 = 0,
+    /// The data URI's `,` has been seen.
+    data_comma: bool = false,
     data_tail: [64]u8 = undefined,
     data_tail_len: usize = 0,
     /// After a data URI ended at `&`, its closing quote is dropped.
@@ -434,7 +436,7 @@ pub const Normalizer = struct {
                     }
                 }
                 if (n.nt_ref_numeric) {
-                    if (c == 'x' or c == 'X') {
+                    if (n.nt_ref_value == 0 and (c == 'x' or c == 'X')) {
                         n.nt_ref_hex = true;
                         break :blk true;
                     }
@@ -537,6 +539,25 @@ pub const Normalizer = struct {
                 n.data_escape = 2;
                 return;
             }
+            if (!n.data_comma) {
+                // Before the `,` (the media type) whitespace and `>` end the URI and count as
+                // tag syntax.
+                switch (c) {
+                    ',' => n.data_comma = true,
+                    ' ', '\t', '\n', 0x0b, 0x0c, '\r' => {
+                        n.data_uri = false;
+                        n.part = .between;
+                        n.tag_space = true;
+                        return;
+                    },
+                    '>' => {
+                        n.data_uri = false;
+                        return n.closeTag();
+                    },
+                    else => {},
+                }
+                return;
+            }
             switch (c) {
                 ' ', '\t', '\n', 0x0b, 0x0c, '\r', '>' => {
                     n.data_uri = false;
@@ -577,7 +598,8 @@ pub const Normalizer = struct {
                     n.endAttr();
                     n.part = .between;
                 }
-                if (n.part != .after_eq) n.tag_space = true;
+                // In the rest of a script or style end tag whitespace is skipped.
+                if (n.part != .after_eq and !n.raw_end_tag) n.tag_space = true;
                 return;
             },
             0 => return,
@@ -660,6 +682,7 @@ pub const Normalizer = struct {
         try n.nc.putAll("data");
         if (c == '>') return false;
         n.data_uri = true;
+        n.data_comma = false;
         n.data_escape = 0;
         n.data_tail_len = 0;
         n.capturing = false;
@@ -747,10 +770,9 @@ pub const Normalizer = struct {
                 n.state = .tag;
                 n.endAttr();
                 if (c == n.quote) {
-                    n.part = .between;
+                    // A `=` right after assigns the same attribute again.
+                    n.part = .attr;
                     n.tag_space = false;
-                    n.after_quote = true;
-                    n.attr_len = 0;
                     return;
                 }
                 n.drop_quote = n.quote;
@@ -914,7 +936,7 @@ pub const Normalizer = struct {
 
     fn rawByte(n: *Normalizer, c: u8) Error!void {
         // The byte after a `<` (whitespace skipped) cannot start an end tag.
-        if (n.raw_after_lt) return n.rawContent(c);
+        if (n.raw_after_lt or n.raw_decl) return n.rawContent(c);
         n.raw_held[n.raw_match] = c;
         switch (n.rawEndsWith(n.raw_held[0 .. n.raw_match + 1])) {
             .full => {
@@ -1020,7 +1042,8 @@ pub const Normalizer = struct {
             return true;
         }
         if (n.ref_numeric) {
-            if (c == 'x' or c == 'X') {
+            // `x` switches to hex while the value is still 0 (leading zeros allowed).
+            if (n.ref_value == 0 and (c == 'x' or c == 'X')) {
                 n.ref_hex = true;
                 return true;
             }
@@ -1161,6 +1184,8 @@ pub const Normalizer = struct {
         n.group_len = 0;
         if (n.state == .tag_open and !n.raw_end_open) try n.ncMarkup("<");
         if (n.state == .tag and n.data_uri and n.data_tail_len > 0) try n.nc.putAll(n.data_tail[0..n.data_tail_len]);
+        if (n.state == .tag_quoted and n.data_uri) try n.nc.put('"');
+        if (n.state == .tag_quoted and !n.data_uri and n.value_ws != 0) try n.nc.put(n.value_ws);
         if (n.state == .tag or n.state == .tag_quoted) {
             if (n.dpending) {
                 n.dpending = false;
