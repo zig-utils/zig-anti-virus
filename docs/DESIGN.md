@@ -229,6 +229,18 @@ A separate blob, because it updates on its own schedule and stays off the scan p
   - a CPE index
   - CVE metadata, including a KEV bit
 - **Inventory collectors:** dpkg, rpm, apk, Homebrew, pantry, lockfiles, pip, Go buildinfo, Cargo, macOS `Info.plist`.
+- **Signing and pinning:** an index compiled on the host from the public feeds is unsigned, and `zav audit` and `zav host` accept it as they always have. A distributor (the Guardian server) builds one index for all its hosts and signs it with the same 32-byte raw Ed25519 seed file that `zav rule-pack` takes:
+
+  ```sh
+  zav cve fetch --feeds feeds --nvd          # NVD_API_KEY, when set, raises NVD's rate limit
+  zav cve compile --feeds feeds --signing-key /private/seed --out cve.zavcve
+  zav audit --cve-index cve.zavcve --cve-key PUBLIC_KEY_HEX .
+  ```
+
+  - `--signing-key` writes the key id (the first 8 bytes of BLAKE3 over the public key) at header offset 288 and the Ed25519 signature over the header block at offset 296. A seed file that is not exactly 32 bytes is refused (exit 2, `InvalidSigningKey`) and nothing is written.
+  - `--cve-key` (on `audit` and `host`, 64 hex digits, repeatable) requires the index to be signed by one of those keys: an unsigned index fails with `Unsigned`, another signer with `UnknownKey`, a changed header with `BadSignature`, a changed body with `RootMismatch` or `SectionHashMismatch`, and a non-zero byte in the header's unsigned tail or the unused end of the section table with `UnsignedHeaderData`. With a key the whole body is hashed against the signed BLAKE3 root on every open (one sequential read of the index), because the header-only open check leaves bodies unverified. Each of these exits 2.
+  - Limit: the signature covers the first 296 header bytes, and those hold the section table only as its xxh3, which is not a cryptographic hash. A forged section table with a colliding xxh3 is not ruled out by the signature alone. Distributors should also bind the whole file with a signed digest (Guardian's signed manifest carries its SHA-256); a later format revision should sign a BLAKE3 of the section table instead.
+  - Without `--cve-key`, an unsigned index opens and a signed one fails with `UnknownKey`, exactly as before; a consumer of a distributed index always passes the key it pinned through its trusted channel.
 
 ## 5. Hot path for one file
 

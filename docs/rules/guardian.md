@@ -70,6 +70,10 @@ source version in the database header. The app must enforce its own persisted
 minimum version to prevent replay; signature validity alone does not prevent
 rollback to an older authentic pack.
 
+The same seed file signs the distributed CVE index (`zav cve compile
+--signing-key`), and hosts require it with `zav audit --cve-key PUBLIC_KEY_HEX`;
+see the CVE index section of [DESIGN.md](../DESIGN.md).
+
 ## Bundle format version 1
 
 The bounded source bundle is an in-memory view, never extracted to disk.
