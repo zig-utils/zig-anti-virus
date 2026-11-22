@@ -1,28 +1,40 @@
 //! The JavaScript normaliser (P5.13): lexical normalisation of scripts from HTML and PDF so that
-//! obfuscated code matches signatures written against the normalised form, as libclamav's
-//! js-norm describes it. It never evaluates code.
+//! obfuscated code matches signatures written against the normalised form. It never evaluates
+//! code. The HTML form reproduces the `javascript` file libclamav writes for a page; its rules
+//! were found black-box, from libclamav's outputs only (docs/clean-room.md, tools/diff/js_goldens.py).
 //!
-//! What it does, in one streaming pass with fixed memory:
+//! What it does, in one pass with fixed memory:
 //! - block comments and white space are removed; one space separates two word tokens;
-//!   the HTML form drops `//` and normalizes the remaining text as tokens;
-//! - string literals are decoded (\xHH, \uHHHH, octal and the single-letter escapes) and written
-//!   double-quoted, with `"` and `\` escaped;
+//! - string literals are decoded and written double-quoted;
 //! - adjacent string literals joined with `+` are folded into one (`"ev"+"al"` is `"eval"`);
-//! - `unescape("...")` of a literal is decoded (%XX and %uXXXX), and
-//!   standalone scripts also fold `String.fromCharCode(n, ...)` with numeric arguments;
-//! - identifiers declared with var, function names and function parameters are
-//!   numbered in declaration order within their active scope. Property names after `.` keep
-//!   their spelling.
+//! - `unescape("...")` of a literal is decoded (%XX and %uXXXX); standalone scripts also fold
+//!   `String.fromCharCode(n, ...)` with numeric arguments, HTML scripts replace `eval("...")`
+//!   by the tokens of its code;
+//! - names declared with var, function names (in the function's own scope) and parameters are
+//!   numbered in declaration order. A use refers to its scope's entry for the name, which a later
+//!   declaration in that scope (or, once the scope ends, in an enclosing one) also numbers, so
+//!   the output is held back until the script ends. Property names after `.` keep their spelling.
 //!
-//! Bounds: a folded string is flushed at `max_string` bytes, at most `max_names` identifiers are
-//! renamed, `String.fromCharCode` folds at most `max_args` arguments, and the caller limits the
-//! input to MaxScriptNormalize.
+//! The HTML form differs from the standalone one as libclamav's does: ASCII is lowercased; there
+//! are no regular expression literals; a `//` comment ends at the first space or line feed;
+//! control bytes, `#`, `@`, the backtick and bytes from 0x80 separate tokens and NUL vanishes;
+//! a backslash outside strings separates words with a space; strings end at the first quote not
+//! after a backslash, know no octal escapes and are written with their quotes and backslashes
+//! as they are; punctuation is written without spaces; and parentheses left open are closed.
+//!
+//! Bounds: a folded string is flushed at `max_string` bytes, at most `max_names` names are
+//! renamed, output beyond `defer_size` is renamed with what is known when it is written,
+//! `String.fromCharCode` folds at most `max_args` arguments, and the caller limits the input to
+//! MaxScriptNormalize.
 const std = @import("std");
 
 pub const max_string = 64 * 1024;
 pub const max_names = 4096;
 pub const max_args = 1024;
-const max_word = 128;
+/// Output held back for renaming; a longer script is renamed with what is known when it fills.
+pub const defer_size = 256 * 1024;
+/// libclamav has no limit on a word; zav keeps this much of one.
+const max_word = 64 * 1024;
 const max_functions = 64;
 
 pub const Output = struct {
@@ -32,9 +44,11 @@ pub const Output = struct {
 
 pub const Error = error{Stop};
 
-const Lex = enum { start, word, number, string, line_comment, block_comment, block_star, regex, regex_class, regex_flags, slash };
+const Lex = enum { start, word, number, string, line_comment, block_comment, block_star, regex, regex_class, regex_flags, slash, backslash };
 
-const TokKind = enum { word, number, string, punct, regex };
+/// `sep` is what a backslash leaves between HTML tokens: " " is a space, "" a space only
+/// before a word or number that would not get one, "-" nothing.
+const TokKind = enum { word, number, string, punct, regex, sep };
 
 /// Token classes the previous significant token can have, which decide whether `/` starts a
 /// regular expression and whether a word is a property name.
@@ -43,7 +57,11 @@ const Prev = enum { none, operand, dot, other };
 pub const Normalizer = struct {
     out: Output,
     html_output: bool = false,
-    // Output buffering.
+    // Output. Everything written is held in `dbuf` until the script ends (or the buffer fills),
+    // because a name's number is only known once its scope has seen every declaration: a
+    // marker byte 0 and a big-endian entry index stand for a name, 0 0xffff for a literal NUL.
+    dbuf: [defer_size]u8 = undefined,
+    dlen: usize = 0,
     obuf: [4096]u8 = undefined,
     olen: usize = 0,
     last_out: TokKind = .punct,
@@ -60,33 +78,71 @@ pub const Normalizer = struct {
     sbuf: [max_string]u8 = undefined,
     slen: usize = 0,
     regex_escape: bool = false,
+    /// A backslash ended a number (it then leaves a space whatever follows).
+    bs_after_number: bool = false,
+    soft_space: bool = false,
+    /// White space (or a backslash) came after the last word or number: a backslash then
+    /// leaves a space whatever follows.
+    ws_after_word: bool = false,
+    prev_wordy: bool = false,
+    prev_number: bool = false,
+    /// The byte before this one in an HTML string: a quote right after a backslash never ends
+    /// the string, not even after an escaped backslash (`'\\'` goes on).
+    raw_prev: u8 = 0,
+    /// The bytes of a \x or \u escape read so far (HTML output).
+    esc_buf: [4]u8 = undefined,
+    /// Parentheses still open (HTML output): libclamav closes them when the script ends.
+    open_parens: u32 = 0,
     prev: Prev = .none,
     // Folding: a pending string and whether a `+` followed it.
     pend: [max_string]u8 = undefined,
     pend_len: usize = 0,
     have_pend: bool = false,
     pend_plus: bool = false,
-    // Call folding: unescape("...") and String.fromCharCode(...).
+    // Call folding: unescape("..."), eval("...") and String.fromCharCode(...).
     call: Call = .idle,
+    call_dot: bool = false,
     call_str: [max_string]u8 = undefined,
     call_str_len: usize = 0,
+    /// `eval(` was held before an `unescape` call that may become its argument.
+    eval_open: bool = false,
+    /// The entry a held call's first word was declared as (`var unescape('%41')` declares).
+    held_entry: u16 = 0,
+    /// The same for `unescape` held inside `eval(`.
+    held_inner: u16 = 0,
+    /// An expanded eval also takes the `;` after its call.
+    drop_semicolon: bool = false,
+    expanding: bool = false,
+    eval_src: [max_string]u8 = undefined,
+    /// The word or number an eval's code left unfinished: it waits, unwritten, for the code of
+    /// the next eval, which continues it (`eval('c');eval('d=1')` writes `cd=1`).
+    eval_lex: Lex = .start,
+    eval_number: HtmlNumber = .integer,
+    eval_word: [1024]u8 = undefined,
+    eval_word_len: usize = 0,
     args: [max_args]u21 = undefined,
     nargs: usize = 0,
     // Declarations and renaming.
     names: [max_names]Name = undefined,
     nnames: usize = 0,
-    /// Open-addressing index over `names`: entry index + 1, 0 for empty.
+    /// Open-addressing index over the names of the open scopes: entry index + 1, 0 for empty.
     slots: [2 * max_names]u16 = @splat(0),
     name_bytes: [max_names * 16]u8 = undefined,
     name_used: usize = 0,
+    next_number: u32 = 0,
+    name_dot: bool = false,
     decl: Decl = .none,
-    depth: i32 = 0,
-    decl_depth: i32 = 0,
-    var_depth: i32 = 0,
+    /// Nesting of `{` (never below zero) and of `[`. Parentheses do not matter to declarations.
+    curly: i32 = 0,
+    square: i32 = 0,
+    /// The `[` nesting at the last name of a var list.
+    var_level: i32 = 0,
     functions: [max_functions]Function = undefined,
     function_count: u8 = 0,
     rename_disabled: bool = false,
 
+    /// A name in one scope. Every use of a name refers to an entry of its own scope; one that
+    /// is never declared there refers on to the enclosing scope's entry when its scope ends.
     const Name = struct {
         off: u32,
         len: u8,
@@ -94,17 +150,32 @@ pub const Normalizer = struct {
         slot: u16,
         previous_value: u16,
         previous_binding: u16,
+        /// The declaration number + 1 (the latest declaration wins), 0 while undeclared.
+        number: u32 = 0,
+        /// The enclosing scope's entry (index + 1) for a name its own scope never declared.
+        alias: u16 = 0,
     };
     const HtmlNumber = enum { integer, fraction, exponent_start, exponent_digits };
-    const Decl = enum { none, var_next, var_list, func_name, func_params };
+    const Decl = enum { none, var_next, var_list };
+    /// A function from its keyword to the end of its body: its scope, and what its header
+    /// declares. `function` and the `(` after its name each make the next name a declaration,
+    /// until a `{` or `;`; once a parameter is declared, a `,` outside the body's braces makes
+    /// the next name one too, and that one survives a `{` (`function(r,{a` declares r and a).
+    /// A `)` changes nothing (`function()n` declares n).
     const Function = struct {
         saved_decl: Decl,
-        saved_decl_depth: i32,
-        saved_var_depth: i32,
-        body_depth: ?i32 = null,
+        saved_var_level: i32,
+        /// The `{` and `[` nesting at the keyword: a var list in the function goes on at it.
+        /// The `[` nesting comes back when the function ends.
+        base_curly: i32,
+        base_square: i32,
+        body_curly: ?i32 = null,
         last_binding: u16 = 0,
+        expect: enum { none, open, comma } = .open,
+        stage: enum { name, params, done } = .name,
+        declared_param: bool = false,
     };
-    const Call = enum { idle, unescape, unescape_paren, unescape_str, string, string_dot, from_char_code, fcc_paren, fcc_num, fcc_comma };
+    const Call = enum { idle, eval, eval_paren, eval_str, unescape, unescape_paren, unescape_str, string, string_dot, from_char_code, fcc_paren, fcc_num, fcc_comma };
 
     pub fn init(out: Output) Normalizer {
         return .{ .out = out };
@@ -120,6 +191,7 @@ pub const Normalizer = struct {
     }
 
     pub fn finish(n: *Normalizer) Error!void {
+        if (n.html_output) return n.finishHtml();
         // A space ends a pending word or number. Not inside a regex body: a script out of HTML
         // ends with its end tag, whose `/script>` lexes as an unterminated regex that must not
         // grow a space (libclamav's file then ends exactly with `</script>`).
@@ -133,19 +205,49 @@ pub const Normalizer = struct {
             else => {},
         }
         n.lex = .start;
-        try n.releaseCall();
         try n.flushPend();
-        try n.flushOut();
+        try n.releaseCall();
+        n.closeScopes();
+        try n.flushDeferred();
+    }
+
+    /// The end of an HTML script: an open string ends where the input does, without the space
+    /// that ends a word, and every parenthesis still open is closed.
+    fn finishHtml(n: *Normalizer) Error!void {
+        switch (n.lex) {
+            .string => {
+                n.lex = .start;
+                try n.endString();
+            },
+            else => try n.byte(' '),
+        }
+        n.lex = .start;
+        try n.flushPend();
+        // A call whose string argument the script's end cut off still folds.
+        switch (n.call) {
+            .unescape_str, .eval_str => try n.callToken(.punct, ")"),
+            else => {},
+        }
+        try n.releaseCall();
+        while (n.open_parens > 0) : (n.open_parens -= 1) try n.emit(.punct, ")");
+        n.closeScopes();
+        try n.flushDeferred();
     }
 
     // -----------------------------------------------------------------------------------------
     // Lexer.
 
     fn byte(n: *Normalizer, c: u8) Error!void {
+        // A NUL outside a string is not there at all in libclamav's HTML output: `a\x00b` is `ab`.
+        if (n.html_output and c == 0 and n.lex != .string) return;
         switch (n.lex) {
             .start => try n.startToken(c),
             .word => {
-                if (isWordChar(c)) {
+                if (n.html_output and c == '\\') {
+                    n.lex = .backslash;
+                    return;
+                }
+                if (if (n.html_output) isHtmlWordChar(c) else isWordChar(c)) {
                     if (n.word_len < max_word) {
                         n.word[n.word_len] = c;
                         n.word_len += 1;
@@ -167,30 +269,40 @@ pub const Normalizer = struct {
                 }
                 n.lex = .start;
                 try n.endNumber();
+                if (n.html_output and c == '\\') {
+                    n.word_len = 0;
+                    n.bs_after_number = true;
+                    n.lex = .backslash;
+                    return;
+                }
                 try n.startToken(c);
             },
-            .string => try n.stringByte(c),
+            .backslash => try n.backslashByte(c),
+            .string => if (n.html_output) try n.htmlStringByte(c) else try n.stringByte(c),
             .slash => {
                 if (c == '/') {
-                    n.lex = if (n.html_output) .start else .line_comment;
+                    n.lex = .line_comment;
                 } else if (c == '*') {
                     n.lex = .block_comment;
-                } else if (n.prev == .operand) {
+                } else if (n.html_output or n.prev == .operand) {
+                    // HTML scripts have no regular expression literals: `/` is an operator
+                    // and the pattern's characters are ordinary tokens.
                     n.lex = .start;
                     try n.token(.punct, "/");
                     try n.startToken(c);
                 } else {
                     // A regular expression literal: passed through as it is.
                     n.lex = .regex;
-                    try n.releaseCall();
                     try n.flushPend();
+                    try n.releaseCall();
                     try n.sep(.regex);
                     try n.put('/');
                     n.regex_escape = false;
                     try n.regexByte(c);
                 }
             },
-            .line_comment => if (c == '\n' or c == '\r') {
+            // In HTML a line comment ends at the first space or line feed.
+            .line_comment => if (if (n.html_output) c == ' ' or c == '\n' else c == '\n' or c == '\r') {
                 n.lex = .start;
             },
             .block_comment => if (c == '*') {
@@ -205,6 +317,44 @@ pub const Normalizer = struct {
                 try n.startToken(c);
             },
         }
+    }
+
+    /// The byte after a backslash in HTML script text. `\u` stays in the word as `\`; any other
+    /// backslash ends the word and leaves a space before a word or number (`a\b` is `a b`,
+    /// `(\b` is `( b`, `a\(b` is `a(b`), plus a space whatever follows when it comes after a
+    /// number, after white space following a word, or before another backslash. Right after a
+    /// `.` it leaves nothing (`a.\nb` is `a.nb`). The words on either side are separate names.
+    fn backslashByte(n: *Normalizer, c: u8) Error!void {
+        if (c == 'u') {
+            if (n.word_len < max_word) {
+                n.word[n.word_len] = '\\';
+                n.word_len += 1;
+            }
+            n.lex = .word;
+            return;
+        }
+        const after_word = n.word_len > 0;
+        const after_dot = !after_word and n.prev == .dot;
+        const hard = n.bs_after_number or (!after_word and (n.prev_number or n.ws_after_word));
+        n.bs_after_number = false;
+        n.lex = .start;
+        if (after_word) try n.token(.word, n.word[0..n.word_len]);
+        n.word_len = 0;
+        if (after_dot) {
+            try n.token(.sep, "-");
+        } else {
+            if (hard) try n.token(.sep, " ");
+            try n.token(.sep, if (c == '\\') " " else "");
+        }
+        // The backslash itself counts as a word for the next one.
+        n.prev = .other;
+        n.prev_wordy = true;
+        n.prev_number = false;
+        if (c == '\\') {
+            n.lex = .backslash;
+            return;
+        }
+        try n.startToken(c);
     }
 
     /// The HTML lexer recognizes an exponent only after a decimal point.
@@ -287,6 +437,19 @@ pub const Normalizer = struct {
     }
 
     fn startToken(n: *Normalizer, c: u8) Error!void {
+        if (n.html_output) {
+            // Control bytes, space, `#`, `@`, the backtick, DEL and every byte from 0x80 only
+            // separate tokens. A backslash is handled by backslashByte.
+            if (c <= ' ' or c == '#' or c == '@' or c == '`' or c >= 0x7f) {
+                if (n.prev_wordy) n.ws_after_word = true;
+                return;
+            }
+            if (c == '\\') {
+                n.lex = .backslash;
+                n.word_len = 0;
+                return;
+            }
+        }
         switch (c) {
             ' ', '\t', '\n', '\r', 0x0b, 0x0c, 0 => {},
             '#', '@', '\\' => if (!n.html_output) try n.token(.punct, &.{c}),
@@ -295,6 +458,7 @@ pub const Normalizer = struct {
                 n.lex = .string;
                 n.quote = c;
                 n.slen = 0;
+                n.raw_prev = 0;
                 n.esc = 0;
             },
             '/' => n.lex = .slash,
@@ -388,6 +552,68 @@ pub const Normalizer = struct {
         }
     }
 
+    /// String literals in HTML scripts end at the first quote not right after a backslash. \xHH is the byte HH and \uHHHH the code point in UTF-8
+    /// (surrogates encoded on their own); a malformed one is 0xFF or U+FFFF. There are no octal
+    /// escapes: \0 is NUL and any other escaped character stands for itself. An escape cut off
+    /// by the closing quote leaves a backslash, plus the digits read so far after \u.
+    fn htmlStringByte(n: *Normalizer, c: u8) Error!void {
+        switch (n.esc) {
+            0 => {
+                if (c == n.quote and n.raw_prev != '\\') {
+                    n.lex = .start;
+                    return n.endString();
+                }
+                n.raw_prev = c;
+                if (c == '\\') n.esc = 1 else n.sput(c);
+            },
+            1 => {
+                n.esc = 0;
+                n.raw_prev = c;
+                switch (c) {
+                    'n' => n.sput('\n'),
+                    'r' => n.sput('\r'),
+                    't' => n.sput('\t'),
+                    'b' => n.sput(8),
+                    'f' => n.sput(12),
+                    'v' => n.sput(11),
+                    '0' => n.sput(0),
+                    'x', 'u' => {
+                        n.esc = c;
+                        n.esc_digits = 0;
+                    },
+                    else => n.sput(c),
+                }
+            },
+            'x', 'u' => {
+                if (c == n.quote and n.raw_prev != '\\') {
+                    n.lex = .start;
+                    return n.endString();
+                }
+                n.raw_prev = c;
+                n.esc_buf[n.esc_digits] = c;
+                n.esc_digits += 1;
+                const want: u8 = if (n.esc == 'x') 2 else 4;
+                if (n.esc_digits < want) return;
+                const value = std.fmt.parseUnsigned(u16, n.esc_buf[0..want], 16) catch null;
+                if (n.esc == 'x') n.sput(if (value) |v| @intCast(v) else 0xff) else n.sputWtf8(value orelse 0xffff);
+                n.esc = 0;
+            },
+            else => unreachable,
+        }
+    }
+
+    /// UTF-8 for a UTF-16 unit, a lone surrogate included.
+    fn sputWtf8(n: *Normalizer, unit: u16) void {
+        if (unit < 0x80) return n.sput(@intCast(unit));
+        if (unit < 0x800) {
+            n.sput(@intCast(0xc0 | unit >> 6));
+        } else {
+            n.sput(@intCast(0xe0 | unit >> 12));
+            n.sput(@intCast(0x80 | (unit >> 6 & 0x3f)));
+        }
+        n.sput(@intCast(0x80 | (unit & 0x3f)));
+    }
+
     fn sput(n: *Normalizer, c: u8) void {
         if (n.slen < n.sbuf.len) {
             n.sbuf[n.slen] = c;
@@ -402,264 +628,42 @@ pub const Normalizer = struct {
     }
 
     fn endString(n: *Normalizer) Error!void {
+        if (n.html_output) switch (n.esc) {
+            1 => n.sput('\\'),
+            'x' => n.sput('\\'),
+            'u' => {
+                n.sput('\\');
+                for (n.esc_buf[0..n.esc_digits]) |b| n.sput(b);
+            },
+            else => {},
+        };
         if (n.esc == 'o') n.sput(@intCast(n.esc_val));
         n.esc = 0;
         try n.token(.string, n.sbuf[0..n.slen]);
     }
 
     // -----------------------------------------------------------------------------------------
-    // Tokens: declarations and renaming, then call folding, then string folding, then output.
+    // Tokens pass four stages: string folding ("a" + "b"), call folding (unescape, eval,
+    // String.fromCharCode), declarations and renaming, then output.
 
-    fn token(n: *Normalizer, kind: TokKind, text: []const u8) Error!void {
-        var t = text;
-        var renamed: [8]u8 = undefined;
-        if (!n.rename_disabled and kind == .word) {
-            if (isKeyword(t)) {
-                n.declKeyword(t);
-            } else if (n.prev != .dot) {
-                const binding = if (n.declaring()) n.declare(t) else n.slots[n.findSlot(t)];
-                if (binding != 0) t = std.fmt.bufPrint(&renamed, "n{d:0>3}", .{binding - 1}) catch t;
-            }
-        } else if (!n.rename_disabled and kind == .punct) n.declPunct(t[0]);
+    fn token(n: *Normalizer, kind: TokKind, t: []const u8) Error!void {
+        if (kind != .sep) {
+            n.prev_wordy = kind == .word or kind == .number;
+            n.prev_number = kind == .number;
+            n.ws_after_word = false;
+        }
+        // What the next `/` means (a regular expression only follows an operator).
         n.prev = switch (kind) {
-            .word => if (isKeyword(text) and !isValueKeyword(text)) .other else .operand,
+            .word => if (isKeyword(t) and !isValueKeyword(t)) .other else .operand,
             .number, .string, .regex => .operand,
+            .sep => n.prev,
             .punct => switch (t[0]) {
                 ')', ']', '}' => .operand,
                 '.' => .dot,
                 else => .other,
             },
         };
-        try n.callToken(kind, t);
-    }
-
-    fn declaring(n: *const Normalizer) bool {
-        return switch (n.decl) {
-            .var_next, .func_name => true,
-            .func_params => n.depth == n.decl_depth + 1,
-            else => false,
-        };
-    }
-
-    fn declKeyword(n: *Normalizer, t: []const u8) void {
-        if (std.mem.eql(u8, t, "var")) {
-            n.decl = .var_next;
-            n.var_depth = n.depth;
-        } else if (std.mem.eql(u8, t, "function")) {
-            if (n.function_count == max_functions) {
-                n.rename_disabled = true;
-                return;
-            }
-            n.functions[n.function_count] = .{
-                .saved_decl = n.decl,
-                .saved_decl_depth = n.decl_depth,
-                .saved_var_depth = n.var_depth,
-            };
-            n.function_count += 1;
-            n.decl = .func_name;
-            n.decl_depth = n.depth;
-        }
-    }
-
-    fn declPunct(n: *Normalizer, c: u8) void {
-        switch (c) {
-            '(', '[', '{' => {
-                if (n.decl == .func_name and c == '(') n.decl = .func_params;
-                n.depth += 1;
-                if (c == '{' and n.function_count != 0) {
-                    const frame = &n.functions[n.function_count - 1];
-                    // The first brace starts the scope body in libclamav's lexer, including
-                    // a brace in a default parameter. Its matching brace ends the scope.
-                    if (frame.body_depth == null) frame.body_depth = n.depth;
-                }
-            },
-            ')', ']', '}' => {
-                const end_function = c == '}' and n.function_count != 0 and
-                    n.functions[n.function_count - 1].body_depth == n.depth;
-                n.depth -= 1;
-                if (end_function) {
-                    n.finishFunction();
-                    return;
-                }
-                if (n.decl == .func_params and n.depth == n.decl_depth) n.decl = .none;
-                if ((n.decl == .var_list or n.decl == .var_next) and n.depth < n.var_depth) n.decl = .none;
-            },
-            ',' => if (n.decl == .var_list and n.depth == n.var_depth) {
-                n.decl = .var_next;
-            },
-            ';' => if (n.decl == .var_list or n.decl == .var_next) {
-                n.decl = .none;
-            },
-            else => {},
-        }
-    }
-
-    fn declare(n: *Normalizer, t: []const u8) u16 {
-        if (n.decl == .var_next) n.decl = .var_list;
-        if (n.decl == .func_name) n.decl = .func_params; // the name; parameters follow
-        const slot = n.findSlot(t);
-        const previous = n.slots[slot];
-        if (previous != 0 and n.names[previous - 1].level == n.function_count) return previous;
-        if (n.nnames == max_names or t.len > 255) return 0;
-        const off = if (previous != 0) n.names[previous - 1].off else blk: {
-            if (n.name_used + t.len > n.name_bytes.len) return 0;
-            const offset: u32 = @intCast(n.name_used);
-            @memcpy(n.name_bytes[n.name_used..][0..t.len], t);
-            n.name_used += t.len;
-            break :blk offset;
-        };
-        const frame = if (n.function_count == 0) null else &n.functions[n.function_count - 1];
-        n.names[n.nnames] = .{
-            .off = off,
-            .len = @intCast(t.len),
-            .level = n.function_count,
-            .slot = @intCast(slot),
-            .previous_value = previous,
-            .previous_binding = if (frame) |f| f.last_binding else 0,
-        };
-        n.nnames += 1;
-        const binding: u16 = @intCast(n.nnames);
-        n.slots[slot] = binding;
-        if (frame) |f| f.last_binding = binding;
-        return binding;
-    }
-
-    fn finishFunction(n: *Normalizer) void {
-        n.function_count -= 1;
-        const frame = n.functions[n.function_count];
-        var binding = frame.last_binding;
-        // Undo insertions in reverse order to preserve each probe chain.
-        while (binding != 0) {
-            const name = n.names[binding - 1];
-            n.slots[name.slot] = name.previous_value;
-            binding = name.previous_binding;
-        }
-        n.decl = frame.saved_decl;
-        n.decl_depth = frame.saved_decl_depth;
-        n.var_depth = frame.saved_var_depth;
-    }
-
-    fn slotOf(t: []const u8) usize {
-        return @intCast(std.hash.Wyhash.hash(0x6a73, t) % (2 * max_names));
-    }
-
-    fn findSlot(n: *const Normalizer, t: []const u8) usize {
-        // At most half the slots are used, so a probe always reaches an empty one.
-        var h = slotOf(t);
-        while (n.slots[h] != 0) : (h = (h + 1) % n.slots.len) {
-            const i = n.slots[h] - 1;
-            const e = n.names[i];
-            if (std.mem.eql(u8, n.name_bytes[e.off..][0..e.len], t)) break;
-        }
-        return h;
-    }
-
-    /// Call folding: unescape("...") and String.fromCharCode(numbers).
-    fn callToken(n: *Normalizer, kind: TokKind, t: []const u8) Error!void {
-        switch (n.call) {
-            .idle => {},
-            .unescape => if (isPunct(kind, t, '(')) {
-                n.call = .unescape_paren;
-                return;
-            },
-            .unescape_paren => if (kind == .string) {
-                n.call_str_len = @min(t.len, n.call_str.len);
-                @memcpy(n.call_str[0..n.call_str_len], t[0..n.call_str_len]);
-                n.call = .unescape_str;
-                return;
-            },
-            .unescape_str => if (isPunct(kind, t, ')')) {
-                n.call = .idle;
-                // The lexer's string buffer is free: the current token is a ')'.
-                return n.foldString(unescape(n.call_str[0..n.call_str_len], &n.sbuf));
-            },
-            .string => if (isPunct(kind, t, '.')) {
-                n.call = .string_dot;
-                return;
-            },
-            .string_dot => if (kind == .word and std.mem.eql(u8, t, "fromCharCode")) {
-                n.call = .from_char_code;
-                return;
-            },
-            .from_char_code => if (isPunct(kind, t, '(')) {
-                n.call = .fcc_paren;
-                n.nargs = 0;
-                return;
-            },
-            .fcc_paren, .fcc_comma => {
-                if (kind == .number and n.nargs < max_args) {
-                    if (parseNumber(t)) |v| {
-                        n.args[n.nargs] = v;
-                        n.nargs += 1;
-                        n.call = .fcc_num;
-                        return;
-                    }
-                }
-                if (n.call == .fcc_paren and isPunct(kind, t, ')')) {
-                    n.call = .idle;
-                    return n.foldString("");
-                }
-            },
-            .fcc_num => {
-                if (isPunct(kind, t, ',')) {
-                    n.call = .fcc_comma;
-                    return;
-                }
-                if (isPunct(kind, t, ')')) {
-                    n.call = .idle;
-                    var buf: [max_args * 4]u8 = undefined;
-                    var len: usize = 0;
-                    for (n.args[0..n.nargs]) |cp| len += std.unicode.utf8Encode(if (cp >= 0xd800 and cp <= 0xdfff) 0xfffd else cp, buf[len..][0..4]) catch 0;
-                    return n.foldString(buf[0..len]);
-                }
-            },
-        }
-        // Not (or no longer) a foldable call: release what was held, then this token.
-        try n.releaseCall();
-        if (kind == .word and std.mem.eql(u8, t, "unescape")) {
-            n.call = .unescape;
-            return;
-        }
-        if (!n.html_output and kind == .word and std.mem.eql(u8, t, "String")) {
-            n.call = .string;
-            return;
-        }
         try n.foldToken(kind, t);
-    }
-
-    /// Emit the tokens a partial call match held back.
-    fn releaseCall(n: *Normalizer) Error!void {
-        const state = n.call;
-        n.call = .idle;
-        switch (state) {
-            .idle => {},
-            .unescape, .unescape_paren, .unescape_str => {
-                try n.foldToken(.word, "unescape");
-                if (state == .unescape) return;
-                try n.foldToken(.punct, "(");
-                if (state == .unescape_str) try n.foldToken(.string, n.call_str[0..n.call_str_len]);
-            },
-            .string, .string_dot, .from_char_code, .fcc_paren, .fcc_num, .fcc_comma => {
-                try n.foldToken(.word, "String");
-                if (state == .string) return;
-                try n.foldToken(.punct, ".");
-                if (state == .string_dot) return;
-                try n.foldToken(.word, "fromCharCode");
-                if (state == .from_char_code) return;
-                try n.foldToken(.punct, "(");
-                for (n.args[0..n.nargs], 0..) |v, i| {
-                    if (i > 0) try n.foldToken(.punct, ",");
-                    var nb: [8]u8 = undefined;
-                    try n.foldToken(.number, std.fmt.bufPrint(&nb, "{d}", .{v}) catch "0");
-                }
-                if (state == .fcc_comma) try n.foldToken(.punct, ",");
-            },
-        }
-    }
-
-    fn foldString(n: *Normalizer, s: []const u8) Error!void {
-        try n.foldToken(.string, s);
-        n.prev = .operand;
     }
 
     /// String folding: "a" + "b" becomes "ab".
@@ -688,32 +692,511 @@ pub const Normalizer = struct {
             return;
         }
         try n.flushPend();
-        try n.emit(kind, t);
+        try n.callToken(kind, t);
     }
 
     fn flushPend(n: *Normalizer) Error!void {
         if (!n.have_pend) return;
         n.have_pend = false;
-        try n.sep(.string);
-        try n.put('"');
-        for (n.pend[0..n.pend_len]) |c| {
-            if (c == '"' or c == '\\') try n.put('\\');
-            try n.put(c);
+        const plus = n.pend_plus;
+        n.pend_plus = false;
+        try n.callToken(.string, n.pend[0..n.pend_len]);
+        if (plus) try n.callToken(.punct, "+");
+    }
+
+    /// Call folding: unescape("...") and String.fromCharCode(numbers) become their string, and
+    /// in HTML scripts eval("...") becomes the tokens of its argument. A folded string folds no
+    /// further with its neighbours.
+    fn callToken(n: *Normalizer, kind: TokKind, t: []const u8) Error!void {
+        const after_dot = n.call_dot;
+        n.call_dot = isPunct(kind, t, '.');
+        if (n.drop_semicolon) {
+            n.drop_semicolon = false;
+            if (isPunct(kind, t, ';')) return;
         }
-        try n.put('"');
-        n.last_out = .string;
-        if (n.pend_plus) {
-            n.pend_plus = false;
-            try n.emit(.punct, "+");
+        if (n.callStep(kind, t)) |next| {
+            // Held: the declarations see it now, the output when the call folds or fails.
+            if (next != .idle) {
+                const entry = n.observe(kind, t);
+                if (kind == .word) {
+                    if (n.call == .eval_paren) n.held_inner = entry else n.held_entry = entry;
+                }
+            }
+            n.call = next;
+            return;
+        }
+        switch (n.call) {
+            .eval_str => if (isPunct(kind, t, ')')) {
+                n.call = .idle;
+                return n.expandEval();
+            },
+            .unescape_str => if (isPunct(kind, t, ')')) {
+                // The lexer's string buffer is free: the current token is a ')'.
+                const s = unescape(n.call_str[0..n.call_str_len], &n.sbuf);
+                if (n.eval_open) {
+                    n.eval_open = false;
+                    n.holdString(s);
+                    n.call = .eval_str;
+                    return;
+                }
+                n.call = .idle;
+                return n.folded(s);
+            },
+            .fcc_paren => if (isPunct(kind, t, ')')) {
+                n.call = .idle;
+                return n.folded("");
+            },
+            .fcc_num => if (isPunct(kind, t, ')')) {
+                n.call = .idle;
+                var buf: [max_args * 4]u8 = undefined;
+                var len: usize = 0;
+                for (n.args[0..n.nargs]) |cp| len += std.unicode.utf8Encode(if (cp >= 0xd800 and cp <= 0xdfff) 0xfffd else cp, buf[len..][0..4]) catch 0;
+                return n.folded(buf[0..len]);
+            },
+            else => {},
+        }
+        // Not (or no longer) a foldable call: release what was held, then this token.
+        try n.releaseCall();
+        if (kind == .word and !after_dot) {
+            const call: Call = if (n.html_output and !n.expanding and std.mem.eql(u8, t, "eval"))
+                .eval
+            else if (std.mem.eql(u8, t, "unescape"))
+                .unescape
+            else if (!n.html_output and std.mem.eql(u8, t, "String"))
+                .string
+            else
+                .idle;
+            if (call != .idle) {
+                n.held_entry = n.observe(kind, t);
+                n.call = call;
+                return;
+            }
+        }
+        try n.nameToken(kind, t);
+    }
+
+    /// The state a held call moves to with this token, or null when the token does not
+    /// continue it (or completes it).
+    fn callStep(n: *Normalizer, kind: TokKind, t: []const u8) ?Call {
+        switch (n.call) {
+            .eval => if (isPunct(kind, t, '(')) return .eval_paren,
+            .eval_paren => {
+                if (kind == .string) {
+                    n.holdString(t);
+                    return .eval_str;
+                }
+                if (kind == .word and std.mem.eql(u8, t, "unescape")) {
+                    n.eval_open = true;
+                    return .unescape;
+                }
+            },
+            .unescape => if (isPunct(kind, t, '(')) return .unescape_paren,
+            .unescape_paren => if (kind == .string) {
+                n.holdString(t);
+                return .unescape_str;
+            },
+            .string => if (isPunct(kind, t, '.')) return .string_dot,
+            .string_dot => if (kind == .word and std.mem.eql(u8, t, "fromCharCode")) return .from_char_code,
+            .from_char_code => if (isPunct(kind, t, '(')) {
+                n.nargs = 0;
+                return .fcc_paren;
+            },
+            .fcc_paren, .fcc_comma => if (kind == .number and n.nargs < max_args) {
+                if (parseNumber(t)) |v| {
+                    n.args[n.nargs] = v;
+                    n.nargs += 1;
+                    return .fcc_num;
+                }
+            },
+            .fcc_num => if (isPunct(kind, t, ',')) return .fcc_comma,
+            else => {},
+        }
+        return null;
+    }
+
+    /// A folded call's string.
+    fn folded(n: *Normalizer, s: []const u8) Error!void {
+        n.held_entry = 0;
+        n.held_inner = 0;
+        n.name_dot = false;
+        try n.emitToken(.string, s, 0);
+    }
+
+    fn holdString(n: *Normalizer, s: []const u8) void {
+        n.call_str_len = @min(s.len, n.call_str.len);
+        @memcpy(n.call_str[0..n.call_str_len], s[0..n.call_str_len]);
+    }
+
+    /// eval("code") is replaced by the tokens of the code, lexed as script text by a lexer of
+    /// its own. A word or number the code leaves unfinished is not written here
+    /// (`eval('a=1')` gives `a=`) but continued by the next eval's code. A `;` right after the
+    /// call goes with it.
+    fn expandEval(n: *Normalizer) Error!void {
+        const len = n.call_str_len;
+        @memcpy(n.eval_src[0..len], n.call_str[0..len]);
+        const saved_prev = n.prev;
+        n.lex = n.eval_lex;
+        n.html_number = n.eval_number;
+        n.word_len = n.eval_word_len;
+        @memcpy(n.word[0..n.word_len], n.eval_word[0..n.word_len]);
+        n.expanding = true;
+        defer n.expanding = false;
+        for (n.eval_src[0..len]) |c| try n.byte(c);
+        switch (n.lex) {
+            .word, .number, .backslash => {
+                n.eval_lex = n.lex;
+                n.eval_number = n.html_number;
+                n.eval_word_len = @min(n.word_len, n.eval_word.len);
+                @memcpy(n.eval_word[0..n.eval_word_len], n.word[0..n.eval_word_len]);
+            },
+            else => {
+                n.eval_lex = .start;
+                n.eval_word_len = 0;
+            },
+        }
+        n.lex = .start;
+        n.esc = 0;
+        n.word_len = 0;
+        n.prev = saved_prev;
+        n.drop_semicolon = true;
+    }
+
+    /// Emit the tokens a partial call match held back (the declarations saw them already).
+    fn releaseCall(n: *Normalizer) Error!void {
+        const state = n.call;
+        const eval_open = n.eval_open;
+        const entry = n.held_entry;
+        const inner = n.held_inner;
+        n.call = .idle;
+        n.eval_open = false;
+        n.held_entry = 0;
+        n.held_inner = 0;
+        switch (state) {
+            .idle => {},
+            .eval, .eval_paren, .eval_str => {
+                try n.emitToken(.word, "eval", entry);
+                if (state == .eval) return;
+                try n.emitToken(.punct, "(", 0);
+                if (state == .eval_str) try n.emitToken(.string, n.call_str[0..n.call_str_len], 0);
+            },
+            .unescape, .unescape_paren, .unescape_str => {
+                if (eval_open) {
+                    try n.emitToken(.word, "eval", entry);
+                    try n.emitToken(.punct, "(", 0);
+                    try n.emitToken(.word, "unescape", inner);
+                } else try n.emitToken(.word, "unescape", entry);
+                if (state == .unescape) return;
+                try n.emitToken(.punct, "(", 0);
+                if (state == .unescape_str) try n.emitToken(.string, n.call_str[0..n.call_str_len], 0);
+            },
+            .string, .string_dot, .from_char_code, .fcc_paren, .fcc_num, .fcc_comma => {
+                try n.emitToken(.word, "String", entry);
+                if (state == .string) return;
+                try n.emitToken(.punct, ".", 0);
+                if (state == .string_dot) return;
+                try n.emitToken(.word, "fromCharCode", 0);
+                if (state == .from_char_code) return;
+                try n.emitToken(.punct, "(", 0);
+                for (n.args[0..n.nargs], 0..) |v, i| {
+                    if (i > 0) try n.emitToken(.punct, ",", 0);
+                    var nb: [8]u8 = undefined;
+                    try n.emitToken(.number, std.fmt.bufPrint(&nb, "{d}", .{v}) catch "0", 0);
+                }
+                if (state == .fcc_comma) try n.emitToken(.punct, ",", 0);
+            },
         }
     }
 
+    /// Declarations and renaming. Names declared with var, function names (in the function's
+    /// own scope) and parameters are numbered in declaration order; a redeclaration takes a new
+    /// number for every use of the name in its scope, earlier ones included. Property names after
+    /// `.` keep their spelling, and so does a name no scope declares.
+    fn nameToken(n: *Normalizer, kind: TokKind, t: []const u8) Error!void {
+        try n.emitToken(kind, t, n.observe(kind, t));
+    }
+
+    /// The declaration side of a token; for a name, the entry it refers to (0: as written).
+    /// The tokens of a call that may fold are observed as they come and emitted later, as
+    /// they were or folded; the declarations never see a folded call's `)` (so in
+    /// `function f unescape('a') b`, `b` is a parameter).
+    fn observe(n: *Normalizer, kind: TokKind, t: []const u8) u16 {
+        const after_dot = n.name_dot;
+        n.name_dot = isPunct(kind, t, '.');
+        if (n.rename_disabled) return 0;
+        switch (kind) {
+            .word => {
+                if (isKeyword(t)) {
+                    n.declKeyword(t);
+                } else if (!after_dot and t.len != 0) {
+                    return if (n.declaring()) n.declare(t) else n.entryFor(t);
+                }
+            },
+            .punct => n.declPunct(t[0]),
+            else => {},
+        }
+        return 0;
+    }
+
+    fn emitToken(n: *Normalizer, kind: TokKind, t: []const u8, entry: u16) Error!void {
+        if (n.html_output and kind == .punct) switch (t[0]) {
+            '(' => n.open_parens += 1,
+            ')' => n.open_parens -|= 1,
+            else => {},
+        };
+        if (entry != 0) return n.emitName(entry);
+        try n.emit(kind, t);
+    }
+
+    fn header(n: *Normalizer) ?*Function {
+        return if (n.function_count == 0) null else &n.functions[n.function_count - 1];
+    }
+
+    fn baseCurly(n: *Normalizer) i32 {
+        return if (n.header()) |f| f.base_curly else 0;
+    }
+
+    fn declaring(n: *Normalizer) bool {
+        if (n.decl == .var_next) return true;
+        const f = n.header() orelse return false;
+        return f.expect != .none;
+    }
+
+    fn declKeyword(n: *Normalizer, t: []const u8) void {
+        if (std.mem.eql(u8, t, "var")) {
+            n.decl = .var_next;
+            // `var` ends a function header (`function var x(` has no parameters).
+            if (n.header()) |h| if (h.body_curly == null and h.stage != .done) {
+                h.stage = .done;
+            };
+        } else if (std.mem.eql(u8, t, "function")) {
+            if (n.function_count == max_functions) {
+                n.rename_disabled = true;
+                return;
+            }
+            n.functions[n.function_count] = .{
+                .saved_decl = n.decl,
+                .saved_var_level = n.var_level,
+                .base_curly = n.curly,
+                .base_square = n.square,
+            };
+            n.function_count += 1;
+            n.decl = .none;
+        }
+    }
+
+    fn declPunct(n: *Normalizer, c: u8) void {
+        const f = n.header();
+        switch (c) {
+            '(' => if (f) |h| if (h.stage == .name and h.body_curly == null) {
+                h.stage = .params;
+                h.expect = .open;
+            },
+            '[' => n.square += 1,
+            ']' => n.square = @max(0, n.square - 1),
+            '{' => {
+                n.curly += 1;
+                if (f) |h| {
+                    if (h.expect == .open) h.expect = .none;
+                    // The first brace starts the scope body, including a brace in a default
+                    // parameter. Its matching brace ends the scope.
+                    if (h.body_curly == null) h.body_curly = n.curly;
+                }
+            },
+            '}' => {
+                // A `}` ends a function that has no body yet: its scope closes and an
+                // enclosing function's name may still follow (`function [function }a`).
+                const end_function = if (f) |h| (h.body_curly orelse n.curly) == n.curly else false;
+                n.curly = @max(0, n.curly - 1);
+                if (end_function) n.finishFunction();
+            },
+            // A `,` continues a var list at the `{` nesting of its function (so in a body only
+            // the first name of a list is declared), not inside a `[` opened since the last
+            // name: `var a=[b,c],d` declares a and d.
+            ',' => {
+                const base = n.baseCurly();
+                if (n.decl == .var_list and n.curly <= base and n.square <= n.var_level) n.decl = .var_next;
+                if (f) |h| if (h.stage == .params and h.declared_param and n.curly <= h.base_curly and n.square <= h.base_square) {
+                    h.expect = .comma;
+                };
+            },
+            // A `;` ends a var list at its function's `{` nesting, and `var` waits for its
+            // name across a `;` nested deeper in `{` or `[`.
+            ';' => {
+                const base = n.baseCurly();
+                const base_square: i32 = if (f) |h| h.base_square else 0;
+                switch (n.decl) {
+                    .var_list => if (n.curly <= base) {
+                        n.decl = .none;
+                    },
+                    .var_next => if (n.curly <= base and n.square <= base_square) {
+                        n.decl = .none;
+                    },
+                    .none => {},
+                }
+                if (f) |h| {
+                    h.expect = .none;
+                    h.stage = .done;
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn declare(n: *Normalizer, t: []const u8) u16 {
+        if (n.decl == .var_next) {
+            n.decl = .var_list;
+            n.var_level = n.square;
+        }
+        if (n.header()) |h| if (h.expect != .none) {
+            h.expect = .none;
+            if (h.stage == .params) h.declared_param = true;
+        };
+        const entry = n.entryFor(t);
+        if (entry != 0) {
+            n.names[entry - 1].number = n.next_number + 1;
+            n.next_number += 1;
+        }
+        return entry;
+    }
+
+    /// The entry of `t` in the innermost scope, created (undeclared) if it has none; 0 when the
+    /// tables are full.
+    fn entryFor(n: *Normalizer, t: []const u8) u16 {
+        const slot = n.findSlot(t);
+        const current = n.slots[slot];
+        if (current != 0 and n.names[current - 1].level == n.function_count) return current;
+        return n.addEntry(t, slot, n.function_count);
+    }
+
+    fn addEntry(n: *Normalizer, t: []const u8, slot: usize, level: u8) u16 {
+        if (n.nnames == max_names or t.len > 255) return 0;
+        const previous = n.slots[slot];
+        const off = if (previous != 0) n.names[previous - 1].off else blk: {
+            if (n.name_used + t.len > n.name_bytes.len) return 0;
+            const offset: u32 = @intCast(n.name_used);
+            @memcpy(n.name_bytes[n.name_used..][0..t.len], t);
+            n.name_used += t.len;
+            break :blk offset;
+        };
+        const frame = if (level == 0) null else &n.functions[level - 1];
+        n.names[n.nnames] = .{
+            .off = off,
+            .len = @intCast(t.len),
+            .level = level,
+            .slot = @intCast(slot),
+            .previous_value = previous,
+            .previous_binding = if (frame) |f| f.last_binding else 0,
+        };
+        n.nnames += 1;
+        const entry: u16 = @intCast(n.nnames);
+        n.slots[slot] = entry;
+        if (frame) |f| f.last_binding = entry;
+        return entry;
+    }
+
+    /// The end of the script ends every function still open, so their undeclared names
+    /// resolve outwards.
+    fn closeScopes(n: *Normalizer) void {
+        while (n.function_count > 0) n.finishFunction();
+    }
+
+    fn finishFunction(n: *Normalizer) void {
+        n.function_count -= 1;
+        const frame = n.functions[n.function_count];
+        var entry = frame.last_binding;
+        // Undo insertions in reverse order to preserve each probe chain. A name the scope never
+        // declared now refers to the enclosing scope's entry for it.
+        while (entry != 0) {
+            const name = n.names[entry - 1];
+            n.slots[name.slot] = name.previous_value;
+            if (name.number == 0 and name.alias == 0) {
+                const outer = n.slots[name.slot];
+                n.names[entry - 1].alias = if (outer != 0 and n.names[outer - 1].level == n.function_count)
+                    outer
+                else
+                    n.addEntry(n.name_bytes[name.off..][0..name.len], name.slot, n.function_count);
+            }
+            entry = name.previous_binding;
+        }
+        n.decl = frame.saved_decl;
+        n.var_level = frame.saved_var_level;
+        n.square = frame.base_square;
+    }
+
+    fn slotOf(t: []const u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0x6a73, t) % (2 * max_names));
+    }
+
+    fn findSlot(n: *const Normalizer, t: []const u8) usize {
+        // At most half the slots are used, so a probe always reaches an empty one.
+        var h = slotOf(t);
+        while (n.slots[h] != 0) : (h = (h + 1) % n.slots.len) {
+            const i = n.slots[h] - 1;
+            const e = n.names[i];
+            if (std.mem.eql(u8, n.name_bytes[e.off..][0..e.len], t)) break;
+        }
+        return h;
+    }
+
+    /// The text a name entry stands for once every declaration is known.
+    fn nameText(n: *const Normalizer, entry: u16, buf: *[16]u8) []const u8 {
+        var e = entry;
+        while (n.names[e - 1].alias != 0) e = n.names[e - 1].alias;
+        const name = n.names[e - 1];
+        if (name.number != 0) return std.fmt.bufPrint(buf, "n{d:0>3}", .{name.number - 1}) catch unreachable;
+        return n.name_bytes[name.off..][0..name.len];
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Output.
+
     fn emit(n: *Normalizer, kind: TokKind, t: []const u8) Error!void {
-        try n.sep(kind);
-        // Keep "a - -b" and "a + +b" from becoming decrements and increments.
-        if (kind == .punct and (t[0] == '+' or t[0] == '-') and n.last_out == .punct and n.last_char == t[0]) try n.put(' ');
+        if (kind == .sep) {
+            if (t.len == 0) {
+                n.soft_space = true;
+            } else if (t[0] == ' ') {
+                try n.put(' ');
+                n.last_out = .punct;
+            }
+            return;
+        }
+        try n.space(kind);
+        if (kind == .string) {
+            try n.put('"');
+            for (t) |c| {
+                // libclamav's HTML form leaves quotes and backslashes in a string as they are.
+                if (!n.html_output and (c == '"' or c == '\\')) try n.put('\\');
+                try n.put(c);
+            }
+            try n.put('"');
+            n.last_out = .string;
+            return;
+        }
+        // Keep "a - -b" and "a + +b" from becoming decrements and increments. (The HTML form
+        // writes punctuation with no space at all: `a+ +b` is `a++b`.)
+        if (!n.html_output and kind == .punct and (t[0] == '+' or t[0] == '-') and n.last_out == .punct and n.last_char == t[0]) try n.put(' ');
         for (t) |c| try n.put(c);
         n.last_out = kind;
+    }
+
+    fn emitName(n: *Normalizer, entry: u16) Error!void {
+        try n.space(.word);
+        if (n.dlen + 3 > n.dbuf.len) try n.flushDeferred();
+        n.dbuf[n.dlen] = 0;
+        std.mem.writeInt(u16, n.dbuf[n.dlen + 1 ..][0..2], entry, .big);
+        n.dlen += 3;
+        n.last_out = .word;
+        n.last_char = 'n';
+    }
+
+    /// The space before a token: between two word-like tokens, or before a word-like token
+    /// after a backslash.
+    fn space(n: *Normalizer, kind: TokKind) Error!void {
+        const soft = n.soft_space;
+        n.soft_space = false;
+        const wordy = kind == .word or kind == .number;
+        const last_wordy = n.last_out == .word or n.last_out == .number;
+        if (wordy and (last_wordy or soft)) try n.put(' ');
     }
 
     /// One space between two word-like tokens.
@@ -724,10 +1207,44 @@ pub const Normalizer = struct {
     }
 
     fn put(n: *Normalizer, c: u8) Error!void {
+        if (n.dlen + 3 > n.dbuf.len) try n.flushDeferred();
+        if (c == 0) {
+            @memcpy(n.dbuf[n.dlen..][0..3], &[3]u8{ 0, 0xff, 0xff });
+            n.dlen += 3;
+        } else {
+            n.dbuf[n.dlen] = c;
+            n.dlen += 1;
+        }
+        n.last_char = c;
+    }
+
+    /// Write the held output with every name resolved as it stands now.
+    fn flushDeferred(n: *Normalizer) Error!void {
+        var i: usize = 0;
+        while (i < n.dlen) {
+            const c = n.dbuf[i];
+            if (c != 0) {
+                try n.out1(c);
+                i += 1;
+                continue;
+            }
+            const entry = std.mem.readInt(u16, n.dbuf[i + 1 ..][0..2], .big);
+            i += 3;
+            if (entry == 0xffff) {
+                try n.out1(0);
+                continue;
+            }
+            var buf: [16]u8 = undefined;
+            for (n.nameText(entry, &buf)) |b| try n.out1(b);
+        }
+        n.dlen = 0;
+        try n.flushOut();
+    }
+
+    fn out1(n: *Normalizer, c: u8) Error!void {
         if (n.olen == n.obuf.len) try n.flushOut();
         n.obuf[n.olen] = c;
         n.olen += 1;
-        n.last_char = c;
     }
 
     fn flushOut(n: *Normalizer) Error!void {
@@ -757,12 +1274,23 @@ fn isWordChar(c: u8) bool {
     return isWordStart(c) or std.ascii.isDigit(c);
 }
 
+/// Word bytes in HTML scripts: bytes from 0x80 separate tokens there.
+fn isHtmlWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+/// Reserved words, ECMAScript 3's future reserved words included, as libclamav's normaliser
+/// keeps them: none is ever renamed. (`let`, `yield`, `async`, `await`, `of` and `undefined`
+/// are names to it.)
 const keywords = [_][]const u8{
-    "break", "case",       "catch",  "class",   "const",   "continue", "debugger", "default", "delete",
-    "do",    "else",       "export", "extends", "finally", "for",      "function", "if",      "import",
-    "in",    "instanceof", "let",    "new",     "return",  "super",    "switch",   "this",    "throw",
-    "try",   "typeof",     "var",    "void",    "while",   "with",     "yield",    "true",    "false",
-    "null",  "undefined",  "async",  "await",   "of",
+    "abstract",  "boolean",  "break",     "byte",       "case",   "catch",   "char",         "class",
+    "const",     "continue", "debugger",  "default",    "delete", "do",      "double",       "else",
+    "enum",      "export",   "extends",   "false",      "final",  "finally", "float",        "for",
+    "function",  "goto",     "if",        "implements", "import", "in",      "instanceof",   "int",
+    "interface", "long",     "native",    "new",        "null",   "package", "private",      "protected",
+    "public",    "return",   "short",     "static",     "super",  "switch",  "synchronized", "this",
+    "throw",     "throws",   "transient", "true",       "try",    "typeof",  "var",          "void",
+    "volatile",  "while",    "with",
 };
 
 fn isKeyword(t: []const u8) bool {
@@ -872,6 +1400,53 @@ test "function scopes reproduce ClamAV declaration numbering" {
     for (cases) |config| {
         var cap: Capture = .{};
         try std.testing.expectEqualStrings(config[1], try normalize(config[0], &cap));
+    }
+}
+
+test "the HTML form matches libclamav's javascript file" {
+    // Each script is fed with the end tag that follows it in the page, as the HTML scanner
+    // passes it; the expected text is the `javascript` file clamscan --leave-temps kept for
+    // `<html><body><script>SCRIPT</script></body></html>` (tools/diff/js_goldens.py), whose
+    // writer adds `<script>` before and `</script>` after unless the form already ends so.
+    const cases = [_][2][]const u8{
+        .{ "a++;b--;a+ +b;a- -b;a+++b;", "<script>a++;b--;a++b;a--b;a+++b;</script>" },
+        .{ "x='say \"hi\"';y='\\x41\\xe9\\u20ac\\uD800';", "<script>x=\"say \"hi\"\";y=\"a\xe9\xe2\x82\xac\xed\xa0\x80\";</script>" },
+        .{ "x='\\101\\0\\9';", "<script>x=\"101\x019\";</script>" },
+        .{ "x='\\x4';y='\\u00';z='\\xzz\\uzzzz';", "<script>x=\"\\\";y=\"\\00\";z=\"\xff\xef\xbf\xbf\";</script>" },
+        .{ "x='\\\\';y=1;'z';", "<script>x=\"\\';y=1;\"z\";</script>\"</script>" },
+        .{ "x='unterminated", "<script>x=\"unterminated</script>\"</script>" },
+        .{ "x=/a\\/b/gi;y=/A\"B/;", "<script>x=/a/b/gi;y=/a\"b/;</script>\"</script>" },
+        .{ "a=1;// comment with / slashes\nb=2;//c\nd;", "<script>a=1;comment with/slashes b=2;d;</script>" },
+        .{ "a\x00b;c\x01d;#e@f`g\x80h;", "<script>ab;c d;e f g h;</script>" },
+        .{ "x=a\\b;y=(\\d);z=a.\\nb;w=1\\2;v=a \\);u=a\\u0041;", "<script>x=a b;y=( d);z=a.nb;w=1  2;v=a );u=a\\0041;</script>" },
+        .{ "x=f((a);", "<script>x=f((a);</script>)</script>" },
+        .{ "eval('a=1');b;x=eval('c')+1;eval(unescape('d=2;'));", "<script>a=b;x=1+1;cd=2;</script>" },
+        .{ "x='a'+unescape('%62')+'c';var unescape('%41'),b;", "<script>x=\"a\"+\"b\"+\"c\";var\"a\",n001;</script>" },
+        .{ "a=1;var a;var b;var a;", "<script>n002=1;var n002;var n001;var n002;</script>" },
+        .{ "x={a:1};var a;function f(){b=1;var c}var b;", "<script>x={n000:1};var n000;function n001(){n003=1;var n002}var n003;</script>" },
+        .{ "function f(a){function g(){return a}}f;g;", "<script>function n000(n001){function n002(){return n001}}f;g;</script>" },
+        .{ "var a=[b,c],d;var e={f:1,g:2},h;function i(){var j,k;for(var l=0,m=0;;);}", "<script>var n000=[b,c],n001;var n002={f:1,g:2},n003;function n004(){var n005,k;for(var n006=0,m=0;;);}</script>" },
+        .{ "{var a;},b;var c;\n[var d;e,f]", "<script>{var n000;},n001;var n002;[var n003;e,f]</script>" },
+        .{ "function(a)b,c;function(r,{s,t;function({u;function()v,w;", "<script>function(n000)b,n001;function(n002,{n003,t;function({u;function()n004,n005;</script>))</script>" },
+        .{ "function x10 unescape('a') b;function [function }c;function d;}d", "<script>function n000\"a\"n001;function[function}n002;function n003;}d</script>" },
+        .{ "var byte,let,undefined,yield;", "<script>var byte,n000,n001,n002;</script>" },
+    };
+    for (cases) |c| {
+        var cap: Capture = .{};
+        const n = try std.testing.allocator.create(Normalizer);
+        defer std.testing.allocator.destroy(n);
+        n.* = .initHtml(.{ .ctx = &cap, .write = Capture.write });
+        try n.feed(c[0]);
+        try n.feed("</script>");
+        try n.finish();
+        const out = cap.buf[0..cap.len];
+        var file: [8192]u8 = undefined;
+        const tail = if (std.mem.endsWith(u8, out, "</script>")) "" else "</script>";
+        const got = try std.fmt.bufPrint(&file, "<script>{s}{s}", .{ out, tail });
+        std.testing.expectEqualStrings(c[1], got) catch |e| {
+            std.debug.print("script: {s}\n", .{c[0]});
+            return e;
+        };
     }
 }
 
