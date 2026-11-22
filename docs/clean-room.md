@@ -190,8 +190,8 @@ From `--allmatch` verdicts of signatures for every target type over files of eac
 | Text form | 1,355 text files (Python stdlib sources, four seam files of up to 1.2 MB) | 1,355 |
 | HTML nocomment | 196 system HTML files | 196 |
 | HTML notags | 196 system HTML files | 195 |
-| HTML nocomment | 600 `gen_html.py` stress documents | 510 |
-| HTML notags | 600 `gen_html.py` stress documents | 570 |
+| HTML nocomment | 600 `gen_html.py` stress documents | 541 |
+| HTML notags | 600 `gen_html.py` stress documents | 594 |
 | P4.21 gate (`realdb.py gate`, whole main and daily) | 35,309 samples | 35,309 |
 
 The stress documents that still differ combine constructs listed under "Not reproduced".
