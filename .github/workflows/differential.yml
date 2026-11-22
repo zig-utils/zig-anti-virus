@@ -31,6 +31,9 @@ jobs:
       # $RUNNER_TEMP, so the job also runs on the self-hosted ReviewOS runner.
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
         run: sh tools/diff/install_clamav.sh "$CLAMAV_VERSION"
+      # tools/diff/python_env.sh: a venv from the first python3 that works, first on PATH.
+      - name: Python tools
+        run: sh tools/diff/python_env.sh yara-python
       - run: zig build diff-tool
       - name: libclamav still gives the recorded verdicts
         run: python3 tools/diff/clamav.py --work "$RUNNER_TEMP/work" tests/differential/cases
@@ -38,8 +41,7 @@ jobs:
         run: zig build diff
       - name: zav agrees with yara on the YARA rules
         run: |
-          python3 -m venv "$RUNNER_TEMP/py" && "$RUNNER_TEMP/py/bin/pip" install --quiet yara-python
-          "$RUNNER_TEMP/py/bin/python3" tools/diff/yara_check.py --work "$RUNNER_TEMP/ywork" tests/differential/cases
+          python3 tools/diff/yara_check.py --work "$RUNNER_TEMP/ywork" tests/differential/cases
       - name: On failure, record what libclamav says
         if: failure()
         run: |
@@ -60,14 +62,12 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      # A virtual environment rather than the system Python, which a self-hosted runner may not
-      # let pip write to; its bin goes first on PATH, so `python3` and `cvd` below are its own.
+      # The Python tools in a venv rather than the system Python, which a self-hosted runner may
+      # not let pip write to; its bin goes first on PATH, so `python3` and `cvd` below are its own.
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}, PCRE2 and Python tools
         run: |
           sh tools/diff/install_clamav.sh "$CLAMAV_VERSION" --pcre2
-          python3 -m venv "$RUNNER_TEMP/py"
-          "$RUNNER_TEMP/py/bin/pip" install --quiet cvdupdate yara-python oletools
-          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+          sh tools/diff/python_env.sh cvdupdate yara-python oletools
       # database.clamav.net serves Cisco's cvdupdate, not generic clients. The databases are
       # cached between runs and never leave the runner.
       - name: Restore the ClamAV databases
@@ -169,6 +169,8 @@ jobs:
           done
           echo "CLAMSCAN=$root/bin/clamscan" >> "$GITHUB_ENV"
           echo "CLAMAV_CERTS=$root/etc/certs" >> "$GITHUB_ENV"
+      - name: Python
+        run: sh tools/diff/python_env.sh
       - run: zig build diff-tool -Doptimize=ReleaseSafe
       - name: Entry points and sections
         run: |
