@@ -53,8 +53,8 @@ jobs:
           # Everything else in rotation.
           - { target: all, iterations: 5000000 }
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Fuzz
@@ -71,8 +71,8 @@ jobs:
     name: Adversarial corpus (ReleaseSafe)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test -Doptimize=safe --summary all

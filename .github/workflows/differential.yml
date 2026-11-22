@@ -23,21 +23,14 @@ jobs:
     name: Signature grammar against libclamav
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      # tools/diff/install_clamav.sh: apt where the runner allows sudo, otherwise unpacked into
+      # $RUNNER_TEMP, so the job also runs on the self-hosted ReviewOS runner.
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
-          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb"
-          clamscan=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')
-          certs=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")
-          echo "CLAMSCAN=$clamscan" >> "$GITHUB_ENV"
-          echo "CLAMAV_CERTS=$certs" >> "$GITHUB_ENV"
-          "$clamscan" --version
+        run: sh tools/diff/install_clamav.sh "$CLAMAV_VERSION"
       - run: zig build diff-tool
       - name: libclamav still gives the recorded verdicts
         run: python3 tools/diff/clamav.py --work "$RUNNER_TEMP/work" tests/differential/cases
@@ -45,8 +38,8 @@ jobs:
         run: zig build diff
       - name: zav agrees with yara on the YARA rules
         run: |
-          python3 -m pip install --quiet yara-python
-          python3 tools/diff/yara_check.py --work "$RUNNER_TEMP/ywork" tests/differential/cases
+          python3 -m venv "$RUNNER_TEMP/py" && "$RUNNER_TEMP/py/bin/pip" install --quiet yara-python
+          "$RUNNER_TEMP/py/bin/python3" tools/diff/yara_check.py --work "$RUNNER_TEMP/ywork" tests/differential/cases
       - name: On failure, record what libclamav says
         if: failure()
         run: |
@@ -54,7 +47,7 @@ jobs:
           git diff > "$RUNNER_TEMP/recorded.diff"
           cat "$RUNNER_TEMP/recorded.diff" | head -200
       - if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: recorded-verdicts
           path: ${{ runner.temp }}/recorded.diff
@@ -63,23 +56,22 @@ jobs:
     name: Real databases against libclamav
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      # A virtual environment rather than the system Python, which a self-hosted runner may not
+      # let pip write to; its bin goes first on PATH, so `python3` and `cvd` below are its own.
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}, PCRE2 and Python tools
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
-          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb" libpcre2-dev
-          echo "CLAMSCAN=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')" >> "$GITHUB_ENV"
-          echo "CLAMAV_CERTS=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")" >> "$GITHUB_ENV"
-          python3 -m pip install --quiet cvdupdate yara-python oletools
+          sh tools/diff/install_clamav.sh "$CLAMAV_VERSION" --pcre2
+          python3 -m venv "$RUNNER_TEMP/py"
+          "$RUNNER_TEMP/py/bin/pip" install --quiet cvdupdate yara-python oletools
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
       # database.clamav.net serves Cisco's cvdupdate, not generic clients. The databases are
       # cached between runs and never leave the runner.
       - name: Restore the ClamAV databases
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/clamav-db
           key: clamav-db-${{ github.run_id }}
@@ -142,7 +134,8 @@ jobs:
           git clone -q --depth 1 https://github.com/Yara-Rules/rules.git "$RUNNER_TEMP/yara-rules"
           db="$RUNNER_TEMP/db"
           python3 tools/diff/realdb.py corpus --db $db/main --db $db/daily --yara "$RUNNER_TEMP/yara-rules" --out "$RUNNER_TEMP/e13.txt"
-          zig build e13 -Doptimize=ReleaseSafe -- "$RUNNER_TEMP/e13.txt" --show 60
+          # PCRE2_PREFIX is set where install_clamav.sh unpacked libpcre2-dev rather than installing it.
+          zig build e13 -Doptimize=ReleaseSafe ${PCRE2_PREFIX:+-Dpcre2=$PCRE2_PREFIX} -- "$RUNNER_TEMP/e13.txt" --show 60
 
   formats:
     name: Executable layouts and normalisers against libclamav (${{ matrix.os }})
@@ -152,27 +145,19 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }} (Linux)
         if: runner.os == 'Linux'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
-          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb"
-          echo "CLAMSCAN=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')" >> "$GITHUB_ENV"
-          echo "CLAMAV_CERTS=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")" >> "$GITHUB_ENV"
+        run: sh tools/diff/install_clamav.sh "$CLAMAV_VERSION"
       # The official macOS package, unpacked rather than installed: its binaries get an rpath to
       # their libraries and an ad hoc signature.
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }} (macOS)
         if: runner.os == 'macOS'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.macos.universal.pkg" -D "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.macos.universal.pkg" "https://github.com/Cisco-Talos/clamav/releases/download/clamav-$CLAMAV_VERSION/clamav-$CLAMAV_VERSION.macos.universal.pkg"
           pkgutil --expand-full "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.macos.universal.pkg" "$RUNNER_TEMP/pkg"
           root="$RUNNER_TEMP/clamav"
           mkdir -p "$root"

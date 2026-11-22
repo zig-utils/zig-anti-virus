@@ -16,19 +16,13 @@ jobs:
   record:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: oven-sh/setup-bun@v2
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "clamav-$CLAMAV_VERSION.linux.x86_64.deb" -D "$RUNNER_TEMP"
-          sudo apt-get install -y "$RUNNER_TEMP/clamav-$CLAMAV_VERSION.linux.x86_64.deb"
-          echo "CLAMSCAN=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')" >> "$GITHUB_ENV"
-          echo "CLAMAV_CERTS=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")" >> "$GITHUB_ENV"
+        run: sh tools/diff/install_clamav.sh "$CLAMAV_VERSION"
       - name: Pages
         run: |
           bun bench/fetch.ts B1 --out "$RUNNER_TEMP/corpus"
@@ -39,7 +33,7 @@ jobs:
         run: |
           zig build diff-tool -Doptimize=ReleaseSafe
           python3 tools/diff/js_goldens.py compare "$RUNNER_TEMP/goldens" --show 30 || true
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: js-goldens
           path: ${{ runner.temp }}/goldens
