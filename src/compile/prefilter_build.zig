@@ -67,8 +67,6 @@ fn searched(p: prog.Program) bool {
 pub fn buildTable(gpa: std.mem.Allocator, programs: prog.Programs, specs: []const prog_build.AtomSpec) ![]align(64) u8 {
     var keyed: std.ArrayList(Keyed) = .empty;
     defer keyed.deinit(gpa);
-    var checks: std.ArrayList(pf.Check) = .empty;
-    defer checks.deinit(gpa);
     for (0..programs.count()) |i| {
         const p = programs.get(i);
         const h = p.header;
@@ -78,17 +76,18 @@ pub fn buildTable(gpa: std.mem.Allocator, programs: prog.Programs, specs: []cons
             const expanded = atoms.expandWindow(p.pattern, h.anchor_part, off, spec.q) orelse return error.InvalidAtomExpansion;
             var entry: pf.Entry = .{
                 .prog = @intCast(i),
-                .ext = 0,
                 .back = off,
-                .ext_len = 0,
+                .rel = 0,
                 .stride = 1,
                 .q = spec.q,
                 .flags = h.target << pf.entry_target_shift,
+                .value = 0,
+                .mask = 0,
             };
             if (bestCheck(p, off, spec.q, &.{}, false)) |check| {
-                entry.flags |= pf.entry_check;
-                entry.ext = @intCast(checks.items.len);
-                try checks.append(gpa, check);
+                entry.rel = check.rel;
+                entry.value = check.value;
+                entry.mask = check.mask;
             }
             for (expanded.grams[0..expanded.len]) |g| try keyed.append(gpa, .{ .key = g, .entry = entry });
             continue;
@@ -98,31 +97,37 @@ pub fn buildTable(gpa: std.mem.Allocator, programs: prog.Programs, specs: []cons
         const after = lit.len - spec.off - spec.q;
         const ext_len: u8 = @intCast(@min(after, 4));
         const check = bestCheck(p, @as(u32, spec.off) + h.anchor_delta, spec.q, lit[spec.off + spec.q ..][0..ext_len], w.nocase);
+        // The window: the check where one says more, else the extension bytes after the key
+        // gram (lowercase for a case-insensitive atom).
+        const back = @as(u32, spec.off) + h.anchor_delta;
+        const ext_bytes = lit[spec.off + spec.q ..][0..ext_len];
+        const ext: u32 = if (w.nocase) gramOf(&lowerAll(ext_bytes), ext_len) else gramOf(ext_bytes, ext_len);
         var entry: pf.Entry = .{
             .prog = @intCast(i),
-            .ext = gramOf(lit[spec.off + spec.q ..], ext_len),
-            .back = @as(u32, spec.off) + h.anchor_delta,
-            .ext_len = ext_len,
+            .back = back,
+            .rel = back + spec.q,
             .stride = spec.stride,
             .q = spec.q,
             .flags = (if (w.nocase) pf.entry_nocase else 0) | h.target << pf.entry_target_shift,
+            .value = ext,
+            .mask = if (ext_len == 0) 0 else (@as(u64, 1) << @intCast(8 * ext_len)) - 1,
         };
         if (check) |ck| {
-            entry.flags |= pf.entry_check;
-            entry.ext = @intCast(checks.items.len);
-            entry.ext_len = 0;
-            try checks.append(gpa, ck);
+            entry.rel = ck.rel;
+            entry.value = ck.value;
+            entry.mask = ck.mask;
         }
         if (!w.nocase) {
             try keyed.append(gpa, .{ .key = gramOf(w.window, spec.q), .entry = entry });
             continue;
         }
-        if (check == null) entry.ext = gramOf(&lowerAll(lit[spec.off + spec.q ..][0..ext_len]), ext_len);
         var it = variants(w.window[0..spec.q]);
         while (it.next()) |v| try keyed.append(gpa, .{ .key = v, .entry = entry });
     }
 
-    // Entries grouped by key in key order, slots at most half full.
+    // Entries grouped by key in key order, slots at most half full: at two thirds (half the
+    // slot memory) a probe that finds nothing walks twice as many slots, and stage two on B1's
+    // PE files was 2 to 6% slower (E2).
     std.mem.sort(Keyed, keyed.items, {}, Keyed.less);
     var distinct: usize = 0;
     for (keyed.items, 0..) |k, i| {
@@ -131,15 +136,14 @@ pub fn buildTable(gpa: std.mem.Allocator, programs: prog.Programs, specs: []cons
     const slot_count = try std.math.ceilPowerOfTwo(usize, @max(16, distinct * 2));
     const slots_at = @sizeOf(pf.TableHeader);
     const entries_at = slots_at + slot_count * @sizeOf(pf.Slot);
-    const checks_at = entries_at + keyed.items.len * @sizeOf(pf.Entry);
-    const table = try gpa.alignedAlloc(u8, .@"64", checks_at + checks.items.len * @sizeOf(pf.Check));
+    const end = entries_at + keyed.items.len * @sizeOf(pf.Entry);
+    const table = try gpa.alignedAlloc(u8, .@"64", end);
     errdefer gpa.free(table);
-    const th: pf.TableHeader = .{ .slot_count = @intCast(slot_count), .entry_count = @intCast(keyed.items.len), .check_count = @intCast(checks.items.len) };
-    @memcpy(table[checks_at..], std.mem.sliceAsBytes(checks.items));
+    const th: pf.TableHeader = .{ .slot_count = @intCast(slot_count), .entry_count = @intCast(keyed.items.len) };
     @memcpy(table[0..@sizeOf(pf.TableHeader)], std.mem.asBytes(&th));
     const slots: []pf.Slot = @ptrCast(@alignCast(table[slots_at..entries_at]));
     @memset(slots, .{ .key = 0, .first = pf.empty_slot });
-    const entries: []pf.Entry = @ptrCast(@alignCast(table[entries_at..checks_at]));
+    const entries: []pf.Entry = @ptrCast(@alignCast(table[entries_at..end]));
     for (keyed.items, 0..) |k, i| {
         var e = k.entry;
         const last = i + 1 == keyed.items.len or keyed.items[i + 1].key != k.key;
@@ -304,7 +308,9 @@ fn byteScore(value: u8, mask: u8) f32 {
 /// A masked 8-byte window of the anchor part that says more than the extension bytes after
 /// the atom, or null. `atom_at` is the atom's distance from the part's start; bytes inside the
 /// atom's key gram are already matched and count for nothing.
-fn bestCheck(p: prog.Program, atom_at: u32, q: u8, ext: []const u8, nocase: bool) ?pf.Check {
+const Check = struct { rel: u32, value: u64, mask: u64 };
+
+fn bestCheck(p: prog.Program, atom_at: u32, q: u8, ext: []const u8, nocase: bool) ?Check {
     if (nocase or p.header.flags & prog.flag_folded != 0) return null;
     // The anchor part's bytes at fixed distances from its start, up to 64.
     var value: [64]u8 = @splat(0);
@@ -353,7 +359,7 @@ fn bestCheck(p: prog.Program, atom_at: u32, q: u8, ext: []const u8, nocase: bool
         }
     }
     if (best < 12 or best <= ext_score + 4) return null;
-    var c: pf.Check = .{ .rel = @intCast(best_at), .value = 0, .mask = 0 };
+    var c: Check = .{ .rel = @intCast(best_at), .value = 0, .mask = 0 };
     for (0..8) |k| {
         c.value |= @as(u64, value[best_at + k] & mask[best_at + k]) << @intCast(8 * k);
         c.mask |= @as(u64, mask[best_at + k]) << @intCast(8 * k);

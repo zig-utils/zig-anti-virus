@@ -29,17 +29,19 @@
 //!
 //! ATOM_TABLE[p]:
 //!
-//!     Header (32 bytes)     magic "ATOM", version, slot count (a power of two), entry count
+//!     Header (32 bytes)     magic "ATOM", version 2, slot count (a power of two), entry count
 //!     slots:   [slot_count]Slot (8 bytes)    {key, first entry}, linear probing, at most half full
-//!     entries: [entry_count]Entry (16 bytes) {program, extension, back, ext_len, stride, q, flags}
-//!     checks:  [check_count]Check (24 bytes)  {offset in the anchor part, value, mask}
+//!     entries: [entry_count]Entry (32 bytes) {program, back, rel, stride, q, flags, value, mask}
 //!
 //! A slot's key is an atom's first gram (shorter grams zero-extended); its entries follow one
 //! another up to the one flagged `last`. A filter hit at position `pos` of a filter with stride
 //! s means an atom may start at `pos - k` for some k below s: stage two reads the gram there,
-//! probes the table, and for each entry of the same stride and gram length compares up to four
-//! more bytes (`ext`), or a masked 8-byte window of the anchor part (a check), before handing
-//! `pos - k - back` (the anchor part's start) to the verifier.
+//! probes the table, and for each entry of the same stride and gram length compares one masked
+//! 8-byte window of the anchor part (`rel`, `value`, `mask`: the bytes after the key gram, or a
+//! window elsewhere in the part that says more) before handing `pos - k - back` (the anchor
+//! part's start) to the verifier. The window sits in the entry itself, so walking a chain reads
+//! the entries in order and the data near the candidate, nothing else (version 1 kept the
+//! wider windows in a separate array, one dependent load per entry of a chain).
 //! An atom occurrence is reported by exactly one sampled position of its own filter, so no
 //! candidate is produced twice.
 const std = @import("std");
@@ -76,22 +78,13 @@ pub const FilterRef = extern struct {
 
 pub const TableHeader = extern struct {
     magic: [4]u8 = "ATOM".*,
-    version: u32 = 1,
+    version: u32 = table_version,
     slot_count: u32,
     entry_count: u32,
-    check_count: u32 = 0,
-    _reserved: [12]u8 = @splat(0),
+    _reserved: [16]u8 = @splat(0),
 };
 
-/// A masked compare of the 8 bytes at `rel` from the anchor part's start, for atoms whose own
-/// bytes and extension say little (a run of zeros next to a short opcode): the entry's `ext`
-/// holds the check's index instead of extension bytes.
-pub const Check = extern struct {
-    rel: u32,
-    _pad: u32 = 0,
-    value: u64,
-    mask: u64,
-};
+pub const table_version = 2;
 
 pub const empty_slot: u32 = 0xffff_ffff;
 pub const gate_len = kernel.gate_len;
@@ -105,23 +98,26 @@ pub const Slot = extern struct {
 };
 
 pub const entry_last: u8 = 1 << 0;
+/// The window compares ASCII case-insensitively (`value` holds lowercase bytes).
 pub const entry_nocase: u8 = 1 << 1;
-/// `ext` is an index into the checks, not extension bytes.
-pub const entry_check: u8 = 1 << 2;
 /// The program's target type sits in the top four bits: the table is shared by every
 /// partition, and a partition keeps entries of its own target and of type 0.
 pub const entry_target_shift = 4;
+const entry_known_flags: u8 = entry_last | entry_nocase | 0xf0;
 
 pub const Entry = extern struct {
     prog: u32,
-    /// Up to four bytes that follow the key gram in the atom, little-endian.
-    ext: u32,
     /// Distance from the atom's first byte back to the anchor part's start.
     back: u32,
-    ext_len: u8,
+    /// Where the 8-byte window starts, from the anchor part's start.
+    rel: u32,
     stride: u8,
     q: u8,
     flags: u8,
+    _pad: u8 = 0,
+    /// The window's bytes where `mask` is set, little-endian; mask 0 compares nothing.
+    value: u64,
+    mask: u64,
 };
 
 comptime {
@@ -129,7 +125,7 @@ comptime {
     std.debug.assert(@sizeOf(FilterRef) == 16);
     std.debug.assert(@sizeOf(TableHeader) == 32);
     std.debug.assert(@sizeOf(Slot) == 8);
-    std.debug.assert(@sizeOf(Entry) == 16);
+    std.debug.assert(@sizeOf(Entry) == 32);
 }
 
 pub const Directory = extern struct {
@@ -199,7 +195,6 @@ pub const Partition = struct {
     gate: []const u8,
     slots: []const Slot,
     entries: []const Entry,
-    checks: []const Check,
 
     /// View a partition's PREFILTER region and the ATOM_TABLE region, or reuse the table an
     /// earlier partition already validated (`shared`).
@@ -216,7 +211,6 @@ pub const Partition = struct {
             .gate = &.{},
             .slots = &.{},
             .entries = &.{},
-            .checks = &.{},
         };
         const refs_end = @sizeOf(Header) + @as(usize, h.filter_count) * @sizeOf(FilterRef);
         if (refs_end > pf_bytes.len) return error.BadPrefilter;
@@ -242,7 +236,6 @@ pub const Partition = struct {
         if (shared) |t| {
             part.slots = t.slots;
             part.entries = t.entries;
-            part.checks = t.checks;
             return part;
         }
         try part.initTable(table_bytes, programs);
@@ -253,18 +246,15 @@ pub const Partition = struct {
     fn initTable(part: *Partition, table_bytes: []const u8, programs: prog.Programs) Error!void {
         if (table_bytes.len < @sizeOf(TableHeader) or @intFromPtr(table_bytes.ptr) % 8 != 0) return error.BadPrefilter;
         const th: *const TableHeader = @ptrCast(@alignCast(table_bytes.ptr));
-        if (!std.mem.eql(u8, &th.magic, "ATOM") or th.version != 1) return error.BadPrefilter;
+        if (!std.mem.eql(u8, &th.magic, "ATOM") or th.version != table_version) return error.BadPrefilter;
         if (th.slot_count == 0 or !std.math.isPowerOfTwo(th.slot_count)) return error.BadPrefilter;
         const slots_end = @sizeOf(TableHeader) + @as(u64, th.slot_count) * @sizeOf(Slot);
         const entries_end = slots_end + @as(u64, th.entry_count) * @sizeOf(Entry);
-        const checks_end = entries_end + @as(u64, th.check_count) * @sizeOf(Check);
-        if (checks_end > table_bytes.len) return error.BadPrefilter;
+        if (entries_end > table_bytes.len or slots_end % 8 != 0) return error.BadPrefilter;
         const slot_ptr: [*]const Slot = @ptrCast(@alignCast(table_bytes.ptr + @sizeOf(TableHeader)));
         const entry_ptr: [*]const Entry = @ptrCast(@alignCast(table_bytes.ptr + slots_end));
         part.slots = slot_ptr[0..th.slot_count];
         part.entries = entry_ptr[0..th.entry_count];
-        const check_ptr: [*]const Check = @ptrCast(@alignCast(table_bytes.ptr + entries_end));
-        part.checks = check_ptr[0..th.check_count];
         // Every chain stays inside the entries and ends; every program exists and carries the
         // atom the entry claims. A corrupt table is refused rather than half used.
         var free: usize = 0;
@@ -277,8 +267,7 @@ pub const Partition = struct {
             while (true) : (e += 1) {
                 if (e >= part.entries.len) return error.BadPrefilter;
                 const entry = part.entries[e];
-                if (entry.prog >= programs.count() or entry.ext_len > 4) return error.BadPrefilter;
-                if (entry.flags & entry_check != 0 and (entry.ext >= part.checks.len or entry.ext_len != 0)) return error.BadPrefilter;
+                if (entry.prog >= programs.count() or entry.flags & ~entry_known_flags != 0 or entry.value & ~entry.mask != 0) return error.BadPrefilter;
                 // Entries of filters this partition lacks belong to other partitions.
                 const ok = (entry.q == 4 and (entry.stride == 1 or entry.stride == 2 or entry.stride == 3 or entry.stride == 4 or entry.stride == 8)) or ((entry.q == 3 or entry.q == 2) and entry.stride == 1);
                 if (!ok or entry.flags >> entry_target_shift > 14) return error.BadPrefilter;
@@ -310,12 +299,11 @@ pub fn describe(parts: *const [partitions]?Partition, w: *std.Io.Writer) !void {
             table_done = true;
             var used: usize = 0;
             for (part.slots) |sl| used += @intFromBool(sl.first != empty_slot);
-            try w.print("  atom table   {d} slots ({d:.1}% used), {d} entries, {d} checks, {d} bytes\n", .{
+            try w.print("  atom table   {d} slots ({d:.1}% used), {d} entries, {d} bytes\n", .{
                 part.slots.len,
                 100 * @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(part.slots.len)),
                 part.entries.len,
-                part.checks.len,
-                part.slots.len * @sizeOf(Slot) + part.entries.len * @sizeOf(Entry) + part.checks.len * @sizeOf(Check),
+                part.slots.len * @sizeOf(Slot) + part.entries.len * @sizeOf(Entry),
             });
         }
         try w.print("  partition {d:<2} {d} programs without an atom{s}\n", .{ p, part.short.len, if (part.gate.len > 0) ", stride-one gate" else "" });
@@ -343,30 +331,31 @@ pub inline fn slotOf(key: u32, n: usize) usize {
 
 pub const load4 = kernel.load4;
 
-inline fn foldGram(x: u32) u32 {
-    // ASCII lowercase on all four bytes at once: bytes in 'A'..'Z' get 0x20 added.
-    const v: @Vector(4, u8) = @bitCast(x);
-    const upper = (v >= @as(@Vector(4, u8), @splat('A'))) & (v <= @as(@Vector(4, u8), @splat('Z')));
-    return @bitCast(v | @select(u8, upper, @as(@Vector(4, u8), @splat(0x20)), @as(@Vector(4, u8), @splat(0))));
+/// ASCII lowercase on all eight bytes at once: bytes in 'A'..'Z' get 0x20 added.
+inline fn fold8(x: u64) u64 {
+    const v: @Vector(8, u8) = @bitCast(x);
+    const upper = (v >= @as(@Vector(8, u8), @splat('A'))) & (v <= @as(@Vector(8, u8), @splat('Z')));
+    return @bitCast(v | @select(u8, upper, @as(@Vector(8, u8), @splat(0x20)), @as(@Vector(8, u8), @splat(0))));
 }
 
-/// Whether the `len` bytes at `data[pos..]` equal the low `len` bytes of `ext`.
-inline fn extMatches(data: []const u8, pos: usize, ext: u32, len: u8, nocase: bool) bool {
-    if (len == 0) return true;
-    if (pos + len > data.len) return false;
-    var got: u32 = 0;
-    for (0..len) |i| got |= @as(u32, data[pos + i]) << @intCast(8 * i);
-    const mask: u32 = if (len == 4) 0xffff_ffff else (@as(u32, 1) << @intCast(8 * len)) - 1;
-    if (nocase) return foldGram(got) & mask == foldGram(ext) & mask;
-    return got & mask == ext & mask;
-}
-
-/// Whether the check's window, read from the anchor part starting at `part_start`, matches.
-/// A window running past the data cannot be decided here: the verifier decides.
-inline fn checkMatches(c: Check, data: []const u8, part_start: usize) bool {
-    const at = part_start + c.rel;
-    if (at + 8 > data.len) return true;
-    return std.mem.readInt(u64, data[at..][0..8], .little) & c.mask == c.value;
+/// Whether the entry's window, read from the anchor part starting at `part_start`, matches.
+/// A window running past the data's end is compared on the bytes that exist; a set mask byte
+/// beyond the end cannot be decided here, so the verifier decides.
+inline fn windowMatches(e: Entry, data: []const u8, part_start: usize) bool {
+    const at = part_start + e.rel;
+    var got: u64 = undefined;
+    if (at + 8 <= data.len) {
+        got = std.mem.readInt(u64, data[at..][0..8], .little);
+    } else {
+        if (at >= data.len) return true;
+        var buf: [8]u8 = @splat(0);
+        @memcpy(buf[0 .. data.len - at], data[at..]);
+        const have: u64 = (@as(u64, 1) << @intCast(8 * (data.len - at))) - 1;
+        if (e.mask & ~have != 0) return true;
+        got = std.mem.readInt(u64, &buf, .little);
+    }
+    if (e.flags & entry_nocase != 0) got = fold8(got);
+    return got & e.mask == e.value;
 }
 
 /// A candidate from stage one: a sampled position and the filter that fired.
@@ -381,6 +370,15 @@ pub const Stats = struct {
     candidates: u64 = 0,
     /// Atom table probes in stage two.
     probes: u64 = 0,
+    /// Probes whose key has a slot, and the entries those slots chain to.
+    slot_hits: u64 = 0,
+    entries_read: u64 = 0,
+    /// Entries read and dropped: another filter kind, another target, the extension or check.
+    drop_kind: u64 = 0,
+    drop_target: u64 = 0,
+    drop_ext: u64 = 0,
+    /// Entries read per chain, indexed by the chain's first entry (diagnostics).
+    per_chain: ?[]u32 = null,
     /// Entries whose extension bytes matched (handed to the verifier).
     verifies: u64 = 0,
     /// Deferred programs searched in the second pass.
@@ -497,9 +495,34 @@ pub fn runnableKernels(out: *[8]*const Kernel) []*const Kernel {
     return out[0..n];
 }
 
+/// Candidates between a slot prefetch and its probe.
+const prefetch_ahead = 12;
+
+inline fn prefetchSlots(part: *const Partition, data: []const u8, c: Candidate) void {
+    const f = part.filters[c.filter];
+    const pos: usize = c.pos;
+    if (pos < 8 or pos + 4 > data.len) return;
+    // The sampled gram's position and the one or two before it (strides 1 to 3); stride 4 and
+    // 8 filters prefetch their first three offsets.
+    const w = std.mem.readInt(u64, data[pos - 4 ..][0..8], .little) >> 8;
+    const mask: u32 = switch (f.q) {
+        4 => 0xffff_ffff,
+        3 => 0xff_ffff,
+        else => 0xffff,
+    };
+    const n = @min(f.stride, 3);
+    inline for (0..3) |k| if (k < n) {
+        const key: u32 = @as(u32, @truncate(w >> @intCast(8 * (3 - k)))) & mask;
+        @prefetch(&part.slots[slotOf(key, part.slots.len)], .{});
+    };
+}
+
 /// Stage two over a batch of candidates.
 pub fn stage2(part: *const Partition, data: []const u8, cands: []const Candidate, sink: anytype, stats: ?*Stats) bool {
-    for (cands) |c| {
+    for (cands, 0..) |c, ci| {
+        // The slots a later candidate will probe, requested now: probes are independent, but a
+        // probe's found-or-not branch mispredicts often enough to stall the loads behind it.
+        if (ci + prefetch_ahead < cands.len) prefetchSlots(part, data, cands[ci + prefetch_ahead]);
         const f = part.filters[c.filter];
         const pos: usize = c.pos;
         const kind: usize = switch (f.q) {
@@ -528,12 +551,28 @@ pub fn stage2(part: *const Partition, data: []const u8, cands: []const Candidate
                 s.by_kind[kind].probes += 1;
             }
             var e = part.lookup(key) orelse continue;
+            if (stats) |s| {
+                s.slot_hits += 1;
+                if (s.per_chain) |pc| {
+                    var x = e;
+                    while (part.entries[x].flags & entry_last == 0) x += 1;
+                    pc[e] +|= @intCast(x - e + 1);
+                }
+            }
             while (true) : (e += 1) {
                 const entry = part.entries[e];
+                if (stats) |s| {
+                    s.entries_read += 1;
+                    const tg = entry.flags >> entry_target_shift;
+                    if (entry.stride != f.stride or entry.q != f.q) {
+                        s.drop_kind += 1;
+                    } else if (!(tg == 0 or tg == part.partition)) {
+                        s.drop_target += 1;
+                    } else s.drop_ext += 1;
+                }
                 const target = entry.flags >> entry_target_shift;
                 if (entry.stride == f.stride and entry.q == f.q and entry.back <= start and
-                    (target == 0 or target == part.partition) and
-                    (if (entry.flags & entry_check != 0) checkMatches(part.checks[entry.ext], data, start - entry.back) else extMatches(data, start + f.q, entry.ext, entry.ext_len, entry.flags & entry_nocase != 0)))
+                    (target == 0 or target == part.partition) and windowMatches(entry, data, start - entry.back))
                 {
                     if (stats) |s| {
                         s.verifies += 1;

@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
         } else try dirs.append(arena, args[i]);
     }
     var corpus: Corpus = .{};
-    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "rec") and !std.mem.eql(u8, cmd, "short") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
+    if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "gated") and !std.mem.eql(u8, cmd, "rec") and !std.mem.eql(u8, cmd, "short") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
 
     if (std.mem.eql(u8, cmd, "census")) return census(database, index);
     if (std.mem.eql(u8, cmd, "tierd")) return tierD(gpa, index);
@@ -103,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "top")) return top(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "grams")) return grams(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "kernel")) return kernelDiff(gpa, io, index, corpus);
+    if (std.mem.eql(u8, cmd, "stage2")) return stage2Split(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "planted")) return planted(gpa, io, index, limit);
     if (std.mem.eql(u8, cmd, "worst")) return worst(gpa, io, index);
     if (std.mem.eql(u8, cmd, "vmprog")) {
@@ -143,6 +144,44 @@ pub fn main(init: std.process.Init) !void {
             var wr: std.Io.Writer = .fixed(&buf);
             zav.compile.hexsig.format(p.pattern, &wr) catch {};
             std.debug.print("prog {d} sub {d} t{d} flags {x} anchor op {d}: {s}\n", .{ k, p.header.subsig, p.header.target, p.header.flags, p.header.anchor_op, wr.buffered() });
+        }
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "gated")) {
+        // gated <db>: the PE partition's entries of the stride-one filters, by gram length.
+        const part = index.partitionFor(1).?;
+        var counts: [5]usize = @splat(0);
+        for (part.entries) |e| {
+            const tg = e.flags >> pf.entry_target_shift;
+            if (e.stride != 1 or !(tg == 0 or tg == 1)) continue;
+            counts[e.q] += 1;
+            if (e.q == 2) std.debug.print("q2 prog {d} target {d} back {d} window at {d} mask {x}\n", .{ e.prog, tg, e.back, e.rel, e.mask });
+        }
+        std.debug.print("stride-one entries: q4 {d}, q3 {d}, q2 {d}\n", .{ counts[4], counts[3], counts[2] });
+        for (part.short) |k| {
+            var buf: [4096]u8 = undefined;
+            var wr: std.Io.Writer = .fixed(&buf);
+            zav.compile.hexsig.format(index.programs.?.get(k).pattern, &wr) catch {};
+            std.debug.print("no atom: prog {d}: {s}\n", .{ k, wr.buffered() });
+        }
+        var firsts: [3][256]u32 = @splat(@splat(0));
+        for (part.slots) |sl| {
+            if (sl.first == pf.empty_slot) continue;
+            var e = sl.first;
+            while (true) : (e += 1) {
+                const en = part.entries[e];
+                const tg = en.flags >> pf.entry_target_shift;
+                if (en.stride == 1 and (tg == 0 or tg == 1)) {
+                    firsts[en.q - 2][sl.key & 0xff] += 1;
+                    if (en.q == 2) std.debug.print("q2 key {x:0>4}\n", .{@byteSwap(@as(u16, @truncate(sl.key)))});
+                }
+                if (en.flags & pf.entry_last != 0) break;
+            }
+        }
+        for (firsts, 2..) |f, qq| {
+            var n: usize = 0;
+            for (f) |c| n += @intFromBool(c > 0);
+            std.debug.print("q{d}: {d} distinct first bytes\n", .{ qq, n });
         }
         return;
     }
@@ -187,6 +226,8 @@ fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             i += 1;
             c.crowd.max_chain = try std.fmt.parseInt(u32, args[i], 10);
             if (c.crowd.max_chain == 0) c.crowd.max_chain = std.math.maxInt(u32);
+        } else if (std.mem.eql(u8, a, "--no-q2")) {
+            c.atom_costs.q2_penalty = std.math.inf(f64);
         } else if (std.mem.eql(u8, a, "--no-text")) {
             c.atom_costs.text = false;
         } else if (std.mem.eql(u8, a, "--gate-ns")) {
@@ -382,6 +423,135 @@ const CountSink = struct {
     }
 };
 
+/// Stage two alone over recorded stage-one candidates, split into its parts: the slot probes
+/// only, then probes and chain walks (the production stage two).
+fn stage2Split(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
+    var datas: std.ArrayList([]u8) = .empty;
+    defer {
+        for (datas.items) |d| gpa.free(d);
+        datas.deinit(gpa);
+    }
+    for (corpus.paths.items) |p| try datas.append(gpa, try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31)));
+    const mb = @as(f64, @floatFromInt(corpus.bytes)) / 1e6;
+    var ring: [pf.ring_len]pf.Candidate = undefined;
+    var cands: std.ArrayList(pf.Candidate) = .empty;
+    defer cands.deinit(gpa);
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(gpa);
+    for (datas.items) |d| {
+        const part = index.partitionFor(targetOf(d)) orelse {
+            try ends.append(gpa, cands.items.len);
+            continue;
+        };
+        var pos: usize = 0;
+        while (pos < d.len) {
+            const n, const next = pf.stage1(part, d, pos, &ring);
+            try cands.appendSlice(gpa, ring[0..n]);
+            pos = next;
+        }
+        try ends.append(gpa, cands.items.len);
+    }
+    var best_probe: u64 = std.math.maxInt(u64);
+    var best_full: u64 = std.math.maxInt(u64);
+    var sum: u64 = 0;
+    for (0..rounds) |_| {
+        var t = now(io);
+        var start: usize = 0;
+        for (datas.items, ends.items) |d, end| {
+            defer start = end;
+            const part = index.partitionFor(targetOf(d)) orelse continue;
+            for (cands.items[start..end]) |c| {
+                const f = part.filters[c.filter];
+                var k: usize = 0;
+                while (k < f.stride and k <= c.pos) : (k += 1) {
+                    const at = c.pos - k;
+                    if (at + 4 > d.len) continue;
+                    const key = switch (f.q) {
+                        4 => pf.load4(d, at),
+                        3 => pf.load4(d, at) & 0xff_ffff,
+                        else => pf.load4(d, at) & 0xffff,
+                    };
+                    sum +%= part.lookup(key) orelse 0;
+                }
+            }
+        }
+        best_probe = @min(best_probe, nsSince(io, t));
+        t = now(io);
+        var sink: CountSink = .{};
+        start = 0;
+        for (datas.items, ends.items) |d, end| {
+            defer start = end;
+            const part = index.partitionFor(targetOf(d)) orelse continue;
+            _ = pf.stage2(part, d, cands.items[start..end], &sink, null);
+        }
+        best_full = @min(best_full, nsSince(io, t));
+        sum +%= sink.n;
+    }
+    std.mem.doNotOptimizeAway(sum);
+    {
+        // Which grams the stride-3 candidates sit on.
+        var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer counts.deinit(gpa);
+        var start: usize = 0;
+        var s3: u64 = 0;
+        for (datas.items, ends.items) |d, end| {
+            defer start = end;
+            const part = index.partitionFor(targetOf(d)) orelse continue;
+            for (cands.items[start..end]) |c| {
+                if (part.filters[c.filter].stride != 3 or c.pos + 4 > d.len) continue;
+                s3 += 1;
+                const gop = try counts.getOrPut(gpa, pf.load4(d, c.pos));
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+        }
+        var vals: std.ArrayList(u32) = .empty;
+        defer vals.deinit(gpa);
+        var it = counts.valueIterator();
+        while (it.next()) |v| try vals.append(gpa, v.*);
+        std.mem.sort(u32, vals.items, {}, std.sort.desc(u32));
+        var acc: u64 = 0;
+        var shown: usize = 0;
+        for (vals.items, 0..) |v, k| {
+            acc += v;
+            if (k + 1 == 10 or k + 1 == 100 or k + 1 == 1000 or k + 1 == 10000) {
+                std.debug.print("  top {d} of {d} grams: {d:.1}% of stride-3 candidates\n", .{ k + 1, vals.items.len, 100 * @as(f64, @floatFromInt(acc)) / @as(f64, @floatFromInt(s3)) });
+                shown += 1;
+            }
+        }
+        var hot = counts.iterator();
+        var hot_list: std.ArrayList(struct { u32, u32 }) = .empty;
+        defer hot_list.deinit(gpa);
+        while (hot.next()) |e| if (e.value_ptr.* >= vals.items[@min(39, vals.items.len - 1)]) try hot_list.append(gpa, .{ e.key_ptr.*, e.value_ptr.* });
+        // How many stride-3 atoms carry each hot gram in their window.
+        const part1 = index.prefilters[1].?;
+        const progs = index.programs.?;
+        var owners: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer owners.deinit(gpa);
+        for (hot_list.items) |e| try owners.put(gpa, e[0], 0);
+        for (part1.entries) |en| {
+            if (en.stride != 3 or en.q != 4) continue;
+            const p = progs.get(en.prog);
+            const lit = p.pattern.bytes(p.pattern.ops[p.header.anchor_op]);
+            if (en.back < p.header.anchor_delta) continue;
+            const off = en.back - p.header.anchor_delta;
+            if (off + 6 > lit.len) continue;
+            for (0..3) |k| if (owners.getPtr(std.mem.readInt(u32, lit[off + k ..][0..4], .little))) |c| {
+                c.* += 1;
+                if (c.* == 1) {
+                    var buf: [600]u8 = undefined;
+                    var wr: std.Io.Writer = .fixed(&buf);
+                    zav.compile.hexsig.format(p.pattern, &wr) catch {};
+                    std.debug.print("  owner of {x:0>8} (offset {d}): prog {d} target {d} atom off {d}: {s}\n", .{ @byteSwap(std.mem.readInt(u32, lit[off + k ..][0..4], .little)), k, en.prog, p.header.target, off, wr.buffered() });
+                }
+            };
+        }
+        for (hot_list.items) |e| std.debug.print("  gram {x:0>8}: {d:.1} per MB, in {d} atom windows\n", .{ @byteSwap(e[0]), @as(f64, @floatFromInt(e[1])) / mb, owners.get(e[0]).? });
+    }
+    std.debug.print("{d} candidates over {d:.1} MB, best of {d}\n", .{ cands.items.len, mb, rounds });
+    std.debug.print("probes only: {d:.1} us per MB; probes and chains (stage two): {d:.1} us per MB\n", .{ @as(f64, @floatFromInt(best_probe)) / 1e3 / mb, @as(f64, @floatFromInt(best_full)) / 1e3 / mb });
+}
+
 fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
     var datas: std.ArrayList([]u8) = .empty;
     defer {
@@ -417,7 +587,28 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
             std.mem.doNotOptimizeAway(checksum);
         }
         // Gather diagnostic counts separately so timed scans use the production path.
+        var per_chain: []u32 = &.{};
+        if (index.prefilters[1]) |p1| {
+            per_chain = try gpa.alloc(u32, p1.entries.len);
+            @memset(per_chain, 0);
+            m.stats.per_chain = per_chain;
+        }
+        defer if (per_chain.len > 0) gpa.free(per_chain);
         _ = probeCorpus(&index, datas.items, kern, &ring, &m.stats);
+        if (per_chain.len > 0 and kern == kernels[0]) {
+            const p1 = &index.prefilters[1].?;
+            var total: u64 = 0;
+            for (per_chain) |c| total += c;
+            for (0..15) |_| {
+                const top_e = std.mem.indexOfMax(u32, per_chain);
+                if (per_chain[top_e] == 0) break;
+                var len: usize = 1;
+                while (p1.entries[top_e + len - 1].flags & pf.entry_last == 0) len += 1;
+                const e0 = p1.entries[top_e];
+                std.debug.print("  chain at entry {d}: {d} entries, stride {d} q {d}, {d:.1} reads per MB ({d:.1}% of reads), first prog {d}, window at {d} mask {x}\n", .{ top_e, len, e0.stride, e0.q, @as(f64, @floatFromInt(per_chain[top_e])) / mb, 100 * @as(f64, @floatFromInt(per_chain[top_e])) / @as(f64, @floatFromInt(@max(total, 1))), e0.prog, e0.rel, e0.mask });
+                per_chain[top_e] = 0;
+            }
+        }
     }
     var gate_pass: u64 = 0;
     var gate_pos: u64 = 0;
@@ -483,6 +674,10 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus:
     for (kernels, measurements[0..kernels.len]) |kern, m| {
         std.debug.print("stage 1 [{s}]:    {d:.1} MB/s per core, {d:.1} candidates per MB\n", .{ kern.name, mb / (@as(f64, @floatFromInt(m.best1)) / 1e9), @as(f64, @floatFromInt(m.cands)) / mb });
         std.debug.print("stages 1+2 [{s}]: {d:.1} MB/s per core, {d:.1} probes and {d:.1} verifies per MB\n", .{ kern.name, mb / (@as(f64, @floatFromInt(m.best12)) / 1e9), @as(f64, @floatFromInt(m.stats.probes)) / mb, @as(f64, @floatFromInt(m.stats.verifies)) / mb });
+        std.debug.print("  per MB: {d:.1} probes find a slot, {d:.1} entries read ({d:.1} another kind, {d:.1} another target, {d:.1} same kind and target)\n", .{ @as(f64, @floatFromInt(m.stats.slot_hits)) / mb, @as(f64, @floatFromInt(m.stats.entries_read)) / mb, @as(f64, @floatFromInt(m.stats.drop_kind)) / mb, @as(f64, @floatFromInt(m.stats.drop_target)) / mb, @as(f64, @floatFromInt(m.stats.drop_ext)) / mb });
+        for (m.stats.by_kind, [_][]const u8{ "s8", "s4", "s3", "s2", "s1", "q3", "q2" }) |bk, name| if (bk.candidates > 0) {
+            std.debug.print("  {s}: {d:.1} candidates, {d:.1} probes, {d:.1} verifies per MB\n", .{ name, @as(f64, @floatFromInt(bk.candidates)) / mb, @as(f64, @floatFromInt(bk.probes)) / mb, @as(f64, @floatFromInt(bk.verifies)) / mb });
+        };
     }
 }
 

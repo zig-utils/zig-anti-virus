@@ -211,6 +211,66 @@ of five prefilter rounds and three raw clamd rounds from that run.
 Each stage-one-plus-two rate exceeded three times its raw clamd baseline.
 Each stayed below 1 GB/s per core. P6.15 covers end-to-end throughput.
 
+## Where stages one and two spend their time (2026-11-22)
+
+Apple M3 Pro, Zig 0.17.0-dev.1857, ReleaseFast, main 63 + daily 28187 + bytecode 339. The
+machine was shared with other work (load average 5 to 20), and full-corpus rounds varied by up
+to 40% between runs. Comparisons below are therefore the best of 30 rounds over B1's 43 PE
+files (40 MB, `--partition 1`), where short rounds land on performance cores, run in
+interleaved pairs; they are relative figures, not isolated latencies. Counters come from
+`prefilter -- stages` and the new `prefilter -- stage2` (stage two alone over recorded stage-one
+candidates, with the stride-3 candidate grams and the atoms that own them).
+
+**Stage two** (full B1 and B2, forced PE partition, per MB): 18,120 table probes, of which
+5,376 find a slot; those read 45,381 entries (36 of another filter kind, 848 of another target,
+44,496 of the right kind and target whose window then fails) for 510 verifies. Chains are long
+because keys are shared up to the crowded-key limit (32): the 15 hottest chains take 22% of the
+reads. Timed alone, the probes cost 214 us per MB and probes plus chains 326 us per MB (about
+12 ns a probe, 2.5 ns an entry). Changes:
+
+- Table version 2 keeps each entry's 8-byte window inline (32-byte entries) instead of a
+  24-byte check reached through an index, so a chain walk reads entries in order and nothing
+  else: ATOM_TABLE 22.1 -> 21.0 MB, PREFILTER 26.5 -> 25.5 MB. Stages one and two, old / new:
+  1,082.6 / 1,093.9 and 1,082.4 / 1,113.3 MB/s.
+- Stage two requests the slots of the candidate 12 ahead before probing: 1,062.4 / 1,067.9 and
+  1,053.7 / 1,077.7 MB/s without / with; stage two alone 326 -> 302 us per MB.
+- Half the slots (58.6% load, 4 MB less) was slower: old / new 1,070.1 / 1,010.1 and
+  1,083.7 / 1,061.0 MB/s. A probe that finds nothing (70% of them) walks about twice as many
+  slots. Not kept.
+
+**Stage one** is about 0.8 ns per byte, and the stride-one gate is almost half of it: without
+the gate (a timing-only build) stage one runs at 2,276 MB/s against 1,245 to 1,301; with the
+gate's loads but no passes appended, 1,373. The gate's loads cost 0.29 ns per byte and its
+passes 0.09. Three cheaper gate loops were measured and dropped: flags packed four bits apart
+into one word with passes taken from it (1,206 to 1,212 against 1,221 to 1,233), one 8-byte
+load per 8 positions (1,148 to 1,170 against 1,125 to 1,233) and an 8 KiB bitset gate (933 to
+1,020 against 1,299 to 1,301). The loop is bound by its instructions per position, not by the
+gate's cache lines.
+
+Fewer positions is what works: reading the gate at even positions only (timing only) gives
+1,566 to 1,576 MB/s. A stride-2 gate is correct for every gated atom of three bytes or more
+(its 2-byte keys at offsets 0 and 1). It is not built because of the 2-byte atoms: 30 PE-partition
+entries on 21 keys with 12 first bytes, among them `00` and `ff`, need every position. Compiled
+without 2-byte atoms (`prefilter -- compile --no-q2`), 11 programs (10 PE) are left with no atom
+at all and would be scanned whole: programs of 2-byte literals between gaps and wildcards, such
+as `538b??8b??908b??8b...`, `8185{8}81ad{8}b8{4}f7a5` and UTF-16 letters at `{10-20}` gaps. A
+nibble-bucket (Teddy) test for those 21 keys alone would cost an estimated 0.05 to 0.08 ns per
+byte, most of the 0.11 to 0.15 a stride-2 gate saves.
+
+**Candidates.** The stride-3 candidates sit on 147,956 distinct grams; the top 10, 100, 1,000
+and 10,000 carry 10.6, 31.0, 64.3 and 92.0% of them. The hottest, `00c00000`, `0000c000` and
+`07000000` (57 to 102 per MB), each sit in a single atom window: zero-padded structures such as
+`09000000000000000700000006000000...` and UTF-16 strings, literals with no rare 4-byte window.
+A longer gram would make those atoms selective, but a second sampled filter costs a second block
+test per sampled position.
+
+**Where this leaves the pass line** (M3 Pro, stages one and two, PE partition): B1's PE files
+run at 1.05 to 1.11 GB/s per core with table version 2. Full B1 and B2 forced through the PE
+partition ran at 0.86 to 0.88 GB/s with version 1 (load about 6); later full runs of both
+versions under heavier load were not repeatable. Either way that measurement stays below the line. No x86_64 figure is new: GitHub Actions is
+disabled for the repository while CI moves runners, and the hosted x86_64 numbers above
+predate these changes.
+
 ## Against the other designs
 
 The alternatives were measured in zig-regex (docs/BENCHMARKS.md, binary literal sets of 100k
