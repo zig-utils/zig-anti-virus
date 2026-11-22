@@ -544,6 +544,23 @@ pub const Index = struct {
         if (idx.database) |d| d.close();
     }
 
+    /// The checks `open` leaves out: BLAKE3 over the whole body against the root in the (signed)
+    /// header, every section's xxh3, and that the header bytes no signature covers (the tail after
+    /// the signature, and the section table past its last entry) are zero, as the writer leaves
+    /// them. It reads every page, so it runs where authenticity matters more than startup time:
+    /// when a consumer requires a trusted signature.
+    ///
+    /// The section table itself is bound to the signature only through the header's xxh3 of it,
+    /// which is not a cryptographic hash; a format revision would sign a BLAKE3 of it instead.
+    pub fn verifyBody(idx: Index) !void {
+        const d = idx.database orelse return error.MissingSection;
+        const bytes = d.mapping;
+        const table_end = format.section_table_offset + d.header().section_count * @sizeOf(format.SectionEntry);
+        if (!std.mem.allEqual(u8, bytes[@offsetOf(format.Header, "_tail")..format.section_table_offset], 0) or
+            !std.mem.allEqual(u8, bytes[table_end..format.header_size], 0)) return error.UnsignedHeaderData;
+        try db.reader.verifyBody(bytes);
+    }
+
     fn fromSections(d: db.reader.Database) !Index {
         const get = struct {
             fn f(dd: db.reader.Database, kind: format.SectionKind) ![]const u8 {
@@ -752,6 +769,64 @@ test "fixture vulnerable versions match and patched versions do not" {
     try std.testing.expectEqual(@as(usize, 1), idx.queryCpe("apache", "log4j", "2.0-beta9", &hits).len);
     try std.testing.expect(idx.find("CVE-2023-4863") != null);
     try std.testing.expect(idx.find("CVE-1999-0001") == null);
+}
+
+test "a required key refuses unsigned, unknown-key and tampered indexes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var b = try fixtureBuilder(gpa, arena.allocator());
+    defer b.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(5));
+    const other = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(6));
+    _ = try b.write(io, tmp.dir, "signed.zavcve", .{ .key_pair = kp });
+    _ = try b.write(io, tmp.dir, "unsigned.zavcve", .{});
+    const required: db.reader.OpenOptions = .{ .trusted_keys = &.{.{ .public_key = kp.public_key.toBytes() }}, .allow_unsigned = false };
+
+    // The right key opens it and the whole body checks out.
+    {
+        const idx = try Index.open(io, tmp.dir, "signed.zavcve", required);
+        defer idx.close();
+        try idx.verifyBody();
+        try std.testing.expect(idx.find("CVE-2021-44228") != null);
+    }
+    // A key other than the signer's, and an unsigned index, are both refused.
+    try std.testing.expectError(error.UnknownKey, Index.open(io, tmp.dir, "signed.zavcve", .{ .trusted_keys = &.{.{ .public_key = other.public_key.toBytes() }}, .allow_unsigned = false }));
+    try std.testing.expectError(error.Unsigned, Index.open(io, tmp.dir, "unsigned.zavcve", required));
+
+    const bytes = try tmp.dir.readFileAlloc(io, "signed.zavcve", gpa, .unlimited);
+    defer gpa.free(bytes);
+    // A changed header byte breaks the signature.
+    const h: *format.Header = @ptrCast(@alignCast(bytes.ptr));
+    h.db_version +%= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "header.zavcve", .data = bytes });
+    try std.testing.expectError(error.BadSignature, Index.open(io, tmp.dir, "header.zavcve", required));
+    h.db_version -%= 1;
+    // A changed body byte keeps the header valid, so open alone accepts it; verifyBody does not.
+    const table: [*]const format.SectionEntry = @ptrCast(@alignCast(bytes.ptr + format.section_table_offset));
+    const strings = for (table[0..h.section_count]) |entry| {
+        if (entry.kind == .cve_strings) break entry;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(strings.size > 0);
+    bytes[strings.offset] ^= 0x01;
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.zavcve", .data = bytes });
+    const tampered = try Index.open(io, tmp.dir, "body.zavcve", required);
+    defer tampered.close();
+    try std.testing.expectError(error.RootMismatch, tampered.verifyBody());
+    bytes[strings.offset] ^= 0x01;
+    // Header bytes outside the signed region (the tail, the unused end of the section table)
+    // keep the signature valid, so open accepts them; verifyBody requires them to be zero.
+    for ([_]usize{ @offsetOf(format.Header, "_tail") + 40, format.header_size - 1 }) |offset| {
+        bytes[offset] ^= 0x01;
+        try tmp.dir.writeFile(io, .{ .sub_path = "tail.zavcve", .data = bytes });
+        const padded = try Index.open(io, tmp.dir, "tail.zavcve", required);
+        defer padded.close();
+        try std.testing.expectError(error.UnsignedHeaderData, padded.verifyBody());
+        bytes[offset] ^= 0x01;
+    }
 }
 
 test "index load stays under 10 ms on a warm cache" {
