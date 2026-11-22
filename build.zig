@@ -114,6 +114,74 @@ pub fn build(b: *std.Build) void {
             if (c.err.len > 0) run.expectStdErrMatch(c.err);
             test_step.dependOn(&run.step);
         }
+
+        // A signed index: `cve compile --signing-key` with a throwaway test seed, then
+        // `audit --cve-key` requiring that signer and refusing every other index.
+        const keys = b.addWriteFiles();
+        const seed = keys.add("test-cve.seed", &@as([32]u8, @splat(7)));
+        const short_seed = keys.add("short.seed", &@as([31]u8, @splat(7)));
+        const pub_hex = testPublicKeyHex(b, 7);
+        const other_hex = testPublicKeyHex(b, 8);
+        const signed_index = blk: {
+            const run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "cve", "compile", "--feeds" });
+            run.addDirectoryArg(b.path("tests/fixtures/cve-feeds"));
+            run.addArg("--signing-key");
+            run.addFileArg(seed);
+            run.addArg("--out");
+            const out = run.addOutputFileArg("signed.zavcve");
+            run.expectExitCode(0);
+            run.expectStdOutMatch("ranges, signed");
+            break :blk out;
+        };
+        const bad_seed = b.addRunArtifact(exe);
+        bad_seed.addArgs(&.{ "cve", "compile", "--feeds" });
+        bad_seed.addDirectoryArg(b.path("tests/fixtures/cve-feeds"));
+        bad_seed.addArg("--signing-key");
+        bad_seed.addFileArg(short_seed);
+        bad_seed.addArg("--out");
+        _ = bad_seed.addOutputFileArg("never.zavcve");
+        bad_seed.expectExitCode(2);
+        bad_seed.expectStdErrMatch("InvalidSigningKey");
+        test_step.dependOn(&bad_seed.step);
+        // Tampered copies of the signed index. The header signature still verifies, so only the
+        // whole-body check under --cve-key can refuse them: one body byte (the last one) and one
+        // byte of the unsigned header tail (offset 400).
+        const flip_exe = b.addExecutable(.{
+            .name = "flip_byte",
+            .root_module = b.createModule(.{ .root_source_file = b.path("tools/flip_byte.zig"), .target = b.graph.host, .optimize = .Debug }),
+        });
+        const tampered = struct {
+            fn copy(bb: *std.Build, tool: *std.Build.Step.Compile, index: std.Build.LazyPath, name: []const u8, offset: []const u8) std.Build.LazyPath {
+                const run = bb.addRunArtifact(tool);
+                run.addFileArg(index);
+                const out = run.addOutputFileArg(name);
+                run.addArg(offset);
+                return out;
+            }
+        }.copy;
+        const body_tampered = tampered(b, flip_exe, signed_index, "body.zavcve", "-1");
+        const tail_tampered = tampered(b, flip_exe, signed_index, "tail.zavcve", "400");
+        const keyed = [_]struct { index: std.Build.LazyPath, keys: []const []const u8, code: u8, out: []const u8 = "", err: []const u8 = "" }{
+            .{ .index = signed_index, .keys = &.{pub_hex}, .code = 12, .out = "CVE-2021-23337" },
+            .{ .index = signed_index, .keys = &.{ other_hex, pub_hex }, .code = 12, .out = "CVE-2021-23337" },
+            .{ .index = signed_index, .keys = &.{other_hex}, .code = 2, .err = "UnknownKey" },
+            .{ .index = cve_index, .keys = &.{pub_hex}, .code = 2, .err = "Unsigned" },
+            .{ .index = signed_index, .keys = &.{"not-hex"}, .code = 2, .err = "InvalidPublicKey" },
+            .{ .index = body_tampered, .keys = &.{pub_hex}, .code = 2, .err = "RootMismatch" },
+            .{ .index = tail_tampered, .keys = &.{pub_hex}, .code = 2, .err = "UnsignedHeaderData" },
+        };
+        for (keyed) |c| {
+            const run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "audit", "--cve-index" });
+            run.addFileArg(c.index);
+            for (c.keys) |k| run.addArgs(&.{ "--cve-key", k });
+            run.addDirectoryArg(b.path("tests/fixtures/stacks-app"));
+            run.expectExitCode(c.code);
+            if (c.out.len > 0) run.expectStdOutMatch(c.out);
+            if (c.err.len > 0) run.expectStdErrMatch(c.err);
+            test_step.dependOn(&run.step);
+        }
     }
 
     // Public Guardian CLI seam: compile the shipped source pack and expose every rule in coverage.
@@ -301,6 +369,12 @@ pub fn build(b: *std.Build) void {
         run_bench.addPassthruArgs();
         bench_step.dependOn(&run_bench.step);
     }
+}
+
+/// The public key, as 64 lowercase hex digits, of the test seed made of 32 `byte`s.
+fn testPublicKeyHex(b: *std.Build, byte: u8) []const u8 {
+    const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(byte)) catch unreachable;
+    return b.dupe(&std.fmt.bytesToHex(kp.public_key.toBytes(), .lower));
 }
 
 fn capiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, zav: *std.Build.Module) *std.Build.Module {

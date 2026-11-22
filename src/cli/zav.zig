@@ -5,15 +5,16 @@
 //!   zav coverage DB
 //!   zav scan [--db FILE] [--json] PATH...
 //!   zav host [--deep] [--json] [--min-severity S] [--category C]... [--config FILE] [--list]
-//!   zav audit [--json] [--min-severity S] [--installed] [--cve-index FILE] [PATH...]
+//!   zav audit [--json] [--min-severity S] [--installed] [--cve-index FILE] [--cve-key HEX]... [PATH...]
 //!   zav cve fetch [--feeds DIR] [--nvd] [--osv ECOSYSTEM]...    (explicit network access)
-//!   zav cve compile [--feeds DIR] [--out FILE]
+//!   zav cve compile [--feeds DIR] [--out FILE] [--signing-key SEEDFILE]
 //!
 //! scan follows clamscan: 0 clean, 1 something found, 2 an error. host and audit exit 0 when
 //! nothing at low or above was found, 11, 12, 13 or 14 for a highest finding of low, medium, high
 //! or critical, and 2 on an error. Databases are opened with
 //! signature checks; `--allow-unsigned` (or ZAV_ALLOW_UNSIGNED=1) accepts locally compiled,
-//! unsigned databases.
+//! unsigned databases. The CVE index is opened unsigned-tolerant unless `--cve-key` names the
+//! trusted keys, which then requires a signature from one of them and a full body check.
 const std = @import("std");
 const cli = @import("zig_cli");
 const zav = @import("zav");
@@ -130,6 +131,7 @@ fn buildCommands(gpa: std.mem.Allocator) !*Command {
     _ = try cve_compile.addOption(Option.init("feeds", "feeds", "Feeds directory (default <state>/feeds)", .string));
     _ = try cve_compile.addOption(Option.init("state", "state", "State directory", .string));
     _ = try cve_compile.addOption(Option.init("out", "out", "Output index (default <state>/cve.zavcve)", .string).withShort('o'));
+    _ = try cve_compile.addOption(Option.init("signing-key", "signing-key", "Sign the index with this private Ed25519 seed file (exactly 32 raw bytes)", .string));
     _ = cve_compile.setActionWithCode(cveCompileAction);
     _ = try cve.addCommand(cve_compile);
     _ = try root.addCommand(cve);
@@ -140,6 +142,7 @@ fn addReportOptions(cmd: *Command) !void {
     _ = try cmd.addOption(Option.init("min-severity", "min-severity", "Leave out findings below this severity (info, low, medium, high, critical)", .string));
     _ = try cmd.addOption(Option.init("state", "state", "State directory for baselines, caches and the CVE index", .string));
     _ = try cmd.addOption(Option.init("cve-index", "cve-index", "CVE index (default <state>/cve.zavcve)", .string));
+    _ = try cmd.addOption(Option.init("cve-key", "cve-key", "Require a CVE index signed by this Ed25519 public key (64 hex digits)", .string).withRepeatable(true));
 }
 
 fn flag(ctx: *Command.ParseContext, name: []const u8) bool {
@@ -237,12 +240,10 @@ fn compileAction(ctx: *Command.ParseContext) !u8 {
     }
     var trusted: std.ArrayList(zav.db.reader.TrustedKey) = .empty;
     defer trusted.deinit(app.gpa);
-    for (ctx.getOptionValues("guardian-key")) |hex| {
-        var key: [32]u8 = undefined;
-        if (hex.len != 64) return error.InvalidGuardianPublicKey;
-        _ = std.fmt.hexToBytes(&key, hex) catch return error.InvalidGuardianPublicKey;
-        try trusted.append(app.gpa, .{ .public_key = key });
-    }
+    trustedKeys(ctx, "guardian-key", &trusted) catch |e| switch (e) {
+        error.InvalidPublicKey => return error.InvalidGuardianPublicKey,
+        else => return e,
+    };
     for (ctx.getOptionValues("guardian-bundle")) |path| {
         const bytes = try cwd.readFileAlloc(app.io, path, app.gpa, .limited(zav.compile.guardian.bundle.max_bytes + 1));
         defer app.gpa.free(bytes);
@@ -274,18 +275,34 @@ fn rulePackAction(ctx: *Command.ParseContext) !u8 {
     var compiler = zav.compile.compiler.Compiler.init(app.gpa);
     defer compiler.deinit();
     try compiler.addGuardianPack(pack);
-    const seed = try cwd.readFileAlloc(app.io, key_path, app.gpa, .limited(33));
-    defer {
-        std.crypto.secureZero(u8, seed);
-        app.gpa.free(seed);
-    }
-    if (seed.len != 32) return error.InvalidSigningKey;
-    var kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed[0..32].*);
+    var kp = try loadSigningKey(key_path);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     const bytes = try zav.compile.guardian.bundle.encode(arena.allocator(), pack, kp);
     try cwd.writeFile(app.io, .{ .sub_path = out, .data = bytes });
     try app.out.print("{s}: Guardian pack version {d}, {d} source files\n", .{ out, version, pack.entries.len });
     return 0;
+}
+
+/// The one loader for signing keys: a file of exactly 32 raw bytes, the Ed25519 seed. Used by
+/// `rule-pack` and `cve compile`, so one distributor key can sign both. Zero the result after use.
+fn loadSigningKey(path: []const u8) !std.crypto.sign.Ed25519.KeyPair {
+    const seed = try std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(33));
+    defer {
+        std.crypto.secureZero(u8, seed);
+        app.gpa.free(seed);
+    }
+    if (seed.len != 32) return error.InvalidSigningKey;
+    return std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed[0..32].*);
+}
+
+/// Append every `option` value (a public key as 64 hex digits) to `out`.
+fn trustedKeys(ctx: *Command.ParseContext, option: []const u8, out: *std.ArrayList(zav.db.reader.TrustedKey)) !void {
+    for (ctx.getOptionValues(option)) |hex| {
+        var key: [32]u8 = undefined;
+        if (hex.len != 64) return error.InvalidPublicKey;
+        _ = std.fmt.hexToBytes(&key, hex) catch return error.InvalidPublicKey;
+        try out.append(app.gpa, .{ .public_key = key });
+    }
 }
 
 fn infoAction(ctx: *Command.ParseContext) !u8 {
@@ -452,13 +469,32 @@ fn minSeverity(ctx: *Command.ParseContext) !zav.host.Severity {
 fn openCveIndex(ctx: *Command.ParseContext, state: []const u8, required: bool) !?zav.cve.index.Index {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = ctx.getOption("cve-index") orelse try std.fmt.bufPrint(&buf, "{s}/cve.zavcve", .{state});
-    // Indexes compiled locally from the public feeds are unsigned; a signed one is checked when
-    // a trusted key is configured.
-    return zav.cve.index.Index.open(app.io, std.Io.Dir.cwd(), path, .{ .allow_unsigned = true }) catch |e| {
+    var trusted: std.ArrayList(zav.db.reader.TrustedKey) = .empty;
+    defer trusted.deinit(app.gpa);
+    trustedKeys(ctx, "cve-key", &trusted) catch |e| {
+        try app.err.print("zav: --cve-key: {t} (expected 64 hex digits)\n", .{e});
+        return e;
+    };
+    // Without --cve-key, an index compiled locally from the public feeds (unsigned) is accepted.
+    // With it, the index must be signed by one of those keys, its whole body must match the
+    // signed BLAKE3 root, and the header bytes outside the signature must be zero
+    // (Index.verifyBody). The section table is bound to the signature by xxh3 only, which is not
+    // a cryptographic hash, so this is not yet authentication of every byte (see DESIGN.md).
+    const options: zav.db.reader.OpenOptions = if (trusted.items.len > 0)
+        .{ .trusted_keys = trusted.items, .allow_unsigned = false }
+    else
+        .{ .allow_unsigned = true };
+    const index = zav.cve.index.Index.open(app.io, std.Io.Dir.cwd(), path, options) catch |e| {
         if (!required and e == error.FileNotFound) return null;
         try app.err.print("zav: cannot open CVE index {s}: {t} (run zav cve fetch, then zav cve compile)\n", .{ path, e });
         return e;
     };
+    if (trusted.items.len > 0) index.verifyBody() catch |e| {
+        index.close();
+        try app.err.print("zav: cannot open CVE index {s}: {t}\n", .{ path, e });
+        return e;
+    };
+    return index;
 }
 
 /// Scans unowned executables with a signature database for `zav host --db`.
@@ -672,6 +708,13 @@ fn cveCompileAction(ctx: *Command.ParseContext) !u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var dir = feedsDir(ctx, &buf) catch return 2;
     defer dir.close(app.io);
+    // Load the key before reading the feeds, so a bad key fails at once.
+    var key_pair: ?std.crypto.sign.Ed25519.KeyPair = null;
+    defer if (key_pair) |*kp| std.crypto.secureZero(u8, std.mem.asBytes(kp));
+    if (ctx.getOption("signing-key")) |key_path| key_pair = loadSigningKey(key_path) catch |e| {
+        try app.err.print("zav: --signing-key {s}: {t} (expected a file of exactly 32 raw bytes)\n", .{ key_path, e });
+        return 2;
+    };
     var b = zav.cve.index.Builder.init(app.gpa);
     defer b.deinit();
     b.addFeedsDir(app.io, dir) catch |e| {
@@ -682,12 +725,12 @@ fn cveCompileAction(ctx: *Command.ParseContext) !u8 {
     var out_buf: [std.fs.max_path_bytes]u8 = undefined;
     const out = ctx.getOption("out") orelse try std.fmt.bufPrint(&out_buf, "{s}/cve.zavcve", .{stateDir(ctx, &state_buf) catch "."});
     const now: u64 = @intCast(@divFloor(std.Io.Clock.real.now(app.io).toNanoseconds(), std.time.ns_per_s));
-    const summary = b.write(app.io, std.Io.Dir.cwd(), out, .{ .db_version = now, .build_unix_time = now }) catch |e| {
+    const summary = b.write(app.io, std.Io.Dir.cwd(), out, .{ .db_version = now, .build_unix_time = now, .key_pair = key_pair }) catch |e| {
         try app.err.print("zav: writing {s}: {t}\n", .{ out, e });
         return 2;
     };
     if (ctx.wantsJson()) {
-        try ctx.writeJson(.{ .out = out, .records = summary.records, .kev = summary.kev, .packages = summary.packages, .cpes = summary.cpes, .ranges = summary.ranges });
-    } else try app.out.print("{s}: {d} vulnerabilities ({d} in KEV), {d} packages, {d} CPEs, {d} ranges\n", .{ out, summary.records, summary.kev, summary.packages, summary.cpes, summary.ranges });
+        try ctx.writeJson(.{ .out = out, .records = summary.records, .kev = summary.kev, .packages = summary.packages, .cpes = summary.cpes, .ranges = summary.ranges, .signed = key_pair != null });
+    } else try app.out.print("{s}: {d} vulnerabilities ({d} in KEV), {d} packages, {d} CPEs, {d} ranges, {s}\n", .{ out, summary.records, summary.kev, summary.packages, summary.cpes, summary.ranges, if (key_pair != null) "signed" else "unsigned" });
     return 0;
 }
