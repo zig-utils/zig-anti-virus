@@ -90,6 +90,10 @@ pub const ClType = enum(u16) {
     // In the official daily.ftm (functionality level 210).
     alz,
     lha_lzh,
+    // OLE2 sub-types clamscan reports (fmt/subtype.zig).
+    msword,
+    msxl,
+    msppt,
     _,
 
     /// `CL_TYPE_ZIP` and friends, case-sensitive as ClamAV writes them.

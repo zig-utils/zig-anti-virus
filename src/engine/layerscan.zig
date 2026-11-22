@@ -13,6 +13,8 @@ const pe = @import("../fmt/pe.zig");
 const elf = @import("../fmt/elf.zig");
 const macho = @import("../fmt/macho.zig");
 const html_norm = @import("../fmt/html_norm.zig");
+const prog = @import("../match/prog.zig");
+const vm = @import("../match/verify_vm.zig");
 
 pub const Engine = struct {
     database: db.reader.Database,
@@ -24,7 +26,12 @@ pub const Engine = struct {
         _ = gpa;
         const database = try db.reader.open(io, dir, path, options);
         errdefer database.close();
-        return .{ .database = database, .body = try .load(database), .hashes = try .load(database) };
+        var e: Engine = .{ .database = database, .body = try .load(database), .hashes = try .load(database) };
+        if (database.section(.ftm_trie, 0)) |section| {
+            const progs: ?prog.Programs = if (database.section(.subsig_prog, 1)) |p| try .init(p) else null;
+            e.types = try .init(section, progs);
+        }
+        return e;
     }
 
     pub fn close(e: *Engine, gpa: std.mem.Allocator) void {
@@ -33,9 +40,9 @@ pub const Engine = struct {
     }
 
     pub fn fileType(e: *const Engine, data: []const u8) ?types.ClType {
-        _ = e;
-        _ = data;
-        return null;
+        const f = e.types orelse return null;
+        var budget: vm.Budget = .{};
+        return ftm.classify(f, data, .{}, &budget).type;
     }
 };
 

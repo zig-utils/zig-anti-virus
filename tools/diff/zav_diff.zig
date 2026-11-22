@@ -833,8 +833,8 @@ fn normalizeCmd(app: App, args: []const []const u8) !u8 {
     const data = try Io.Dir.cwd().readFileAlloc(app.io, args[1], app.arena, .limited(1 << 30));
     if (std.mem.eql(u8, args[0], "text")) {
         const out = try app.arena.alloc(u8, data.len);
-        // libclamav restarts its buffer at page-dependent places (text_norm.Seams).
-        var n: zav.fmt.text_norm.Normalizer = .{ .seams = .{ .pages = .{ .page = @intCast(std.heap.pageSize()) } }, .total = data.len };
+        // clamscan normalises in rounds that depend on the host page size (text_norm.Seams).
+        var n: zav.fmt.text_norm.Normalizer = .{ .seams = .{ .pages = .{ .page = @intCast(std.heap.pageSize()) } } };
         try app.out.writeAll(out[0..n.feed(data, out)]);
         return 0;
     }
