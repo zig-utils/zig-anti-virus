@@ -20,6 +20,8 @@ pub const Limits = struct {
     max_embedded_pe: u64 = 40 * 1024 * 1024,
     /// HTML bytes normalised (MaxHTMLNormalize).
     max_html_normalize: u64 = 40 * 1024 * 1024,
+    /// Largest normalised HTML form still matched (MaxHTMLNoTags, clamscan --max-htmlnotags).
+    max_html_notags: u64 = 8 * 1024 * 1024,
     /// Script bytes normalised (MaxScriptNormalize).
     max_script_normalize: u64 = 20 * 1024 * 1024,
     /// A member may expand to this many times its compressed size once past `ratio_floor`.
@@ -66,6 +68,8 @@ pub const Event = enum(u8) {
     verify_count,
     /// A container header exceeds its bounded variable-length field budget.
     container_header,
+    /// A normalised HTML form over MaxHTMLNoTags was not matched.
+    html_notags,
 };
 
 /// Per-scan accounting. Lives in scratch; resetting it is O(1).

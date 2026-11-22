@@ -4,6 +4,7 @@
 pub const types = @import("types.zig");
 pub const ftm = @import("ftm.zig");
 pub const subtype = @import("subtype.zig");
+pub const js_file = @import("js_file.zig");
 pub const detect = @import("detect.zig");
 pub const scan = @import("scan.zig");
 pub const decode = @import("decode.zig");
@@ -51,6 +52,7 @@ test {
     _ = types;
     _ = ftm;
     _ = subtype;
+    _ = js_file;
     _ = detect;
     _ = scan;
     _ = decode;

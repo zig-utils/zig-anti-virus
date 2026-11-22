@@ -40,6 +40,7 @@ const upx = @import("unpack/upx.zig");
 const html_norm = @import("html_norm.zig");
 const js_norm = @import("js_norm.zig");
 const text_norm = @import("text_norm.zig");
+const js_file = @import("js_file.zig");
 const heuristics = @import("../engine/heuristics.zig");
 const ftm = @import("ftm.zig");
 const types = @import("types.zig");
@@ -210,12 +211,20 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     try w.drain(&tee.interface);
 }
 
-/// Re-typing by the database's type magics: removed pending a clean-room rewrite.
+/// Re-typing by the database's type magics (fmt/ftm.zig): text and binary data that clamscan
+/// types as HTML, mail or PDF from the magics in their head are parsed as such.
 fn retype(w: *Walker, obj: *Object, head: []const u8, f: Format) Format {
-    _ = w;
     _ = obj;
-    _ = head;
-    return f;
+    if (f != .binary and f != .text) return f;
+    const magics = w.options.types orelse return f;
+    var budget: vm.Budget = .{};
+    const c = ftm.classify(magics.*, head, .{ .file_size = std.math.maxInt(u64) }, &budget);
+    return switch (c.type) {
+        .html => .html,
+        .mail => .mail,
+        .pdf => .pdf,
+        else => f,
+    };
 }
 
 /// Formats recognised past the detection head, for positional sources: ISO 9660 by its volume
@@ -297,16 +306,92 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
     }
 }
 
-/// Text and HTML normalisation: removed pending a clean-room rewrite.
+/// The target type 7 stream of a text object, as a derived child named "text". Input past
+/// MaxScriptNormalize is reported and left unnormalised (its raw bytes are still scanned).
 fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
-    _ = w;
-    _ = r;
+    const buf = w.alloc(u8, container.block_len) orelse return w.drain(r);
+    defer w.free(buf);
+    var d: Object = undefined;
+    try w.beginDerived(&d, "text", .normalized_text);
+    defer w.endDerived(&d);
+    var n: text_norm.Normalizer = .{ .seams = .{ .pages = .{ .page = @intCast(std.heap.pageSize()) } } };
+    var markers: heuristics.ScriptScanner = .{};
+    const max = w.tracker.limits.max_script_normalize;
+    var total: u64 = 0;
+    while (true) {
+        const want = @min(buf.len / 2, max - @min(max, total));
+        if (want == 0) {
+            w.limit(.script_normalize);
+            return w.drain(r);
+        }
+        const got = r.readSliceShort(buf[0..want]) catch |e| switch (e) {
+            error.ReadFailed => return if (w.halt != null) error.Halted else {},
+        };
+        if (got == 0) return reportScript(w, &markers);
+        total += got;
+        if (w.options.heuristics != null) markers.update(buf[0..got]);
+        const out = buf[want..][0..got];
+        const len = n.feed(buf[0..got], out);
+        try w.feed(&d, out[0..len]);
+    }
 }
 
+/// The target type 3 streams of an HTML object, as derived children: "nocomment" and "notags"
+/// (normalized_html) and "js", the JavaScript file of its scripts (normalized_js). Input past
+/// MaxHTMLNormalize is reported and left out; a notags form over MaxHTMLNoTags too.
 fn normalizeHtml(w: *Walker, src: Source) Error!void {
-    _ = w;
-    _ = src;
+    const total = src.len() orelse return;
+    const Pass = enum { nocomment, notags, js };
+    const norm = w.scratch.allocator().create(html_norm.Normalizer) catch return w.limit(.memory);
+    const buf = w.alloc(u8, container.block_len) orelse return;
+    defer w.free(buf);
+    const max = w.tracker.limits.max_html_normalize;
+    for ([_]Pass{ .nocomment, .notags, .js }) |pass| {
+        var sink: HtmlSink = .{ .w = w };
+        const kind: container.Kind = if (pass == .js) .normalized_js else .normalized_html;
+        try w.beginDerived(&sink.obj, @tagName(pass), kind);
+        defer w.endDerived(&sink.obj);
+        const out: html_norm.Output = .{ .ctx = &sink, .write = HtmlSink.write };
+        var js: js_file.JavascriptFile = .{ .out = out };
+        norm.* = .init(switch (pass) {
+            .nocomment => .{ .nocomment = out },
+            .notags => .{ .notags = out },
+            .js => .{ .scripts = js.pieces() },
+        });
+        var markers: heuristics.ScriptScanner = .{};
+        var off: u64 = 0;
+        while (off < total and off < max) {
+            const want: usize = @intCast(@min(buf.len, max - off, total - off));
+            const got = src.readAt(w.io, off, buf[0..want]) catch break;
+            if (got == 0) break;
+            if (pass == .nocomment and w.options.heuristics != null) markers.update(buf[0..got]);
+            norm.feed(buf[0..got]) catch break;
+            off += got;
+        }
+        norm.finish() catch {};
+        if (pass == .nocomment and w.options.heuristics != null) reportScript(w, &markers);
+        if (sink.halted) return error.Halted;
+        if (pass == .nocomment and total > max) w.limit(.html_normalize);
+        if (pass == .notags and sink.bytes > w.tracker.limits.max_html_notags) w.limit(.html_notags);
+    }
 }
+
+const HtmlSink = struct {
+    w: *Walker,
+    obj: Object = undefined,
+    bytes: u64 = 0,
+    halted: bool = false,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
+        s.bytes += bytes.len;
+        if (s.bytes > s.w.tracker.limits.max_html_notags and s.obj.kind == .normalized_html and std.mem.eql(u8, s.obj.name, "notags")) return error.Stop;
+        s.w.feed(&s.obj, bytes) catch {
+            s.halted = true;
+            return error.Stop;
+        };
+    }
+};
 
 /// Name for a compression wrapper's output: the parent's name without its extension.
 fn innerName(name: []const u8, format: Format) []const u8 {

@@ -4,8 +4,8 @@
 //!
 //! The target description block is `Key:Value` pairs separated by commas: Engine, Target,
 //! FileSize, EntryPoint, NumberOfSections, Container and Intermediates are compiled; IconGroup1,
-//! IconGroup2 are rejected with their own reason until icons exist; HandlerType is rejected
-//! pending a clean-room rewrite (docs/clean-room.md).
+//! IconGroup2 are rejected with their own reason until icons exist; HandlerType is compiled (the
+//! scan pipeline re-scans a matching file as that type).
 //! The expression compiles to RPN (`ir.RpnOp`); `&` and `|` share one precedence and group to
 //! the right (as libclamav reads them), parentheses group,
 //! and `=X`, `>X`, `<X` (each with an optional `,Y` distinct count) apply to the subsig or block
@@ -243,7 +243,7 @@ pub fn parseTdb(text: []const u8, flevel_min: *u16, flevel_max: *u16) LineError!
                 }
             },
             7, 8 => return error.IconUnsupported,
-            9 => return error.HandlerTypeUnsupported,
+            9 => tdb.handler = try fileType(value),
             else => unreachable,
         }
     }
