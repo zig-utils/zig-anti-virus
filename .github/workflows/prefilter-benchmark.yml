@@ -56,8 +56,8 @@ jobs:
               printf '\n'
             done
           } | tee "$RUNNER_TEMP/e2/inputs.txt"
-      - name: Verify and materialize the B1 and B2 manifests
-        run: bun bench/fetch.ts B1 B2 --out "$RUNNER_TEMP/corpus"
+      - name: Verify and materialize the B1, B2 and S1 manifests
+        run: bun bench/fetch.ts B1 B2 S1 --out "$RUNNER_TEMP/corpus"
       - name: Build the full atom set and measure the PE partition
         run: |
           bench_dir="$RUNNER_TEMP/e2"
@@ -67,6 +67,11 @@ jobs:
           printf 'Pinned CPU %s\n' "$core" | tee -a "$bench_dir/inputs.txt"
           for corpus in B1 B2; do
             taskset -c "$core" ./zig-out/bin/prefilter stages "$db" "$RUNNER_TEMP/corpus/$corpus" --partition 1 --rounds 5 2>&1 | tee "$bench_dir/$corpus.txt"
+          done
+          # The whole body scan (anchored index, prefilter, verify VM, deferred pass, logical
+          # evaluation), files typed by magic, best of three scans per file.
+          for corpus in B1 B2 S1; do
+            taskset -c "$core" ./zig-out/bin/prefilter scan "$db" "$RUNNER_TEMP/corpus/$corpus" --rounds 3 2>&1 | grep -v '^LIMITED\|^FOUND' | tee "$bench_dir/$corpus-scan.txt"
           done
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
         env:

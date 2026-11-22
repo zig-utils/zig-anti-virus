@@ -194,3 +194,55 @@ An additional 32 real logical signatures (31 with deferred subsigs) have zero ve
 mismatches: 23 detected by both paths and nine where the reference exhausted logical state
 while the filtered path detected the signature. This smaller sample supplements the exhaustive
 expanded-window tests; it does not repeat the historical 1,988-rule deferral experiment above.
+
+## Text gram model (zig-utils/zig-anti-virus#108)
+
+The 4-gram model is built from B1 (executables, source, documents), so it rates mail and HTML
+grams rarer than mail shows: on S1 the most frequent candidates were `2002`, `mail`, `=3D"`,
+`src=`, `SMTP`, ` you` and `<br>`, all grams of stride-3 windows of type-0 text signatures. A
+second model, `src/compile/gram_model_text.bin` (230 KB, the same format and builder), is built
+from T1: SpamAssassin easy_ham_2, 1,401 messages that S1 does not contain (bench/corpus).
+Programs of the text partitions (any type, HTML, mail, normalised ASCII) score every window
+with the larger of the two probabilities (gram_model.zig `Model.with`), so a window must be
+rare in both; other targets keep the binary model alone. `prefilter -- compile --no-text`
+builds the comparison database.
+
+Main 63 + daily 28187 + bytecode 339, `prefilter -- scan` over the full corpora (natural
+typing), candidates per MB:
+
+| Corpus | E3 baseline (strides 8 and 4) | stride 3, binary model only | stride 3, binary and text models |
+|---|---:|---:|---:|
+| S1 | 13,272 | 7,836 | **3,040** |
+| B1 | 2,021 | 1,451 | 1,459 |
+| B2 | 6,559 | 5,581 | 5,557 |
+
+S1 falls 4.4x below the E3 baseline (2.6x below the same build without the text model), probes
+from 84,969 to 8,984 per MB; B1 and B2 stay below the baseline (B1 rises by 8 candidates per MB,
+0.6%, against the build without the text model; B2 falls). Verifies on S1 rise from 99 to 140
+per MB (2-byte atoms of the text model's choices); stages one and two on S1 run at 1,234 MB/s
+against 924 without the text model, and the whole scan 228 against 211 MB/s (M3 Pro, shared
+machine). **Pass line met.**
+
+## Sparse grams for the remaining tier D (#107, #27)
+
+`prefilter -- tierd <db>` classifies the searched programs that still use 3- or 2-byte atoms
+(PE partition and type 0, 2,622): 33 have a 4-byte window across masks or single-byte
+alternations (four distinct keys; the bounded expansion above), 2,566 more only a sparse
+4-gram across single-byte wildcards, 23 neither. The sparse grams fall on 79 keys, and one of
+them, `e8 ?? 00 00 00` (a call with a short forward displacement), is shared by 2,278 programs:
+the generated `.ndb` family `e8??000000{-50}86xxxx{-15}88xx{-50}ffex`, whose other literals
+are separated by variable gaps. On B1's 43 PE files that sparse gram occurs 148 times per MB,
+against 0.3 per MB for the family's current 3-byte keys (`860166`, `8a0166`, `860266`,
+`880166`): a 4-byte atom 500 times more frequent than the 3-byte one it would replace, with a
+chain of 2,278 programs behind it, the worst case the crowded-key limit (E4) exists to prevent.
+The limit would admit 32 of them. Sparse grams would therefore move at most about 350 programs
+off 3- and 2-byte atoms (tier D searched through them stays above 35%), and the ones they move
+would cost more candidates, not fewer. They are not built.
+
+Tier D by E3's definition (longest fixed literal under 4 bytes): 5,343 programs, 2,316 searched
+through 3- or 2-byte atoms, 606 deferred, 2,419 anchored: 56.6% deferred or anchored. The 90%
+line of #27 is out of reach for the same family: its programs are `.ndb` body signatures (no
+logical expression, so no partner to defer behind) at offset `*` (nothing to anchor). Deferring
+or anchoring all of tier D but this family would give 99%; with it, 56.6% is the ceiling of
+deferral and anchoring, and the family is searched through 3-byte atoms behind the gate (35.7
+candidates per MB on B1).

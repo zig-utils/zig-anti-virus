@@ -88,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u8, cmd, "show") and !std.mem.eql(u8, cmd, "rec") and !std.mem.eql(u8, cmd, "short") and !std.mem.eql(u8, cmd, "vmprog") and !std.mem.eql(u8, cmd, "planted") and !std.mem.eql(u8, cmd, "worst")) for (dirs.items) |d| try list(io, arena, d, &corpus, limit);
 
     if (std.mem.eql(u8, cmd, "census")) return census(database, index);
+    if (std.mem.eql(u8, cmd, "tierd")) return tierD(gpa, index);
     if (std.mem.eql(u8, cmd, "short")) {
         if (dirs.items.len > 1) hot_key = @byteSwap(try std.fmt.parseInt(u16, dirs.items[1], 16));
         return shortAtoms(gpa, index, if (dirs.items.len > 0) try std.fmt.parseInt(u8, dirs.items[0], 10) else 1);
@@ -1129,4 +1130,122 @@ fn shortAtoms(gpa: std.mem.Allocator, index: bodyscan.BodyIndex, target: u8) !vo
         for (hist[qq], 0..) |n, l| if (n > 0) std.debug.print(" lit{d}={d}", .{ l, n });
         std.debug.print("\n", .{});
     }
+}
+
+/// tierd <db>: the searched programs with a 3- or 2-byte atom, by whether a 4-byte window
+/// exists across masks and single-byte alternations (bounded expansion, 16 variants or fewer)
+/// or across single-byte wildcards (a sparse gram), and how many programs share each key.
+fn tierD(gpa: std.mem.Allocator, index: bodyscan.BodyIndex) !void {
+    const progs = index.programs.?;
+    const part = index.partitionFor(1).?;
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(gpa);
+    var sparse_keys: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer sparse_keys.deinit(gpa);
+    var expand_keys: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer expand_keys.deinit(gpa);
+    var total: usize = 0;
+    var expandable: usize = 0;
+    var sparse_only: usize = 0;
+    for (part.entries) |e| {
+        if (e.q == 4) continue;
+        if ((try seen.getOrPut(gpa, e.prog)).found_existing) continue;
+        total += 1;
+        const p = progs.get(e.prog);
+        // Byte sets of every part at fixed distance from its start: value count and one value.
+        var counts: [64]u32 = undefined;
+        var vals: [64]u8 = undefined;
+        var best_expand: ?u64 = null;
+        var best_sparse: ?u64 = null;
+        var n: usize = 0;
+        for (p.pattern.ops) |o| {
+            switch (o.code) {
+                .lit => for (p.pattern.bytes(o)) |b| {
+                    if (n < counts.len) {
+                        counts[n] = 1;
+                        vals[n] = b;
+                        n += 1;
+                    }
+                },
+                .masked => for (p.pattern.bytes(o), p.pattern.masks(o)) |v, m| {
+                    if (n < counts.len) {
+                        counts[n] = if (o.flags & zav.compile.ir.op_negate != 0) 255 else @as(u32, 1) << @intCast(8 - @popCount(m));
+                        vals[n] = v;
+                        n += 1;
+                    }
+                },
+                .gapf => for (0..o.a) |_| {
+                    if (n < counts.len) {
+                        counts[n] = 256;
+                        vals[n] = 0;
+                        n += 1;
+                    }
+                },
+                .alt => {
+                    var single = o.b & 0xffff == 1 and o.b >> 16 == 1;
+                    for (p.pattern.alternatives(o)) |alt| {
+                        const ops = p.pattern.altOps(alt);
+                        single = single and ops.len == 1 and ops[0].code == .lit and ops[0].len == 1;
+                    }
+                    if (single and n < counts.len) {
+                        counts[n] = o.len;
+                        vals[n] = 0;
+                        n += 1;
+                    } else n = 0;
+                },
+                else => {
+                    // A part boundary or anything variable: windows restart.
+                    windows(&counts, &vals, n, &best_expand, &best_sparse);
+                    n = 0;
+                },
+            }
+        }
+        windows(&counts, &vals, n, &best_expand, &best_sparse);
+        if (best_expand) |k| {
+            expandable += 1;
+            const g = try expand_keys.getOrPut(gpa, k);
+            g.value_ptr.* = if (g.found_existing) g.value_ptr.* + 1 else 1;
+        } else if (best_sparse) |k| {
+            sparse_only += 1;
+            const g = try sparse_keys.getOrPut(gpa, k);
+            g.value_ptr.* = if (g.found_existing) g.value_ptr.* + 1 else 1;
+        }
+    }
+    var largest_sparse: u32 = 0;
+    var it = sparse_keys.valueIterator();
+    while (it.next()) |v| largest_sparse = @max(largest_sparse, v.*);
+    var largest_expand: u32 = 0;
+    var it2 = expand_keys.valueIterator();
+    while (it2.next()) |v| largest_expand = @max(largest_expand, v.*);
+    std.debug.print("{d} searched programs with 3- or 2-byte atoms (PE partition and type 0): {d} have a 4-byte window across masks or single-byte alternations ({d} distinct keys, largest shared by {d}); {d} more only a sparse gram across wildcards ({d} distinct keys, largest shared by {d}); {d} neither\n", .{ total, expandable, expand_keys.count(), largest_expand, sparse_only, sparse_keys.count(), largest_sparse, total - expandable - sparse_only });
+}
+
+/// The first expansion window (4 positions, 16 variants or fewer) and the first sparse gram (4
+/// single-valued positions within 8) of a run of byte sets, as keys (positions folded in).
+fn windows(counts: *[64]u32, vals: *[64]u8, n: usize, expand: *?u64, sparse: *?u64) void {
+    if (n >= 4 and expand.* == null) for (0..n - 3) |s| {
+        var prod: u64 = 1;
+        for (counts[s..][0..4]) |c| prod *= c;
+        if (prod <= 16 and prod > 1) {
+            var k: u64 = prod << 40;
+            for (vals[s..][0..4], 0..) |v, i| k |= @as(u64, v) << @intCast(8 * i);
+            expand.* = k;
+            break;
+        }
+    };
+    if (sparse.* == null) for (0..n) |s| {
+        var got: usize = 0;
+        var k: u64 = 0;
+        var shape: u64 = 0;
+        var j = s;
+        while (j < n and j < s + 8 and got < 4) : (j += 1) if (counts[j] == 1) {
+            k |= @as(u64, vals[j]) << @intCast(8 * got);
+            shape |= @as(u64, 1) << @intCast(j - s);
+            got += 1;
+        };
+        if (got == 4 and counts[s] == 1) {
+            sparse.* = k | shape << 32;
+            break;
+        }
+    };
 }

@@ -96,6 +96,14 @@ all CPU-variant jobs, including x86_64 v2, v3 and the aarch64 runner. A fresh lo
 B1, B2 and S1 plus equal-sized random buffers: 11,162 files, 1,473.7 MB total,
 3,030,822 candidates, no differences.
 
+A vpshufb/tbl first-byte prefilter in front of the gate (#109) was measured by counting what it
+would pass rather than built: the PE partition's gate holds stride-one grams starting with 82
+distinct first bytes and 116 distinct second bytes, and on B1's 43 PE files a first-byte class
+test passes 62.0% of positions and a second-byte one 67.8% (`prefilter -- stages` prints both),
+so a 16-lane class test would let almost every 16-position step through to the gate loads it
+was meant to avoid. The gate itself costs about 0.25 ns per byte (measured with its passes
+discarded); its passes, now batched, cost about 9 ns each at 0.94% of positions.
+
 Real-atom measurements on the same ARM machine, main 63 + daily 28187 + bytecode 339,
 compiled from current source, best of five passes. Every file is forced through the PE
 partition with `--partition 1`; stage two is atom-table confirmation, without the VM.
