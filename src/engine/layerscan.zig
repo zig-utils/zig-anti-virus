@@ -218,11 +218,14 @@ pub const Scanner = struct {
             if (js.len > 0) {
                 const r = try s.body(e, js, 3, .{ .size = js.len }, t, layer, handler);
                 if (r != .clean) return r;
-                // The JavaScript file is also a text child of the page.
-                const owned = try s.gpa.dupe(u8, js);
-                defer s.gpa.free(owned);
-                const child = try s.scanObject(e, owned, .{ .container = @backingInt(types.ClType.html), .depth = layer.depth +| 1 });
-                if (child != .clean) return child;
+                // The JavaScript file is also a text child of the page (matched raw and
+                // normalised, not re-typed).
+                if (layer.depth < max_depth) {
+                    const owned = try s.gpa.dupe(u8, js);
+                    defer s.gpa.free(owned);
+                    const child = try s.scanAs(e, owned, .text_ascii, .{ .container = @backingInt(types.ClType.html), .depth = layer.depth +| 1 }, false);
+                    if (child != .clean) return child;
+                }
             }
             return .clean;
         }

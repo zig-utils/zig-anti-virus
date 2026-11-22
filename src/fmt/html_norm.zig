@@ -104,6 +104,7 @@ pub const Normalizer = struct {
     nc_suppress: bool = true,
     /// The pending whitespace run is a single space.
     nc_run_plain: bool = false,
+    after_decl: bool = false,
     /// The last byte written to the notags form was a space.
     nt_space: bool = false,
 
@@ -123,6 +124,11 @@ pub const Normalizer = struct {
     /// How much of `data:` the value has started with (5 once decided).
     dprefix: usize = 0,
     data_uri: bool = false,
+    /// A value has started with `data:` and the next byte decides.
+    dpending: bool = false,
+    data_escape: u8 = 0,
+    data_tail: [64]u8 = undefined,
+    data_tail_len: usize = 0,
     /// After a data URI ended at `&`, its closing quote is dropped.
     drop_quote: u8 = 0,
     vgroup: [3]u8 = undefined,
@@ -152,6 +158,7 @@ pub const Normalizer = struct {
     /// The quote of the string script or style content is in, or 0.
     raw_quote: u8 = 0,
     raw_after_lt: bool = false,
+    raw_decl: bool = false,
     /// The bytes of a script piece not yet handed over.
     piece: [256]u8 = undefined,
     piece_len: usize = 0,
@@ -181,6 +188,7 @@ pub const Normalizer = struct {
     nt_ref_hex: bool = false,
     nt_ref_digits: usize = 0,
     nt_ref_value: u64 = 0,
+    nt_ref_len: usize = 0,
 
     // High bytes in text, for the notags form's grouping and for U+3002 / U+FF0E.
     group: [3]u8 = undefined,
@@ -245,6 +253,10 @@ pub const Normalizer = struct {
 
     /// A character of text for the nocomment form.
     fn ncText(n: *Normalizer, c: u8) Error!void {
+        if (n.after_decl) {
+            n.after_decl = false;
+            n.nc_space = false;
+        }
         if (n.nc_space and !n.nc_suppress) try n.nc.put(' ');
         n.nc_space = false;
         n.nc_suppress = false;
@@ -253,6 +265,7 @@ pub const Normalizer = struct {
 
     /// Markup for the nocomment form: a pending space is written first.
     fn ncMarkup(n: *Normalizer, s: []const u8) Error!void {
+        n.after_decl = false;
         if (n.nc_space and !n.nc_suppress) try n.nc.put(' ');
         n.nc_space = false;
         n.nc_suppress = false;
@@ -423,7 +436,10 @@ pub const Normalizer = struct {
                     n.nt_ref_digits += 1;
                     break :blk true;
                 }
-                break :blk std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == ':';
+                if (n.nt_ref_len == 1023) break :blk false;
+                const name = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == ':';
+                if (name) n.nt_ref_len += 1;
+                break :blk name;
             };
             if (consumed) return;
             n.nt_ref = false;
@@ -439,6 +455,7 @@ pub const Normalizer = struct {
                 n.nt_ref_hex = false;
                 n.nt_ref_digits = 0;
                 n.nt_ref_value = 0;
+                n.nt_ref_len = 0;
                 try n.ntSpace();
             },
             else => try n.ntText(c),
@@ -451,6 +468,7 @@ pub const Normalizer = struct {
     fn startTag(n: *Normalizer) void {
         n.raw_end_tag = false;
         n.data_uri = false;
+        n.dpending = false;
         n.drop_quote = 0;
         n.state = .tag;
         n.part = .name;
@@ -466,10 +484,8 @@ pub const Normalizer = struct {
         switch (c) {
             ' ', '\t', '\n', 0x0b, 0x0c, '\r' => {},
             '!' => {
-                if (n.nc_space and !n.nc_run_plain and !n.nc_suppress) {
-                    try n.nc.put(' ');
-                    n.nc_suppress = true;
-                }
+                // A whitespace run before a declaration is written at once.
+                if (n.nc_space and !n.nc_suppress) try n.nc.put(' ');
                 n.nc_space = false;
                 n.state = .decl;
             },
@@ -493,11 +509,36 @@ pub const Normalizer = struct {
     }
 
     fn tagByte(n: *Normalizer, c: u8) Error!void {
+        if (n.dpending) {
+            if (!try n.dataDecide(c)) {
+                if (c == '>') return n.closeTag();
+            }
+        }
         if (n.data_uri) {
-            // An unquoted data URI ends at whitespace or `>`, which it swallows too.
+            // An unquoted data URI ends at whitespace or `>`, which it swallows too, or at a
+            // character reference, which is written. A `%` escape takes the next two bytes,
+            // whatever they are.
+            if (n.data_escape > 0) {
+                n.data_escape -= 1;
+                return;
+            }
+            if (c == '%') {
+                n.data_escape = 2;
+                return;
+            }
             switch (c) {
-                ' ', '\t', '\n', 0x0b, 0x0c, '\r', '>' => n.data_uri = false,
-                else => {},
+                ' ', '\t', '\n', 0x0b, 0x0c, '\r', '>' => {
+                    n.data_uri = false;
+                    n.data_tail_len = 0;
+                },
+                else => if (c == '&' or n.data_tail_len > 0) {
+                    // Kept for the end of the input, where a reference and what follows it
+                    // are written after all.
+                    if (n.data_tail_len < n.data_tail.len) {
+                        n.data_tail[n.data_tail_len] = c;
+                        n.data_tail_len += 1;
+                    }
+                },
             }
             return;
         }
@@ -518,7 +559,8 @@ pub const Normalizer = struct {
         if (n.part == .value and !(c >= 'a' and c <= 'z') and c != ':') try n.valueFlushPrefix();
         switch (c) {
             '>' => return n.closeTag(),
-            ' ', '\t', '\n', 0x0b, 0x0c, '\r' => {
+            '\r' => return,
+            ' ', '\t', '\n', 0x0b, 0x0c => {
                 if (n.part == .value or n.part == .attr or n.part == .name) {
                     if (n.part == .value) n.attr_len = 0;
                     n.endAttr();
@@ -534,9 +576,11 @@ pub const Normalizer = struct {
                 if (n.part != .value) {
                     try n.nc.put('=');
                     n.part = .after_eq;
-                    n.capturing = !n.captured and n.wantsCapture();
-                    n.capture_len = 0;
-                    n.capture_space = false;
+                    if (!n.captured and n.wantsCapture()) {
+                        n.capturing = true;
+                        n.capture_len = 0;
+                        n.capture_space = false;
+                    }
                 } else if (n.part == .value) {
                     return n.valueByte('=', '=');
                 }
@@ -596,6 +640,21 @@ pub const Normalizer = struct {
     /// and text) for the next value byte and are written before it, and a value that starts with `data:` is a data URI (RFC 2397), written as `data`
     /// and otherwise swallowed (up to the closing quote or `&` when quoted, whitespace when
     /// not).
+    /// After a value's `data:`: a data URI starts unless the tag ends right there; either way
+    /// the value is written as `data`.
+    fn dataDecide(n: *Normalizer, c: u8) Error!bool {
+        if (!n.dpending) return false;
+        n.dpending = false;
+        try n.nc.putAll("data");
+        if (c == '>') return false;
+        n.data_uri = true;
+        n.data_escape = 0;
+        n.data_tail_len = 0;
+        n.capturing = false;
+        n.captured = false;
+        return true;
+    }
+
     fn valueByte(n: *Normalizer, c: u8, out: u8) Error!void {
         if (c >= 0x80) {
             if (n.vgroup_len == 3) try n.vgroupEmit();
@@ -604,15 +663,17 @@ pub const Normalizer = struct {
             n.value_len += 1;
             return;
         }
+        const pending = n.vgroup_len;
         try n.vgroupEmit();
+        if (pending > 0 and n.dprefix == 0) {
+            // Bytes written before the value's first byte: it no longer starts with `data:`.
+            n.dprefix = 5;
+        }
         if (n.value_len == n.dprefix and n.dprefix < 5 and c == "data:"[n.dprefix]) {
             n.dprefix += 1;
             n.value_len += 1;
-            if (n.dprefix == 5) {
-                n.data_uri = true;
-                n.capturing = false;
-                try n.nc.putAll("data");
-            }
+            // Decided by the byte after the `:`.
+            if (n.dprefix == 5) n.dpending = true;
             return;
         }
         if (n.dprefix > 0 and n.dprefix < 5) {
@@ -625,7 +686,7 @@ pub const Normalizer = struct {
         }
         n.dprefix = 5;
         n.value_len += 1;
-        try n.captureByte(c);
+        try n.captureByte(if (c == '\'' or c == '"') '"' else c);
         try n.nc.put(out);
     }
 
@@ -633,7 +694,11 @@ pub const Normalizer = struct {
         const g = n.vgroup[0..n.vgroup_len];
         n.vgroup_len = 0;
         if (g.len == 0) return;
-        if (std.mem.eql(u8, g, "\xe3\x80\x82") or std.mem.eql(u8, g, "\xef\xbc\x8e")) return n.nc.put('.');
+        if (std.mem.eql(u8, g, "\xe3\x80\x82") or std.mem.eql(u8, g, "\xef\xbc\x8e")) {
+            try n.captureByte('.');
+            return n.nc.put('.');
+        }
+        for (g) |x| try n.captureByte(x);
         try n.nc.putAll(g);
     }
 
@@ -654,7 +719,16 @@ pub const Normalizer = struct {
     /// leaves the quoted value (the rest is tag content) and a `>` ends the tag. The closing
     /// quote is followed by a space unless the value held a run.
     fn quotedByte(n: *Normalizer, c: u8) Error!void {
+        if (n.dpending) _ = try n.dataDecide(c);
         if (n.data_uri) {
+            if (n.data_escape > 0) {
+                n.data_escape -= 1;
+                return;
+            }
+            if (c == '%') {
+                n.data_escape = 2;
+                return;
+            }
             if (c == n.quote or c == '&') {
                 n.data_uri = false;
                 try n.nc.put('"');
@@ -777,8 +851,8 @@ pub const Normalizer = struct {
         n.state = .text;
         n.nt_tag_text = false;
         n.nc_space = false;
-        // Whitespace after a tag is dropped, except after a script or style end tag.
-        n.nc_suppress = !n.raw_end_tag;
+        // Whitespace after a tag is dropped.
+        n.nc_suppress = true;
         n.raw_end_tag = false;
         if (n.captured) {
             // Written when the next byte arrives.
@@ -793,6 +867,7 @@ pub const Normalizer = struct {
                 n.raw_match = 0;
                 n.raw_quote = 0;
                 n.raw_after_lt = false;
+                n.raw_decl = false;
                 n.piece_len = 0;
                 if (n.raw_script) if (n.scripts) |p| {
                     try p.begin(p.ctx);
@@ -855,14 +930,17 @@ pub const Normalizer = struct {
                 else => {},
             }
             n.raw_after_lt = false;
+            if (c == '!') n.raw_decl = true;
             return n.ncText(lower(c));
         }
         if (c == '<') n.raw_after_lt = true;
+        if (c == '>') n.raw_decl = false;
         if (c >= 0x80) return n.groupByte(c);
         switch (c) {
             ' ', '\t', '\n', 0x0b, 0x0c, '\r', 0 => {},
             '\'' => try n.ncText('"'),
-            '&' => n.startRef(false),
+            // No references are decoded inside `<!...>`.
+            '&' => if (n.raw_decl) try n.ncText('&') else n.startRef(false),
             else => try n.ncText(lower(c)),
         }
     }
@@ -1035,7 +1113,10 @@ pub const Normalizer = struct {
             try n.nc.put(' ');
             n.nc_space = false;
         }
-        if (n.in_ref and n.state == .raw and (n.ref_numeric or n.ref_len > 0)) {
+        if (n.in_ref and n.state == .raw and !n.ref_numeric and n.ref_len > 0 and lookup(n.ref_name[0..n.ref_len]) != null) {
+            n.in_ref = false;
+            try n.codePoint(lookup(n.ref_name[0..n.ref_len]).?, true);
+        } else if (n.in_ref and n.state == .raw and (n.ref_numeric or n.ref_len > 0)) {
             // In script and style content an unfinished reference is written as it came.
             try n.ncText('&');
             if (n.ref_numeric) try n.ncText('#');
@@ -1050,8 +1131,12 @@ pub const Normalizer = struct {
         n.in_ref = false;
         n.group_len = 0;
         if (n.state == .tag_open and !n.raw_end_open) try n.ncMarkup("<");
+        if (n.state == .tag and n.data_uri and n.data_tail_len > 0) try n.nc.putAll(n.data_tail[0..n.data_tail_len]);
         if (n.state == .tag or n.state == .tag_quoted) {
-            if (!n.data_uri) try n.valueFlushPrefix();
+            if (n.dpending) {
+                n.dpending = false;
+                try n.nc.putAll("data:");
+            } else if (!n.data_uri) try n.valueFlushPrefix();
         }
         if (n.after_raw) {
             n.after_raw = false;
