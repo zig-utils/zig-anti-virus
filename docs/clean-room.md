@@ -104,8 +104,10 @@ Observations, all with the official `daily.ftm` loaded and an otherwise empty da
 - Binary data whose first 512 bytes are a tar header with a valid unsigned checksum (signed
   sums do not count) is OLD_TAR, before body magics are considered.
 
-Known differences: two XDP/MHTML magics followed by a self-extractor marker in the same head
-(the first document type wins in clamscan); a disk image magic inside a fully formed RAR or
+With two or more XDP/MHTML magics followed by a self-extractor marker in the same head, the
+first document type of the run wins; MAIL matches between them (an MHTML magic also matches
+as MAIL) do not end the run (5,554 probes of up to five XDP, MHTML, PDF, HTML and
+self-extractor magics, in text and in binary data). Known differences: a disk image magic inside a fully formed RAR or
 PDF header; one OLE2 file that clamscan leaves as MSOLE2.
 
 ## Text normalisation (`src/fmt/text_norm.zig`)
@@ -125,7 +127,10 @@ PDF header; one OLE2 file that clamscan leaves as MSOLE2.
 - Chunks: a single space at offsets 8191, 16382, 24573 of a document without other
   whitespace is dropped, and with periodic whitespace the drop points move: a chunk is 8191
   bytes, ends after its last whitespace byte when the byte after it is not whitespace, and its
-  leading whitespace is dropped (in both forms). A newline does not end a chunk.
+  leading whitespace is dropped (in both forms). A newline does not end a chunk. When a chunk
+  is cut short, the next one starts later by the number of NUL bytes in the part of the
+  8191-byte window that was left over (found by computing the boundaries of the two stress
+  documents that still differed and moving NULs across them).
 - nocomment: lower case; whitespace runs to one space written before the next character
   (none at the end of the input, none right after a tag or declaration, written at once before
   a declaration); CR and NUL dropped; other control bytes kept; `<!...>` dropped up to the next
@@ -142,7 +147,11 @@ PDF header; one OLE2 file that clamscan leaves as MSOLE2.
   FFFF reduced to 16 bits; unknown names written back in lower case (case-sensitive table).
 - notags: text only, every tag and reference a space, spaces collapsed; a reference there runs
   over letters, digits, `-`, `_`, `:` (at most 1024 bytes); the `href` of an `a` and the `src` of
-  an `img` are written in their own case when the next byte arrives.
+  an `img` are written in their own case when the next byte arrives, followed by a space that
+  is not merged with a space ending the value. A quoted value left without its closing quote
+  (a second whitespace run, or a `>` after whitespace or after another `>`), or cut off by a
+  NUL reference, loses its last byte there (random values of letters, whitespace, `<`, `>`,
+  `#`, `=`, NUL, CR, high bytes and references, about 1,150 documents).
 - High bytes come in groups of three, each written when the byte after it arrives (a last
   group is dropped at the end of the input): in nocomment as they are, in notags as the
   first, the second and the second again (a group of two as the first twice, one as a NUL),
@@ -152,19 +161,44 @@ PDF header; one OLE2 file that clamscan leaves as MSOLE2.
   tags and text for the next value byte.
 - `script` and `style` content: all whitespace removed, `'` written as `"`, references decoded
   except inside `<!...>`, until `</script` (or `</style`, or `</script` for style); the byte after
-  a `<` (whitespace skipped) is written as it is and cannot start the end tag. Each script is
-  handed to the JavaScript normaliser with its end tag.
+  a `<` (whitespace skipped) is written as it is and cannot start the end tag, except inside
+  `<!...>`, where a `<` is an ordinary byte. Each script is handed to the JavaScript normaliser
+  with its end tag: runs of letters, digits, `_` and `$` are handed over whole, then `</script`,
+  and a `>` right after it with one whitespace byte after that, or a whitespace byte right after
+  it. A script whose open tag ends on the last byte of the input hands over nothing.
 - Data URIs (RFC 2397): a value starting with lower-case `data:` is written as `data` and the
-  rest swallowed (to the closing quote or `&` when quoted, to whitespace or `>` when not, a `%`
-  taking the next two bytes), unless the tag ends right after `data:`.
+  rest swallowed, unless the tag ends right after `data:`. Quoted, the URI ends at the closing
+  quote or at a `&`, whose reference is then written and the rest of the value dropped.
+  Unquoted, before the `,` (the media type) whitespace and `>` end it as tag syntax; after the
+  `,` whitespace or `>` end it and are swallowed, what follows is attribute name again with no
+  space before it, and references inside are written, decoded (their names may also hold `-`,
+  `_` and `:`). A `%` takes the next byte, and the one after when that is a hex digit.
+- Data URI files (`Outputs.data_uris`), from clamscan's `rfc2397/clamav-*.tmp`:
+  `From html-normalise\nContent-type: TYPE\n`, then `Content-transfer-encoding: base64\n` when
+  TYPE contains `;base64` anywhere (`a;base64x` and `a;base64;x` count), then an empty line and
+  the data. TYPE is the text between `data:`
+  and the first `,`, lower-cased; a URI with no `,` makes no file. `%XY` is decoded (a second
+  byte that is not a hex digit counts as 0; a first one that is not makes `%0` and the byte
+  is consumed), the decoded byte written when the next byte arrives (so one at the end of the
+  input is lost); references are left out with their `;` (names over letters, digits, `#`, `-`,
+  `_`, `:`, at most 1024 bytes); raw bytes, newlines and control bytes kept. CR is left out of
+  TYPE and before the first data byte; after that it is data in a quoted URI and ends an
+  unquoted one. Whitespace in the TYPE of a quoted URI is one space and the quote is forgotten:
+  the URI then ends as an unquoted one does, its closing quote becoming data. A newline as the
+  first data byte of a quoted URI is written as a space. The URI is not ended by the tag: one
+  whose closing quote was taken by a `%` escape runs on through the page to the end of the
+  input or to the next such quote. Scanned as children of the page (they type as mail).
 - Named references: `tools/diff/html_named_refs.py` writes every candidate name from the
   WHATWG `entities.json` and the W3C ISO 8879 and HTML/MathML sets (2,216 names) into one
   document and reads back what clamscan decodes: 743 names, with the code point clamscan
   prints for each. The table is that observation.
 
-Not reproduced (known differences): some combinations of data URIs and references, a `'` quote
-whose value starts with whitespace inside a tag named `'`, the notags capture of a quoted value
-holding a NUL reference, and the tag text clamscan writes in notags after some script end tags.
+Not reproduced (known differences): data URI files whose media type holds a `>` and whose data
+holds a reference followed by CR; values whose quote characters fall inside other values, or
+that repeat `href`; a high byte right after `=` in tag text that follows a quoted value left
+without its quote; and, in the `javascript` file, the parts that belong to the JavaScript
+normaliser (see below): clamscan drops a trailing identifier at the end of the input and keeps
+whitespace runs inside strings.
 
 ## Scan model (`src/engine/layerscan.zig`, `src/fmt/js_file.zig`)
 
@@ -189,12 +223,21 @@ From `--allmatch` verdicts of signatures for every target type over files of eac
 | File typing | 14,294 generated probes (bytes, BOMs, windows, magic mixes) | 14,292 |
 | Text form | 1,355 text files (Python stdlib sources, four seam files of up to 1.2 MB) | 1,355 |
 | HTML nocomment | 196 system HTML files | 196 |
-| HTML notags | 196 system HTML files | 195 |
-| HTML nocomment | 600 `gen_html.py` stress documents | 541 |
-| HTML notags | 600 `gen_html.py` stress documents | 594 |
+| HTML notags | 196 system HTML files | 196 |
+| HTML nocomment | 600 `gen_html.py` stress documents | 600 |
+| HTML notags | 600 `gen_html.py` stress documents | 600 |
+| HTML `javascript` | 600 `gen_html.py` stress documents (3 of the system files have scripts: 3) | 570 |
+| Data URI files | 236 stress documents and 37 data URI probes with data URIs | 273 |
+| Data URI files | 858 random data URIs (four seeds) | 848 |
+| File typing | 5,554 document and self-extractor magic combinations | 5,554 |
 | P4.21 gate (`realdb.py gate`, whole main and daily) | 35,309 samples | 35,309 |
 
-The stress documents that still differ combine constructs listed under "Not reproduced".
+The 30 `javascript` differences are the JavaScript normaliser's (a trailing identifier at the
+end of the input, whitespace inside strings); the HTML side hands it the same pieces.
+
+`tools/diff/norm.py` counts files clamscan kept no normalised form for (neither text nor HTML)
+as `other`. Nothing is compared for them, so the old `other: N files, 0 byte-identical` line was
+a count, not a failure; it now says so.
 
 ## JavaScript normaliser (`src/fmt/js_norm.zig`)
 

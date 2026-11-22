@@ -85,6 +85,11 @@ def main():
                 i = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]), min(len(got), len(want)))
                 print("DIFF %s (%s) at byte %d:\n  libclamav %r\n  zav       %r" % (path, kind, i, want[max(0, i - 30):i + 50], got[max(0, i - 30):i + 50]))
     for kind, c in sorted(counts.items()):
+        if kind == "other":
+            # Files clamscan kept no normalised form for (typed neither text nor HTML): nothing
+            # to compare, so they are counted only.
+            print("norm.py: other: %d files clamscan did not normalise (not compared)" % c[0])
+            continue
         print("norm.py: %s: %d files, %d byte-identical" % (kind, c[0], c[1]))
     return 0 if failures == 0 else 1
 

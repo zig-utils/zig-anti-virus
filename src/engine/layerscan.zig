@@ -129,6 +129,9 @@ pub const Scanner = struct {
     html: *html_norm.Normalizer,
     walk_scratch: scratch_mod.Scratch,
     forms: [3]std.ArrayList(u8) = @splat(.empty),
+    /// Data URI files of the last HTML object, back to back; `durl_ends` holds where each ends.
+    durls: std.ArrayList(u8) = .empty,
+    durl_ends: std.ArrayList(usize) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: Io) !*Scanner {
         const s = try gpa.create(Scanner);
@@ -161,6 +164,8 @@ pub const Scanner = struct {
         s.gpa.free(s.vm_sections);
         s.gpa.destroy(s.html);
         for (&s.forms) |*f| f.deinit(s.gpa);
+        s.durls.deinit(s.gpa);
+        s.durl_ends.deinit(s.gpa);
         s.walk_scratch.deinit();
         s.scratch.deinit();
         s.gpa.destroy(s);
@@ -213,6 +218,20 @@ pub const Scanner = struct {
             for (forms) |form| {
                 const r = try s.body(e, form, 3, .{ .size = form.len }, t, layer, handler);
                 if (r != .clean) return r;
+            }
+            // Data URIs are children of the page (mail-like files, typed as usual).
+            if (layer.depth < max_depth and s.durl_ends.items.len > 0) {
+                const all = try s.gpa.dupe(u8, s.durls.items);
+                defer s.gpa.free(all);
+                const ends = try s.gpa.dupe(usize, s.durl_ends.items);
+                defer s.gpa.free(ends);
+                var start: usize = 0;
+                for (ends) |end| {
+                    const child = try s.scanObject(e, all[start..end], .{ .container = @backingInt(types.ClType.html), .depth = layer.depth +| 1 });
+                    if (child != .clean) return child;
+                    start = end;
+                }
+                try s.normalizeHtml(data);
             }
             const js = s.forms[2].items;
             if (js.len > 0) {
@@ -318,15 +337,32 @@ pub const Scanner = struct {
         }
     };
 
-    /// The nocomment and notags forms of an HTML object and its JavaScript file, in `forms`.
+    const DurlSink = struct {
+        fn begin(_: *anyopaque) error{Stop}!void {}
+        fn data(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+            const s: *Scanner = @ptrCast(@alignCast(ctx));
+            if (s.durls.items.len + bytes.len > s.limits.max_scan_size) return error.Stop;
+            s.durls.appendSlice(s.gpa, bytes) catch return error.Stop;
+        }
+        fn end(ctx: *anyopaque) error{Stop}!void {
+            const s: *Scanner = @ptrCast(@alignCast(ctx));
+            s.durl_ends.append(s.gpa, s.durls.items.len) catch return error.Stop;
+        }
+    };
+
+    /// The nocomment and notags forms of an HTML object, its JavaScript file and its data URI
+    /// files.
     pub fn normalizeHtml(s: *Scanner, data: []const u8) !void {
         for (&s.forms) |*f| f.clearRetainingCapacity();
         var sinks: [3]FormSink = .{ .{ .s = s, .i = 0 }, .{ .s = s, .i = 1 }, .{ .s = s, .i = 2 } };
         var js: JavascriptFile = .{ .out = .{ .ctx = &sinks[2], .write = FormSink.write } };
+        s.durls.clearRetainingCapacity();
+        s.durl_ends.clearRetainingCapacity();
         s.html.* = .init(.{
             .nocomment = .{ .ctx = &sinks[0], .write = FormSink.write },
             .notags = .{ .ctx = &sinks[1], .write = FormSink.write },
             .scripts = js.pieces(),
+            .data_uris = .{ .ctx = s, .begin = DurlSink.begin, .data = DurlSink.data, .end = DurlSink.end },
         });
         const max = s.limits.max_html_normalize;
         s.html.feed(data[0..@min(data.len, max)]) catch {};

@@ -856,6 +856,18 @@ fn normalizeCmd(app: App, args: []const []const u8) !u8 {
         outputs.notags = writer;
     } else if (std.mem.eql(u8, args[0], "js")) {
         outputs.scripts = js.pieces();
+    } else if (std.mem.eql(u8, args[0], "datauri")) {
+        // Each data URI file, followed by a separator line.
+        const P = struct {
+            fn begin(_: *anyopaque) error{Stop}!void {}
+            fn piece(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+                return Sink.write(ctx, bytes);
+            }
+            fn end(ctx: *anyopaque) error{Stop}!void {
+                return Sink.write(ctx, "\n--zav-datauri--\n");
+            }
+        };
+        outputs.data_uris = .{ .ctx = &sink, .begin = P.begin, .data = P.piece, .end = P.end };
     } else return usage(app);
     const norm = try app.arena.create(zav.fmt.html_norm.Normalizer);
     norm.* = .init(outputs);

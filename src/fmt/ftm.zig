@@ -248,10 +248,29 @@ fn lowRank(t: types.ClType) u8 {
 /// Stage 3: feed the head's body-magic matches in file order.
 const Combiner = struct {
     cur: ?Match = null,
+    /// The first of a run of XDP/MHTML matches that replaced each other: a self-extractor
+    /// marker after the run brings it back (observed with two and three document magics
+    /// and a marker).
+    first_doc: ?Match = null,
 
     fn add(c: *Combiner, m: Match) void {
         const new = classOf(m);
         if (new == .none) return;
+        if (c.cur) |cur| {
+            if (classOf(cur) == .document) {
+                if (new == .sfx) {
+                    if (c.first_doc) |f| c.cur = f;
+                    return;
+                }
+                if (new == .document) {
+                    if (c.first_doc == null) c.first_doc = cur;
+                } else if (new == .exe or new == .installer or new == .top or new == .disk) {
+                    // Only a match that replaces the document ends the run (a MAIL match
+                    // between two document magics does not).
+                    c.first_doc = null;
+                }
+            }
+        }
         const cur = c.cur orelse {
             c.cur = m;
             return;

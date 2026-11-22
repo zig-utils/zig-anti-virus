@@ -36,8 +36,33 @@ pub const Outputs = struct {
     /// Each script's raw text followed by its end tag (`</script`, plus the `>` when it comes
     /// right after).
     scripts: ?Pieces = null,
-    /// Reserved: data URIs are not extracted.
+    /// Each data URI's file (below), one piece per URI.
     data_uris: ?Pieces = null,
+};
+
+/// The file clamscan makes of a data URI (RFC 2397) found in an attribute value, observed in
+/// its `rfc2397/` temporary files: a mail-like header with the media type (lower-cased) and a
+/// base64 transfer encoding when the media type contains `;base64`, then the data with `%`
+/// escapes decoded. Only URIs with a `,` make one.
+const DataUri = struct {
+    active: bool = false,
+    quote: u8 = 0,
+    comma: bool = false,
+    mt: [256]u8 = undefined,
+    mt_len: usize = 0,
+    /// 0 none, 1 after `%`, 2 after a hex digit (in `hi`), 3 a decoded byte (in `hi`) waiting.
+    esc: u8 = 0,
+    hi: u8 = 0,
+    /// Inside a reference, which is left out of the data.
+    in_ref: bool = false,
+    ref_len: usize = 0,
+    /// The data ended (at an unterminated reference) but the URI goes on.
+    done: bool = false,
+    /// Whitespace in the media type of a quoted URI: the quote is forgotten, and the run is
+    /// one space.
+    type_ws: bool = false,
+    /// A byte of data has arrived since the comma.
+    data_seen: bool = false,
 };
 
 /// The longest chunk the input is cut into.
@@ -93,9 +118,14 @@ pub const Normalizer = struct {
     nc: Buffered,
     nt: Buffered,
     scripts: ?Pieces,
+    data_uris: ?Pieces,
+    du: DataUri = .{},
+    du_buf: [256]u8 = undefined,
+    du_len: usize = 0,
 
     chunk: [chunk_max + 1]u8 = undefined,
     chunk_len: usize = 0,
+    chunk_skip: usize = 0,
 
     state: State = .text,
     /// Whitespace seen in text that the nocomment form writes before the next character.
@@ -126,6 +156,7 @@ pub const Normalizer = struct {
     data_uri: bool = false,
     /// A value has started with `data:` and the next byte decides.
     dpending: bool = false,
+    after_durl: bool = false,
     data_escape: u8 = 0,
     /// The data URI's `,` has been seen.
     data_comma: bool = false,
@@ -151,6 +182,8 @@ pub const Normalizer = struct {
     capture_due: bool = false,
     /// A NUL ended the capture.
     capture_closed: bool = false,
+    /// The quoted value was left without its closing quote: the capture loses its last byte.
+    capture_trim: bool = false,
     /// The rest of a script's end tag goes to the notags form as text.
     nt_tag_text: bool = false,
 
@@ -164,7 +197,8 @@ pub const Normalizer = struct {
     raw_after_lt: bool = false,
     raw_decl: bool = false,
     /// The bytes of a script piece not yet handed over.
-    piece: [256]u8 = undefined,
+    piece: [4096]u8 = undefined,
+    piece_gt: bool = false,
     piece_len: usize = 0,
     /// A script or style end tag was just matched; a `>` right after belongs to it.
     after_raw: bool = false,
@@ -174,9 +208,14 @@ pub const Normalizer = struct {
     raw_end_tag: bool = false,
     /// A script piece is open.
     piece_open: bool = false,
+    /// The open piece has been handed to the sink: it begins with the first byte after the
+    /// open tag, so a script tag closed by the last byte of input begins none.
+    piece_begun: bool = false,
 
     // Character references.
     in_ref: bool = false,
+    /// The reference is inside an unquoted data URI.
+    ref_durl: bool = false,
     ref_numeric: bool = false,
     ref_hex: bool = false,
     ref_digits: usize = 0,
@@ -204,7 +243,7 @@ pub const Normalizer = struct {
     pub const Error = error{Stop};
 
     pub fn init(outputs: Outputs) Normalizer {
-        return .{ .nc = .{ .out = outputs.nocomment }, .nt = .{ .out = outputs.notags }, .scripts = outputs.scripts };
+        return .{ .nc = .{ .out = outputs.nocomment }, .nt = .{ .out = outputs.notags }, .scripts = outputs.scripts, .data_uris = outputs.data_uris };
     }
 
     pub fn feed(n: *Normalizer, in: []const u8) Error!void {
@@ -226,9 +265,13 @@ pub const Normalizer = struct {
                         }
                     }
                 }
+                // Observed: when a chunk is cut short, the next one starts later by the number of
+                // NUL bytes in the part of the 8191-byte window left over.
+                const skip = std.mem.count(u8, n.chunk[cut..chunk_max], &.{0});
                 try n.process(n.chunk[0..cut]);
                 std.mem.copyForwards(u8, n.chunk[0 .. n.chunk_len - cut], n.chunk[cut..n.chunk_len]);
                 n.chunk_len -= cut;
+                n.chunk_skip = skip;
             }
         }
     }
@@ -242,7 +285,8 @@ pub const Normalizer = struct {
     }
 
     fn process(n: *Normalizer, chunk: []const u8) Error!void {
-        var i: usize = 0;
+        var i: usize = @min(chunk.len, n.chunk_skip);
+        n.chunk_skip = 0;
         while (i < chunk.len and isSpace(chunk[i])) i += 1;
         for (chunk[i..]) |c| try n.step(c);
     }
@@ -346,12 +390,14 @@ pub const Normalizer = struct {
     fn step(n: *Normalizer, c: u8) Error!void {
         // NUL bytes are ignored everywhere.
         if (c == 0) return;
+        if (n.du.active) try n.duByte(c);
         if (n.state == .text or n.state == .raw) {
             if (n.phantom and c >= 0x80) {
                 n.phantom = false;
                 n.group_len = 0;
             } else if (n.group_len == 1 and n.group[0] == 0xa1 and !n.phantom and (c == 0x43 or c == 0x44 or c == 0x4f) and !n.in_ref and n.raw_match == 0) {
                 // Big5 dots (A1 43, A1 44, A1 4F).
+                if (n.state == .raw) try n.pieceByte(c);
                 try n.ncText('.');
                 try n.nt.put('.');
                 n.group[0] = 0;
@@ -364,11 +410,24 @@ pub const Normalizer = struct {
             n.capture_due = false;
             try n.ntSpace();
             for (n.capture[0..n.capture_len]) |x| try n.ntChar(x);
-            try n.ntSpace();
+            // Written even after a capture that ends in whitespace.
+            try n.ntChar(' ');
+        }
+        if (n.piece_gt) {
+            // After `</script>`, a whitespace byte still goes with the script.
+            n.piece_gt = false;
+            if (n.piece_open) try n.endPiece(if (isSpace(c)) c else null);
         }
         if (n.after_raw) {
             n.after_raw = false;
-            if (n.piece_open) try n.endPiece(c == '>');
+            // A whitespace byte right after the end tag goes with the script, and so does a
+            // `>` (and a whitespace byte after that).
+            if (n.piece_open) {
+                if (c == '>') {
+                    try n.pieceByte(c);
+                    n.piece_gt = true;
+                } else try n.endPiece(if (isSpace(c)) c else null);
+            }
             // In the notags form the end tag is over when whitespace follows: the rest of the
             // tag is text there. Whitespace after an end tag with more in it is kept.
             switch (c) {
@@ -381,7 +440,11 @@ pub const Normalizer = struct {
         }
         if (n.state == .text) try n.ntTextStep(c);
         if (n.in_ref) {
-            if (try n.refStep(c)) return;
+            if (try n.refStep(c)) {
+                // Script text keeps its references as written.
+                if (n.state == .raw) try n.pieceByte(c);
+                return;
+            }
         }
         switch (n.state) {
             .text => try n.textByte(c),
@@ -482,6 +545,7 @@ pub const Normalizer = struct {
         n.raw_end_tag = false;
         n.data_uri = false;
         n.dpending = false;
+        n.after_durl = false;
         n.drop_quote = 0;
         n.state = .tag;
         n.part = .name;
@@ -532,7 +596,9 @@ pub const Normalizer = struct {
             // character reference, which is written. A `%` escape takes the next two bytes,
             // whatever they are.
             if (n.data_escape > 0) {
+                // `%` takes the next byte, and the one after only when that is a hex digit.
                 n.data_escape -= 1;
+                if (n.data_escape == 1 and std.fmt.charToDigit(c, 16) == error.InvalidCharacter) n.data_escape = 0;
                 return;
             }
             if (c == '%') {
@@ -560,17 +626,20 @@ pub const Normalizer = struct {
             }
             switch (c) {
                 ' ', '\t', '\n', 0x0b, 0x0c, '\r', '>' => {
+                    // What follows is attribute name again, written with no space before it
+                    // (whitespace after the URI is skipped).
                     n.data_uri = false;
                     n.data_tail_len = 0;
+                    n.part = .attr;
+                    n.after_durl = true;
                 },
-                else => if (c == '&' or n.data_tail_len > 0) {
-                    // Kept for the end of the input, where a reference and what follows it
-                    // are written after all.
-                    if (n.data_tail_len < n.data_tail.len) {
-                        n.data_tail[n.data_tail_len] = c;
-                        n.data_tail_len += 1;
-                    }
+                // References inside the data are written, decoded; their names may also
+                // hold `-`, `_` and `:`.
+                '&' => {
+                    n.startRef(true);
+                    n.ref_durl = true;
                 },
+                else => {},
             }
             return;
         }
@@ -578,6 +647,12 @@ pub const Normalizer = struct {
             // The rest of a quoted data URI after its `&` reference, closing quote included.
             if (c == n.drop_quote) n.drop_quote = 0;
             return;
+        }
+        if (n.after_durl) {
+            switch (c) {
+                ' ', '\t', '\n', 0x0b, 0x0c, '\r' => return,
+                else => n.after_durl = false,
+            }
         }
         const after_quote = n.after_quote;
         n.after_quote = false;
@@ -612,6 +687,7 @@ pub const Normalizer = struct {
                     if (!n.captured and n.wantsCapture()) {
                         n.capturing = true;
                         n.capture_closed = false;
+                        n.capture_trim = false;
                         n.capture_len = 0;
                         n.capture_space = false;
                     }
@@ -681,6 +757,9 @@ pub const Normalizer = struct {
         n.dpending = false;
         try n.nc.putAll("data");
         if (c == '>') return false;
+        try n.duEnd();
+        n.du = .{ .active = true, .quote = if (n.state == .tag_quoted) n.quote else 0 };
+        try n.duByte(c);
         n.data_uri = true;
         n.data_comma = false;
         n.data_escape = 0;
@@ -757,7 +836,9 @@ pub const Normalizer = struct {
         if (n.dpending) _ = try n.dataDecide(c);
         if (n.data_uri) {
             if (n.data_escape > 0) {
+                // `%` takes the next byte, and the one after only when that is a hex digit.
                 n.data_escape -= 1;
+                if (n.data_escape == 1 and std.fmt.charToDigit(c, 16) == error.InvalidCharacter) n.data_escape = 0;
                 return;
             }
             if (c == '%') {
@@ -787,6 +868,7 @@ pub const Normalizer = struct {
                 if (n.value_space) return;
                 if (n.value_had_ws or n.value_gt) {
                     // A second whitespace run leaves the quoted value: the rest is tag content.
+                    n.capture_trim = true;
                     n.state = .tag;
                     return n.tagByte(c);
                 }
@@ -821,7 +903,10 @@ pub const Normalizer = struct {
         }
         switch (c) {
             '>' => {
-                if (n.value_had_ws or n.value_gt) return n.closeTag();
+                if (n.value_had_ws or n.value_gt) {
+                    n.capture_trim = true;
+                    return n.closeTag();
+                }
                 n.value_gt = true;
                 n.value_space = true;
                 try n.captureByte(c);
@@ -873,11 +958,13 @@ pub const Normalizer = struct {
     fn endAttr(n: *Normalizer) void {
         if (n.capturing) {
             n.capturing = false;
+            if (n.capture_trim and n.capture_len > 0) n.capture_len -= 1;
             n.captured = n.capture_len > 0;
         }
     }
 
     fn closeTag(n: *Normalizer) Error!void {
+        // A data URI is not ended by the tag: a quoted one runs to its quote.
         n.endAttr();
         try n.valueFlushPrefix();
         n.drop_quote = 0;
@@ -905,10 +992,10 @@ pub const Normalizer = struct {
                 n.raw_after_lt = false;
                 n.raw_decl = false;
                 n.piece_len = 0;
-                if (n.raw_script) if (n.scripts) |p| {
-                    try p.begin(p.ctx);
+                if (n.raw_script and n.scripts != null) {
                     n.piece_open = true;
-                };
+                    n.piece_begun = false;
+                }
             }
         }
     }
@@ -971,7 +1058,8 @@ pub const Normalizer = struct {
             if (c == '!') n.raw_decl = true;
             return n.ncText(lower(c));
         }
-        if (c == '<') n.raw_after_lt = true;
+        // Inside `<!...>` a `<` is an ordinary byte.
+        if (c == '<' and !n.raw_decl) n.raw_after_lt = true;
         if (c == '>') n.raw_decl = false;
         // Inside `<!...>` high bytes are written as they are, to the nocomment form only.
         if (c >= 0x80) return if (n.raw_decl) n.ncText(c) else n.groupByte(c);
@@ -1001,24 +1089,34 @@ pub const Normalizer = struct {
         n.raw_end_open = true;
     }
 
+    /// Script text, buffered up to the byte that ends a run of letters, digits, `_` and `$`.
     fn pieceByte(n: *Normalizer, c: u8) Error!void {
         if (!n.piece_open) return;
         const p = n.scripts orelse return;
+        if (!n.piece_begun) {
+            try p.begin(p.ctx);
+            n.piece_begun = true;
+        }
         if (n.piece_len == n.piece.len) {
             try p.data(p.ctx, n.piece[0..n.piece_len]);
             n.piece_len = 0;
         }
         n.piece[n.piece_len] = c;
         n.piece_len += 1;
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '$')) {
+            try p.data(p.ctx, n.piece[0..n.piece_len]);
+            n.piece_len = 0;
+        }
     }
 
-    fn endPiece(n: *Normalizer, gt: bool) Error!void {
+    fn endPiece(n: *Normalizer, next: ?u8) Error!void {
         const p = n.scripts orelse return;
-        if (gt) try n.pieceByte('>');
+        if (next) |c| try n.pieceByte(c);
         if (n.piece_len > 0) try p.data(p.ctx, n.piece[0..n.piece_len]);
         n.piece_len = 0;
         n.piece_open = false;
-        try p.end(p.ctx);
+        if (n.piece_begun) try p.end(p.ctx);
+        n.piece_begun = false;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1033,6 +1131,7 @@ pub const Normalizer = struct {
         n.ref_value = 0;
         n.ref_len = 0;
         n.ref_digits_len = 0;
+        n.ref_durl = false;
     }
 
     /// Returns true when `c` was consumed by the reference.
@@ -1068,7 +1167,9 @@ pub const Normalizer = struct {
             try n.endRef(c == ';');
             return c == ';';
         }
-        if (std.ascii.isAlphanumeric(c) and n.ref_len < n.ref_name.len) {
+        const name_byte = std.ascii.isAlphanumeric(c) or
+            (n.ref_durl and (c == '-' or c == '_' or c == ':'));
+        if (name_byte and n.ref_len < n.ref_name.len) {
             n.ref_name[n.ref_len] = c;
             n.ref_len += 1;
             return true;
@@ -1090,7 +1191,10 @@ pub const Normalizer = struct {
             for (s) |c| try n.nc.put(c);
             for (captured) |c| {
                 if (c == 0) {
-                    if (n.ref_numeric and n.ref_semi) n.capture_closed = true;
+                    if (n.ref_numeric and n.ref_semi) {
+                        n.capture_closed = true;
+                        n.capture_trim = true;
+                    }
                     continue;
                 }
                 try n.captureByte(c);
@@ -1138,6 +1242,135 @@ pub const Normalizer = struct {
         try n.refOut(std.fmt.bufPrint(&buf, "&#x{x:0>4};", .{u}) catch unreachable);
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Data URI files
+
+    fn duByte(n: *Normalizer, c: u8) Error!void {
+        const d = &n.du;
+        // Carriage returns are left out of the media type and before the first byte of data;
+        // after that one is data in a quoted URI and ends an unquoted one.
+        if (c == '\r' and !(d.comma and d.data_seen)) return;
+        if (!d.comma) {
+            switch (c) {
+                ' ', '\t', '\n', 0x0b, 0x0c => if (d.quote != 0 or d.type_ws) {
+                    // Whitespace in the media type: from here on the URI ends as an
+                    // unquoted one does, the closing quote being data.
+                    if (!d.type_ws and d.mt_len < d.mt.len) {
+                        d.mt[d.mt_len] = ' ';
+                        d.mt_len += 1;
+                    }
+                    d.quote = 0;
+                    d.type_ws = true;
+                    return;
+                },
+                else => {},
+            }
+            d.type_ws = false;
+            const end = if (d.quote != 0) c == d.quote else switch (c) {
+                ' ', '\t', '\n', 0x0b, 0x0c, '\r', '>' => true,
+                else => false,
+            };
+            if (end) {
+                d.active = false;
+                return;
+            }
+            if (c == ',') {
+                d.comma = true;
+                const p = n.data_uris orelse return;
+                try p.begin(p.ctx);
+                const mt = d.mt[0..d.mt_len];
+                try p.data(p.ctx, "From html-normalise\nContent-type: ");
+                try p.data(p.ctx, mt);
+                try p.data(p.ctx, "\n");
+                if (std.mem.indexOf(u8, mt, ";base64") != null) try p.data(p.ctx, "Content-transfer-encoding: base64\n");
+                try p.data(p.ctx, "\n");
+                return;
+            }
+            if (d.mt_len < d.mt.len) {
+                d.mt[d.mt_len] = lower(c);
+                d.mt_len += 1;
+            }
+            return;
+        }
+        switch (d.esc) {
+            1 => {
+                if (std.fmt.charToDigit(c, 16)) |v| {
+                    d.hi = v;
+                    d.esc = 2;
+                } else |_| {
+                    d.esc = 0;
+                    try n.duOut("%0");
+                }
+                return;
+            },
+            2 => {
+                // The decoded byte is written when the next byte arrives.
+                const v = std.fmt.charToDigit(c, 16) catch 0;
+                d.hi = d.hi * 16 + v;
+                d.esc = 3;
+                return;
+            },
+            3 => {
+                d.esc = 0;
+                try n.duOut(&.{d.hi});
+            },
+            else => {},
+        }
+        if (d.in_ref) {
+            // A reference is left out, its `;` too.
+            if (d.ref_len < 1024 and (std.ascii.isAlphanumeric(c) or c == '#' or c == '-' or c == '_' or c == ':')) {
+                d.ref_len += 1;
+                return;
+            }
+            d.in_ref = false;
+            if (c == ';') return;
+        }
+        const end = if (d.quote != 0) c == d.quote else switch (c) {
+            ' ', '\t', '\n', 0x0b, 0x0c, '\r', '>' => true,
+            else => false,
+        };
+        if (end) return n.duEnd();
+        // A newline as the first byte of data is written as a space.
+        if (!d.data_seen and c == '\n' and !d.done) {
+            d.data_seen = true;
+            return n.duOut(" ");
+        }
+        d.data_seen = true;
+        if (d.done) return;
+        switch (c) {
+            '%' => d.esc = 1,
+            '&' => {
+                d.in_ref = true;
+                d.ref_len = 0;
+            },
+            else => try n.duOut(&.{c}),
+        }
+    }
+
+    fn duOut(n: *Normalizer, bytes: []const u8) Error!void {
+        if (n.du.done) return;
+        const p = n.data_uris orelse return;
+        for (bytes) |b| {
+            if (n.du_len == n.du_buf.len) {
+                try p.data(p.ctx, n.du_buf[0..n.du_len]);
+                n.du_len = 0;
+            }
+            n.du_buf[n.du_len] = b;
+            n.du_len += 1;
+        }
+    }
+
+    fn duEnd(n: *Normalizer) Error!void {
+        if (!n.du.active) return;
+        const opened = n.du.comma;
+        n.du.active = false;
+        const p = n.data_uris orelse return;
+        if (!opened) return;
+        if (n.du_len > 0) try p.data(p.ctx, n.du_buf[0..n.du_len]);
+        n.du_len = 0;
+        try p.end(p.ctx);
+    }
+
     /// Code points written as `.` (observed: U+3002, U+FE52, U+FF0E).
     fn isDot(u: u16) bool {
         return u == 0x3002 or u == 0xfe52 or u == 0xff0e;
@@ -1182,8 +1415,9 @@ pub const Normalizer = struct {
         }
         n.in_ref = false;
         n.group_len = 0;
+        n.du.esc = 0;
+        try n.duEnd();
         if (n.state == .tag_open and !n.raw_end_open) try n.ncMarkup("<");
-        if (n.state == .tag and n.data_uri and n.data_tail_len > 0) try n.nc.putAll(n.data_tail[0..n.data_tail_len]);
         if (n.state == .tag_quoted and n.data_uri) try n.nc.put('"');
         if (n.state == .tag_quoted and !n.data_uri and n.value_ws != 0) try n.nc.put(n.value_ws);
         if (n.state == .tag or n.state == .tag_quoted) {
@@ -1192,9 +1426,10 @@ pub const Normalizer = struct {
                 try n.nc.putAll("data:");
             } else if (!n.data_uri) try n.valueFlushPrefix();
         }
-        if (n.after_raw) {
+        if (n.after_raw or n.piece_gt) {
             n.after_raw = false;
-            if (n.piece_open) try n.endPiece(false);
+            n.piece_gt = false;
+            if (n.piece_open) try n.endPiece(null);
         }
         if (n.state == .raw) {
             if (n.raw_match > 0) {
@@ -1203,7 +1438,7 @@ pub const Normalizer = struct {
                 n.raw_match = 0;
                 for (held[0..count]) |x| try n.rawContent(x);
             }
-            if (n.piece_open) try n.endPiece(false);
+            if (n.piece_open) try n.endPiece(null);
         }
     }
 };
@@ -1233,6 +1468,52 @@ fn normalize(in: []const u8, step: usize) !struct { nc: []u8, nt: []u8 } {
     return .{ .nc = try nc.list.toOwnedSlice(testing.allocator), .nt = try nt.list.toOwnedSlice(testing.allocator) };
 }
 
+const Pieces2 = struct {
+    list: std.ArrayList(u8) = .empty,
+
+    fn begin(ctx: *anyopaque) error{Stop}!void {
+        const c: *Pieces2 = @ptrCast(@alignCast(ctx));
+        c.list.append(testing.allocator, '[') catch return error.Stop;
+    }
+    fn data(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
+        const c: *Pieces2 = @ptrCast(@alignCast(ctx));
+        c.list.appendSlice(testing.allocator, bytes) catch return error.Stop;
+    }
+    fn end(ctx: *anyopaque) error{Stop}!void {
+        const c: *Pieces2 = @ptrCast(@alignCast(ctx));
+        c.list.append(testing.allocator, ']') catch return error.Stop;
+    }
+    fn pieces(c: *Pieces2) Pieces {
+        return .{ .ctx = c, .begin = begin, .data = data, .end = end };
+    }
+};
+
+fn extract(in: []const u8, comptime field: []const u8) ![]u8 {
+    var p: Pieces2 = .{};
+    var outs: Outputs = .{};
+    @field(outs, field) = p.pieces();
+    var n = Normalizer.init(outs);
+    try n.feed(in);
+    try n.finish();
+    return p.list.toOwnedSlice(testing.allocator);
+}
+
+test "observed data URI files and script pieces" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "data_uris", "<html><img src=\"data:A;base64x,Q%41\">", "[From html-normalise\nContent-type: a;base64x\nContent-transfer-encoding: base64\n\nQA]" },
+        .{ "data_uris", "<html><img src=\"data:a b,c\">y", "[From html-normalise\nContent-type: a b\n\nc\"]" },
+        .{ "data_uris", "<html><img src=data:a,b\rc>y", "[From html-normalise\nContent-type: a\n\nb]" },
+        .{ "data_uris", "<html><img src=\"data:a,\nZ\">y", "[From html-normalise\nContent-type: a\n\n Z]" },
+        .{ "scripts", "<html><script>", "" },
+        .{ "scripts", "<html><script>a</script>", "[a</script>]" },
+    };
+    for (cases) |c| {
+        const got = if (std.mem.eql(u8, c[0], "data_uris")) try extract(c[1], "data_uris") else try extract(c[1], "scripts");
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
+    }
+}
+
 test "observed forms of small documents" {
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
         .{ "<html><body>Hello &amp; <b>World</b><!-- c --><script>var a=1;</script></body></html>", "<html><body>hello & <b>world</b><script>vara=1;</script></body></html>", " hello world " },
@@ -1240,6 +1521,10 @@ test "observed forms of small documents" {
         .{ "<html><a href=\"X Y\">x</a>", "<html><a href=\"x y\">x</a>", " X Y x " },
         .{ "<html>&#65;&#x42;&Eacute;&bogus;", "<html>ab\xc9&bogus;", " " },
         .{ "<html>x  <p>  y  </p>  z", "<html>x <p>y </p>z", " x y z" },
+        // A quoted href left without its quote loses its last byte in notags.
+        .{ "<html><a href=\"a b>c\">z</a>", "<html><a href=\"a b>c\">z</a>", " a  c\">z " },
+        .{ "<html><a href=\"ab \">z</a>", "<html><a href=\"ab \">z</a>", " ab  z " },
+        .{ "<html><a href=\"B\t&#0;BB\" x=1>z</a>", "<html><a href=\"b\t\x00bb\" x=1>z</a>", " B z " },
     };
     for (cases) |c| for ([_]usize{ 1, 7, 4096 }) |step| {
         const got = try normalize(c[0], step);
