@@ -210,36 +210,12 @@ fn parseStream(w: *Walker, obj: *Object, st: Source.Stream) Error!void {
     try w.drain(&tee.interface);
 }
 
-/// libclamav's re-typing of text and binary data by the database's embedded type magics in the
-/// first 1024 bytes (`ftm.retype`; engine/layerscan.zig has the whole rule set): binary data
-/// with an HTML tag near its start is parsed as HTML, mail headers make mail. Without type magics
-/// zav's own detection stands. HTML objects, and objects typed CL_TYPE_IGNORED, are not matched
-/// raw (`Object.skip_raw`).
+/// Re-typing by the database's type magics: removed pending a clean-room rewrite.
 fn retype(w: *Walker, obj: *Object, head: []const u8, f: Format) Format {
-    const out = retypeFormat(w, obj, head, f);
-    if (out == .html) obj.skip_raw = true;
-    return out;
-}
-
-fn retypeFormat(w: *Walker, obj: *Object, head: []const u8, f: Format) Format {
-    const magics = w.options.types orelse return f;
-    switch (f) {
-        .text, .binary, .html => {},
-        else => return f,
-    }
-    var budget: vm.Budget = .{};
-    const base: types.ClType = if (f == .binary) .binary_data else .text_ascii;
-    const t = ftm.retype(magics.*, head, base, &budget) orelse return if (f == .html) .text else f;
-    return switch (t) {
-        .html, .html_utf16 => .html,
-        .mail => .mail,
-        .pdf => .pdf,
-        .ignored => blk: {
-            obj.skip_raw = true;
-            break :blk f;
-        },
-        else => if (f == .html) .text else f,
-    };
+    _ = w;
+    _ = obj;
+    _ = head;
+    return f;
 }
 
 /// Formats recognised past the detection head, for positional sources: ISO 9660 by its volume
@@ -321,185 +297,16 @@ fn randomAccess(w: *Walker, format: Format, src: Source) Error!void {
     }
 }
 
-/// The target type 7 stream of a text object, as a derived child named "text". Input past
-/// MaxScriptNormalize is reported and left unnormalised (its raw bytes are still scanned).
+/// Text and HTML normalisation: removed pending a clean-room rewrite.
 fn normalizeText(w: *Walker, r: *Io.Reader) Error!void {
-    var d: Object = undefined;
-    try w.beginDerived(&d, "text", .normalized_text);
-    defer w.endDerived(&d);
-    const out = w.alloc(u8, container.block_len) orelse return;
-    var n: text_norm.Normalizer = .{};
-    var scripts: heuristics.ScriptScanner = .{};
-    defer reportScript(w, &scripts);
-    var done: u64 = 0;
-    const max = w.tracker.limits.max_script_normalize;
-    while (true) {
-        const chunk = r.peekGreedy(1) catch |e| switch (e) {
-            error.EndOfStream => return,
-            error.ReadFailed => return if (w.halt != null) error.Halted else {},
-        };
-        const take = @min(chunk.len, out.len, max -| done);
-        if (take == 0) return w.limit(.script_normalize);
-        try w.feed(&d, out[0..n.feed(chunk[0..take], out)]);
-        scripts.update(chunk[0..take]);
-        r.toss(take);
-        done += take;
-    }
+    _ = w;
+    _ = r;
 }
 
-/// libclamav's normalised forms of an HTML object (htmlnorm.c, scanned by cli_scanhtml), as
-/// derived children: "html" (nocomment.html) and "notags" (notags.html), both matched with target
-/// type 3; each script element's raw bytes as "script/<n>"; and "js", the normalised JavaScript
-/// laid out as libclamav's `javascript` file (each script as `<script>...</script>`, newline
-/// separated), which libclamav matches with target types 3 and 7. libclamav does not match the
-/// raw bytes of an HTML object at all (DOCUMENT HTMLSKIPRAW): `Object.skip_raw` says so.
-///
-/// One pass per output over a positional source, since derived children cannot interleave;
-/// bounded state, no whole-document buffer. Input past MaxHTMLNormalize is reported and left
-/// unnormalised, and notags is reported and skipped past MaxHTMLNoTags, as libclamav skips it.
 fn normalizeHtml(w: *Walker, src: Source) Error!void {
-    const buf = w.alloc(u8, container.block_len) orelse return;
-    const norm = w.alloc(html_norm.Normalizer, 1) orelse return;
-    const total = src.len().?;
-    const Pass = enum { nocomment, notags, scripts, js };
-    inline for (.{ Pass.nocomment, Pass.notags, Pass.scripts, Pass.js }) |pass| pass: {
-        if (pass == .notags and total > w.tracker.limits.max_html_notags) {
-            w.limit(.html_notags);
-            break :pass;
-        }
-        var sink: HtmlSink = .{ .w = w };
-        defer sink.close();
-        var outputs: html_norm.Outputs = .{};
-        const writer: html_norm.Output = .{ .ctx = &sink, .write = HtmlSink.write };
-        const pieces: html_norm.Pieces = .{ .ctx = &sink, .begin = HtmlSink.begin, .data = HtmlSink.data, .end = HtmlSink.end };
-        switch (pass) {
-            .nocomment => {
-                try w.beginDerived(&sink.obj, "html", .normalized_html);
-                sink.open = true;
-                outputs.nocomment = writer;
-            },
-            .notags => {
-                try w.beginDerived(&sink.obj, "notags", .normalized_html);
-                sink.open = true;
-                outputs.notags = writer;
-            },
-            .scripts => {
-                sink.mode = .scripts;
-                outputs.scripts = pieces;
-            },
-            .js => {
-                sink.mode = .js;
-                sink.js = w.scratch.allocator().create(js_norm.Normalizer) catch return w.limit(.memory);
-                outputs.scripts = pieces;
-            },
-        }
-        norm[0] = .init(outputs);
-        var off: u64 = 0;
-        const max = w.tracker.limits.max_html_normalize;
-        var limited = false;
-        while (off < total) {
-            if (off >= max) {
-                limited = true;
-                break;
-            }
-            const want: usize = @intCast(@min(buf.len, max - off));
-            const got = src.readAt(w.io, off, buf[0..want]) catch break;
-            if (got == 0) break;
-            norm[0].feed(buf[0..got]) catch return error.Halted;
-            off += got;
-        }
-        norm[0].finish() catch return error.Halted;
-        if (limited and pass == .nocomment) w.limit(.html_normalize);
-        if (pass == .scripts) reportScript(w, &sink.markers);
-    }
+    _ = w;
+    _ = src;
 }
-
-const HtmlSink = struct {
-    w: *Walker,
-    mode: enum { stream, scripts, js } = .stream,
-    obj: Object = undefined,
-    open: bool = false,
-    scripts: u32 = 0,
-    name_buf: [24]u8 = undefined,
-    markers: heuristics.ScriptScanner = .{},
-    /// The JavaScript pass: script bodies go through this normaliser into "js".
-    js: ?*js_norm.Normalizer = null,
-    /// The last bytes written to "js": libclamav adds `</script>` unless the script ends with it.
-    tail: [9]u8 = @splat(0),
-    tail_len: usize = 0,
-
-    fn write(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
-        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
-        if (!s.open) return;
-        s.w.feed(&s.obj, bytes) catch return error.Stop;
-    }
-
-    fn begin(ctx: *anyopaque) error{Stop}!void {
-        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
-        switch (s.mode) {
-            .stream => {},
-            .scripts => {
-                const name = std.fmt.bufPrint(&s.name_buf, "script/{d}", .{s.scripts}) catch "script";
-                s.scripts += 1;
-                s.w.beginDerived(&s.obj, name, .script) catch return error.Stop;
-                s.open = true;
-            },
-            .js => {
-                if (!s.open) {
-                    s.w.beginDerived(&s.obj, "js", .normalized_js) catch return error.Stop;
-                    s.open = true;
-                } else try s.jsOut("\n");
-                try s.jsOut("<script>");
-                s.js.?.* = .initHtml(.{ .ctx = s, .write = jsWrite });
-            },
-        }
-    }
-
-    fn data(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
-        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
-        switch (s.mode) {
-            .stream => {},
-            .scripts => {
-                s.markers.update(bytes);
-                s.w.feed(&s.obj, bytes) catch return error.Stop;
-            },
-            .js => try s.js.?.feed(bytes),
-        }
-    }
-
-    fn end(ctx: *anyopaque) error{Stop}!void {
-        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
-        switch (s.mode) {
-            .stream => {},
-            .scripts => s.close(),
-            .js => {
-                try s.js.?.finish();
-                if (s.tail_len < 9 or !std.mem.eql(u8, &s.tail, "</script>")) try s.jsOut("</script>");
-            },
-        }
-    }
-
-    /// Normalised JavaScript out of the JS pass's normaliser.
-    fn jsWrite(ctx: *anyopaque, bytes: []const u8) error{Stop}!void {
-        const s: *HtmlSink = @ptrCast(@alignCast(ctx));
-        try s.jsOut(bytes);
-    }
-
-    fn jsOut(s: *HtmlSink, bytes: []const u8) error{Stop}!void {
-        s.w.feed(&s.obj, bytes) catch return error.Stop;
-        for (bytes) |b| {
-            std.mem.copyForwards(u8, s.tail[0..8], s.tail[1..9]);
-            s.tail[8] = b;
-            s.tail_len +|= 1;
-        }
-    }
-
-    fn close(s: *HtmlSink) void {
-        if (!s.open) return;
-        s.w.endDerived(&s.obj);
-        s.open = false;
-    }
-};
 
 /// Name for a compression wrapper's output: the parent's name without its extension.
 fn innerName(name: []const u8, format: Format) []const u8 {
@@ -763,53 +570,6 @@ test "executables: children from overlays and resources, positional and streamed
     }
 }
 
-test "HTML yields its normalised stream and scripts; text yields its normalised stream" {
-    const page = "<HTML><Body>Hello   <B>World</B><!-- x --><script>Alert(1)</script></body></HTML>\n";
-    var rig: TestRig = undefined;
-    try rig.init(.{});
-    defer rig.deinit();
-    try rig.scanBoth(page, "p.html");
-    const norm = "<html><body>hello <b>world</b><script>alert(1)</script></body></html>";
-    var hasher = std.hash.Crc32.init();
-    hasher.update(norm);
-    var seen: usize = 0;
-    for (rig.rec.objects.items) |e| {
-        if (std.mem.eql(u8, e.path, "p.html/html")) {
-            seen += 1;
-            try std.testing.expectEqual(container.Kind.normalized_html, e.kind);
-            try std.testing.expectEqual(@as(u64, norm.len), e.bytes);
-            try std.testing.expectEqual(hasher.final(), e.crc);
-        }
-        if (std.mem.eql(u8, e.path, "p.html/script/0")) {
-            seen += 1;
-            // The script runs to the end of its end tag, as libclamav hands it to the JS parser.
-            try std.testing.expectEqual(@as(u64, "Alert(1)</script>".len), e.bytes);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 4), seen);
-
-    var rig2: TestRig = undefined;
-    try rig2.init(.{});
-    defer rig2.deinit();
-    try rig2.scanBoth("Plain  TEXT\twith\r\nLines\n", "t.txt");
-    var texts: usize = 0;
-    for (rig2.rec.objects.items) |e| if (std.mem.eql(u8, e.path, "t.txt/text")) {
-        texts += 1;
-        try std.testing.expectEqual(@as(u64, "plain text with lines ".len), e.bytes);
-    };
-    try std.testing.expectEqual(@as(usize, 2), texts);
-}
-
-test "normaliser limits are reported" {
-    var rig: TestRig = undefined;
-    try rig.init(.{ .max_html_normalize = 10, .max_script_normalize = 5 });
-    defer rig.deinit();
-    try rig.walker.scan(.{ .memory = "<html><body>a long enough page</body></html>" }, "p.html");
-    try std.testing.expect(rig.rec.hasLimit(.html_normalize));
-    try rig.walker.scan(.{ .memory = "some longer text" }, "t.txt");
-    try std.testing.expect(rig.rec.hasLimit(.script_normalize));
-}
-
 test "heuristics: each one fires on its positive fixture, and only when enabled" {
     const H = heuristics.Id;
     const Case = struct { name: []const u8, bytes: []const u8, id: H };
@@ -927,34 +687,5 @@ test "container metadata (.cdb) signatures fire on zip members, filename regex i
         try std.testing.expectEqual(c[1], hit);
         // The streamed pass cannot tell the cpio's size: that record is reported undecided.
         if (std.mem.eql(u8, c[0], "crc.cpio")) try std.testing.expect(rig.rec.hasLimit(.container_size_unknown));
-    }
-}
-
-test "with type magics, binary data with an HTML tag near its start is parsed as HTML" {
-    const Compiler = @import("../compile/compiler.zig").Compiler;
-    const reader = @import("../db/root.zig").reader;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var c = Compiler.init(std.testing.allocator);
-    defer c.deinit();
-    try c.addFile("t.ftm", "1:*:3c736372697074(3e|20):HTML data:CL_TYPE_ANY:CL_TYPE_HTML\n");
-    _ = try c.write(std.testing.io, tmp.dir, "t.zavdb", .{ .db_version = 1 });
-    const database = try reader.open(std.testing.io, tmp.dir, "t.zavdb", .{ .allow_unsigned = true });
-    defer database.close();
-    const progs = try @import("../match/prog.zig").Programs.init(database.section(.subsig_prog, 1).?);
-    const magics = try ftm.Ftm.init(database.section(.ftm_trie, 0).?, progs);
-
-    const bytes = "\x00\x01\x02\x03<script>Alert(1)</script><p>Text</p>";
-    for ([_]bool{ false, true }) |with_magics| {
-        var rig: TestRig = undefined;
-        try rig.init(.{});
-        defer rig.deinit();
-        if (with_magics) rig.walker.options.types = &magics;
-        try rig.scanBoth(bytes, "x.bin");
-        var html: usize = 0;
-        for (rig.rec.objects.items) |e| {
-            if (std.mem.eql(u8, e.path, "x.bin/html") or std.mem.eql(u8, e.path, "x.bin/notags")) html += 1;
-        }
-        try std.testing.expectEqual(@as(usize, if (with_magics) 4 else 0), html);
     }
 }

@@ -20,8 +20,6 @@ pub const Limits = struct {
     max_embedded_pe: u64 = 40 * 1024 * 1024,
     /// HTML bytes normalised (MaxHTMLNormalize).
     max_html_normalize: u64 = 40 * 1024 * 1024,
-    /// HTML files whose text-only form (notags) is still matched (MaxHTMLNoTags).
-    max_html_notags: u64 = 8 * 1024 * 1024,
     /// Script bytes normalised (MaxScriptNormalize).
     max_script_normalize: u64 = 20 * 1024 * 1024,
     /// A member may expand to this many times its compressed size once past `ratio_floor`.
@@ -63,8 +61,6 @@ pub const Event = enum(u8) {
     window_size,
     /// The worker's scratch arena could not hold a child's working set.
     memory,
-    /// An HTML file over MaxHTMLNoTags: its text-only form was not matched.
-    html_notags,
     /// One file's verify calls passed their count budget, proportional to its size
     /// (verify_vm.Budget): crafted candidate density.
     verify_count,

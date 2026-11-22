@@ -77,8 +77,7 @@ pub const TdbRecord = extern struct {
     intermediate_count: u8 = 0,
     _pad0: u8 = 0,
     container: u16 = 0,
-    /// HandlerType as a `fmt.types.ClType` value; 0 for none.
-    handler: u16 = 0,
+    _pad1: u16 = 0,
     file_size_lo: u64 = 0,
     file_size_hi: u64 = 0,
     entry_point_lo: u64 = 0,
@@ -89,7 +88,7 @@ pub const TdbRecord = extern struct {
     _reserved: [8]u8 = @splat(0),
 
     pub fn from(t: ir.Tdb) TdbRecord {
-        var r: TdbRecord = .{ .target = t.target, .intermediate_count = t.intermediate_count, .intermediates = t.intermediates, .handler = t.handler orelse 0 };
+        var r: TdbRecord = .{ .target = t.target, .intermediate_count = t.intermediate_count, .intermediates = t.intermediates };
         if (t.file_size) |x| {
             r.flags |= tdb_file_size;
             r.file_size_lo = x.lo;

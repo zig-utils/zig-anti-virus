@@ -80,9 +80,6 @@ pub const Object = struct {
     /// Exact size for positional sources; a hint (untrusted header value) or null for streams.
     size: ?u64,
     entered: bool = false,
-    /// libclamav does not match the raw bytes of this object, only its derived streams: HTML
-    /// (DOCUMENT HTMLSKIPRAW). Matchers skip its data; its bytes still count as scanned.
-    skip_raw: bool = false,
 };
 
 /// A reportable condition found while walking. Limits are the clamd-equivalent events; the other
@@ -164,8 +161,7 @@ pub const Walker = struct {
         heuristics: ?*const @import("heuristics.zig").Config = null,
         /// Container metadata signatures, checked once per member by the archive parsers.
         cdb: ?*const CdbHook = null,
-        /// The database's file-type magics: text and binary data are re-typed from their
-        /// embedded type magics, as libclamav does (fmt/scan.zig `retype`).
+        /// The database's file-type magics (unused until the clean-room rewrite lands).
         types: ?*const @import("../fmt/ftm.zig").Ftm = null,
     };
 
