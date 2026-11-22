@@ -10,6 +10,7 @@ sample is ever committed, and no malware is ever listed here.
 | B1 | Benign filesystem slice: ELF, PE and Mach-O executables and libraries, scripts, source, HTML, office documents, PDFs, archives (1 KiB to 8 MiB) | 8,398 | 356 MB | 578 files, 45 MB |
 | B2 | Large benign files (8 MiB and up): executables, installers, an MSI | 12 | 366 MB | 1 file, 12 MB |
 | S1 | Mail: RFC 822 messages with headers, MIME parts and attachments | 2,752 | 15 MB | 161 files, 1.2 MB |
+| T1 | Mail held out from S1, for the text gram model (`src/compile/gram_model_text.bin`) | 1,401 | 5.9 MB | 76 files, 0.3 MB |
 
 ## Fetching
 
@@ -54,7 +55,7 @@ does not incorporate their implementation code.
 | [Apache POI 5.2.5](https://github.com/apache/poi/tree/REL_5_2_5/test-data) test documents (OLE2, OOXML, PDF, images and more) | B1 | Apache-2.0 |
 | [BusyBox 1.35.0](https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/) ([licence](https://busybox.net/license.html)) static x86_64 binary | B1 | GPL-2.0-only |
 | [PuTTY 0.81](https://www.chiark.greenend.org.uk/~sgtatham/putty/) for w64 | B1 | MIT |
-| [SpamAssassin public corpus](https://spamassassin.apache.org/old/publiccorpus/) easy_ham and hard_ham (2003-02-28) | S1 | Published by the SpamAssassin project for testing mail filters; copyright in each message stays with its sender ([corpus terms](https://spamassassin.apache.org/old/publiccorpus/readme.html)). Fetched from the project, never redistributed here, and never sent into a live mail system. Only the ham (non-spam) sets are used |
+| [SpamAssassin public corpus](https://spamassassin.apache.org/old/publiccorpus/) easy_ham and hard_ham (2003-02-28) for S1, easy_ham_2 (2003-02-28) for T1 | S1, T1 | Published by the SpamAssassin project for testing mail filters; copyright in each message stays with its sender ([corpus terms](https://spamassassin.apache.org/old/publiccorpus/readme.html)). Fetched from the project, never redistributed here, and never sent into a live mail system. Only the ham (non-spam) sets are used |
 
 GitHub tag archives are generated on demand and their bytes have changed in the past, so the
 POI archive's hash is recorded but not enforced (`archive_hash_unstable`); every member it
@@ -63,7 +64,8 @@ yields is still checked against the manifest. Every other archive's hash is enfo
 ## Who reads the manifests
 
 - `zig build gram-model -- src/compile/gram_model.bin ~/.cache/zav/corpus/B1` builds the 4-gram
-  frequency model from B1.
+  frequency model from B1, and `zig build gram-model -- src/compile/gram_model_text.bin
+  ~/.cache/zav/corpus/T1` the text model from T1.
 - `zig build prefilter -- scan|stages|top|prefix <db> ~/.cache/zav/corpus/B1 ...` measures the
   byte-pattern prefilter on B1, B2 and S1 (docs/experiments/E2-prefilter.md, E3-atoms.md).
 - The P6.15 harness must consume these same manifests and fetched directories when it lands.

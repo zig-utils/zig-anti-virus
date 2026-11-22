@@ -57,7 +57,7 @@ test('fetching rejects a member that escapes the extraction directory', () => {
   expect(() => fetchCorpus(manifest, { out })).toThrow('unsafe member')
 })
 
-for (const name of ['B1', 'B2', 'S1']) {
+for (const name of ['B1', 'B2', 'S1', 'T1']) {
   test(`${name} CI selection is the stable SHA-256 prefix of its validated manifest`, () => {
     const manifest = loadManifest(name)
     const ci = selectFiles(manifest, 'ci')
@@ -68,7 +68,7 @@ for (const name of ['B1', 'B2', 'S1']) {
   })
 }
 
-test('the loader only permits the three benign corpora', () => {
+test('the loader only permits the benign corpora', () => {
   expect(() => loadManifest('../M1')).toThrow('unknown benign corpus')
   expect(() => loadManifest('M1')).toThrow('unknown benign corpus')
   expect(() => loadManifest('A1')).toThrow('unknown benign corpus')

@@ -143,6 +143,20 @@
           "project": "SpamAssassin public corpus, hard_ham 2003-02-28"
         }
       ]
+    },
+    "T1": {
+      "description": "Mail for the text gram model (atom selection for text partitions): RFC 822 messages with headers, MIME parts and HTML. Held out from S1, which measures it.",
+      "min_size": 1,
+      "max_size": 67108864,
+      "sources": [
+        {
+          "id": "spamassassin-easy-ham-2",
+          "url": "https://spamassassin.apache.org/old/publiccorpus/20030228_easy_ham_2.tar.bz2",
+          "format": "tar.bz2",
+          "license": "SpamAssassin public corpus terms (for testing mail filters; copyright stays with the senders, see README.md)",
+          "project": "SpamAssassin public corpus, easy_ham_2 2003-02-28"
+        }
+      ]
     }
   }
 }

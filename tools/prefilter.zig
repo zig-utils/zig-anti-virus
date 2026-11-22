@@ -186,6 +186,8 @@ fn compileVariant(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             i += 1;
             c.crowd.max_chain = try std.fmt.parseInt(u32, args[i], 10);
             if (c.crowd.max_chain == 0) c.crowd.max_chain = std.math.maxInt(u32);
+        } else if (std.mem.eql(u8, a, "--no-text")) {
+            c.atom_costs.text = false;
         } else if (std.mem.eql(u8, a, "--gate-ns")) {
             i += 1;
             c.atom_costs.gate_ns = try std.fmt.parseFloat(f64, args[i]);
@@ -1024,6 +1026,23 @@ fn census(database: zav.db.reader.Database, index: bodyscan.BodyIndex) !void {
             keyed[k] += g.keyed_count;
         }
         try w.print("  anchored {d}: groups by kind {any}, list programs {any}, keyed {any}\n", .{ part, kinds, lists, keyed });
+        if (part == 0) {
+            var shown: usize = 0;
+            var wins: [6]u64 = @splat(0);
+            for (ai.groups) |g| for (ai.groupList(g)) |pi| {
+                const p = index.programs.?.get(pi);
+                const sh = p.header.off_shift;
+                wins[if (sh == 0) 0 else if (sh <= 16) 1 else if (sh <= 256) 2 else if (sh <= 4096) 3 else if (sh <= 65536) 4 else 5] += 1;
+                if (shown < 12 and pi % 97 == 0) {
+                    shown += 1;
+                    var wb: [160]u8 = undefined;
+                    var wr: std.Io.Writer = .fixed(&wb);
+                    zav.compile.hexsig.format(p.pattern, &wr) catch {};
+                    try w.print("    {t} {d},{d}: {s}\n", .{ p.header.off_kind, p.header.off_a, sh, wr.buffered() });
+                }
+            };
+            try w.print("    list windows: shift 0, <=16, <=256, <=4096, <=65536, more: {any}\n", .{wins});
+        }
     };
     // Chain lengths of the shared atom table: every candidate walks its key's whole chain.
     if (index.partitionFor(1)) |part| {

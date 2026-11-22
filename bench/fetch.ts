@@ -1,7 +1,8 @@
-// Benign corpora (B1, B2, S1) for the atom frequency model and the benchmarks.
+// Benign corpora (B1, B2, S1) for the atom frequency model and the benchmarks, and T1 (mail held
+// out from S1) for the text gram model.
 //
 //   bun bench/fetch.ts B1 [B2 S1 | all] [--out DIR] [--subset ci]   fetch and verify
-//   bun bench/fetch.ts --generate [--out DIR]                        rebuild the manifests
+//   bun bench/fetch.ts --generate [T1 ...] [--out DIR]               rebuild the manifests
 //
 // A manifest (bench/corpus/<name>.json) lists every file by SHA-256, size, source archive and
 // member path; the files themselves are never committed. Fetching downloads each source archive
@@ -119,9 +120,11 @@ function memberPath(src: Source, member: string, out: string): string {
   return join(extract(src, archive, out), member)
 }
 
-function generate(out: string): void {
+function generate(out: string, only: string[] = []): void {
   const spec = JSON.parse(readFileSync(join(corpusDir, 'sources.json'), 'utf8')) as { corpora: Record<string, CorpusSpec> }
   for (const [name, corpus] of Object.entries(spec.corpora)) {
+    // `--generate T1`: only the corpora named, so the others' manifests stay as they are.
+    if (only.length > 0 && !only.includes(name)) continue
     const seen = new Set<string>()
     const archives: Archive[] = []
     const files: Entry[] = []
@@ -223,7 +226,7 @@ export function fetchCorpus(manifest: Manifest, options: { out?: string, subset?
 
 /** Shared manifest boundary for corpus consumers; importing this module performs no I/O. */
 export function loadManifest(name: string, directory = corpusDir): Manifest {
-  if (!['B1', 'B2', 'S1'].includes(name)) throw new Error(`unknown benign corpus: ${name}`)
+  if (!['B1', 'B2', 'S1', 'T1'].includes(name)) throw new Error(`unknown benign corpus: ${name}`)
   const manifest = JSON.parse(readFileSync(join(directory, `${name}.json`), 'utf8')) as Manifest
   validateManifest(manifest)
   if (manifest.name !== name) throw new Error(`${name}: manifest name mismatch`)
@@ -233,7 +236,7 @@ export function loadManifest(name: string, directory = corpusDir): Manifest {
 /** Validate metadata before it can name any path or create a misleading benchmark input. */
 export function validateManifest(manifest: Manifest): void {
   const fail = (message: string): never => { throw new Error(`invalid corpus manifest: ${message}`) }
-  if (!['B1', 'B2', 'S1'].includes(manifest.name)) fail('unknown name')
+  if (!['B1', 'B2', 'S1', 'T1'].includes(manifest.name)) fail('unknown name')
   if (!Array.isArray(manifest.archives) || !Array.isArray(manifest.files)) fail('missing archives or files')
   const digest = /^[a-f0-9]{64}$/
   const size = (n: number) => Number.isSafeInteger(n) && n >= 0
@@ -281,15 +284,15 @@ function main(args: string[]): void {
       subset = 'ci'
     }
     else if (arg === '--generate') regenerate = true
-    else if (['B1', 'B2', 'S1', 'all'].includes(arg)) names.push(arg)
+    else if (['B1', 'B2', 'S1', 'T1', 'all'].includes(arg)) names.push(arg)
     else throw new Error(`unknown argument: ${arg}`)
   }
   if (regenerate) {
-    if (subset || names.length) throw new Error('--generate cannot select corpora or a subset')
-    generate(out)
+    if (subset || names.includes('all')) throw new Error('--generate cannot select a subset or all')
+    generate(out, names)
   }
   else {
-    const list = !names.length || names.includes('all') ? ['B1', 'B2', 'S1'] : [...new Set(names)]
+    const list = !names.length || names.includes('all') ? ['B1', 'B2', 'S1', 'T1'] : [...new Set(names)]
     for (const name of list) fetchCorpus(loadManifest(name), { out, subset })
   }
 }

@@ -37,6 +37,10 @@ comptime {
 
 /// The model compiled into the compiler.
 pub const embedded: []const u8 = @embedFile("gram_model.bin");
+/// The text model (T1: mail with HTML parts, held out from S1), consulted beside the binary one
+/// for programs of the text partitions (P4.03 follow-up, zig-utils/zig-anti-virus#108).
+pub const embedded_text: []const u8 = @embedFile("gram_model_text.bin");
+var text_model: ?Model = null;
 
 pub const Model = struct {
     total: u64,
@@ -46,6 +50,8 @@ pub const Model = struct {
     top_cost: []const u8,
     /// Cost of the rarest top gram: the floor for every estimated gram.
     floor: u8,
+    /// A second model a gram must be rare in too: probabilities are the larger of the two.
+    also: ?*const Model = null,
 
     pub const Error = error{BadModel};
 
@@ -78,6 +84,23 @@ pub const Model = struct {
         return init(embedded) catch unreachable;
     }
 
+    pub fn defaultText() Model {
+        return init(embedded_text) catch unreachable;
+    }
+
+    /// The embedded text model, parsed on first use (the compiler runs single-threaded).
+    pub fn text() *const Model {
+        if (text_model == null) text_model = defaultText();
+        return &text_model.?;
+    }
+
+    /// This model, with `other` consulted too.
+    pub fn with(m: Model, other: *const Model) Model {
+        var x = m;
+        x.also = other;
+        return x;
+    }
+
     /// Estimated cost of the gram whose bytes are `g` read little-endian (byte 0 first).
     pub fn cost(m: Model, g: u32) u8 {
         if (m.findTop(g)) |i| return m.top_cost[i];
@@ -93,7 +116,8 @@ pub const Model = struct {
 
     /// Estimated probability that a 4-byte window of a benign file is `g`.
     pub fn prob(m: Model, g: u32) f64 {
-        return std.math.exp2(-@as(f64, @floatFromInt(m.cost(g))) / scale);
+        const own = std.math.exp2(-@as(f64, @floatFromInt(m.cost(g))) / scale);
+        return if (m.also) |o| @max(own, o.prob(g)) else own;
     }
 
     /// Estimated cost of a 3-byte window `abc` (byte 0 first), from the bigrams.
@@ -105,12 +129,14 @@ pub const Model = struct {
     }
 
     pub fn prob3(m: Model, bytes: *const [3]u8) f64 {
-        return std.math.exp2(-@as(f64, @floatFromInt(m.cost3(bytes))) / scale);
+        const own = std.math.exp2(-@as(f64, @floatFromInt(m.cost3(bytes))) / scale);
+        return if (m.also) |o| @max(own, o.prob3(bytes)) else own;
     }
 
     pub fn prob2(m: Model, bytes: *const [2]u8) f64 {
         const c = m.bi[@as(u16, bytes[0]) | @as(u16, bytes[1]) << 8];
-        return std.math.exp2(-@as(f64, @floatFromInt(c)) / scale);
+        const own = std.math.exp2(-@as(f64, @floatFromInt(c)) / scale);
+        return if (m.also) |o| @max(own, o.prob2(bytes)) else own;
     }
 
     fn findTop(m: Model, g: u32) ?usize {

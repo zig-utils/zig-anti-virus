@@ -61,6 +61,10 @@ pub const Costs = struct {
     /// PE code rarer than PE files show, and 30 is the value of 4, 10 and 30 that gave the
     /// fastest stage one on B2, which the model never saw (E2).
     gate_ns: f64 = 30,
+    /// The text model (gram_model.zig, T1): windows of programs for the text partitions
+    /// (any type, HTML, mail, ASCII) must be rare in it as well as in the binary model, or
+    /// mail and HTML grams such as `mail`, `src=` and `<br>` fire on every message (E3).
+    text: bool = true,
     /// Prefix selection (E3): the first 4-byte window of the first literal, stride 1, and no
     /// deferral.
     prefix: bool = false,
@@ -404,8 +408,19 @@ pub const Planned = struct {
 };
 
 /// The atom of a program that nothing can defer (a body signature, a YARA string).
-pub fn chooseFor(model: gm.Model, costs: Costs, in: prog_build.Input, crowd: ?*const Crowd) Choice {
+/// Whether programs of ClamAV target `target` can match text: any type, HTML, mail, ASCII.
+pub fn isTextTarget(target: u8) bool {
+    return target == 0 or target == 3 or target == 4 or target == 7;
+}
+
+/// The model a program of `target` is scored with.
+pub fn modelFor(model: gm.Model, costs: Costs, target: u8) gm.Model {
+    return if (costs.text and isTextTarget(target)) model.with(gm.Model.text()) else model;
+}
+
+pub fn chooseFor(model_in: gm.Model, costs: Costs, in: prog_build.Input, crowd: ?*const Crowd) Choice {
     if (in.offset.kind != .any) return pinned(in.pattern);
+    const model = modelFor(model_in, costs, in.target);
     const best = choose(model, costs, in.pattern, false);
     const cr = crowd orelse return best;
     const key = choiceKey(best, in.pattern) orelse return best;
@@ -507,9 +522,11 @@ const CoverCtx = struct {
 /// subsigs of each logical rule outside its cheapest cover. `rules[i]` covers the programs
 /// `first[i] .. first[i] + count[i]`; YARA rules are passed as null (their conditions are not
 /// RPN, so nothing of theirs is deferred).
-pub fn plan(gpa: std.mem.Allocator, model: gm.Model, costs: Costs, inputs: []const prog_build.Input, logicals: []const Logical, crowd: ?*Crowd) ![]Planned {
+pub fn plan(gpa: std.mem.Allocator, model_in: gm.Model, costs: Costs, inputs: []const prog_build.Input, logicals: []const Logical, crowd: ?*Crowd) ![]Planned {
     const out = try gpa.alloc(Planned, inputs.len);
     errdefer gpa.free(out);
+    // One logical signature has one target.
+    const model = if (inputs.len > 0) modelFor(model_in, costs, inputs[0].target) else model_in;
     for (inputs, out) |in, *o| {
         o.* = .{ .choice = chooseFor(model, costs, in, crowd) };
     }
