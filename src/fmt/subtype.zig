@@ -8,8 +8,8 @@
 //! - ZIP archives become OOXML_WORD, OOXML_XL, OOXML_PPT or OOXML_HWP from the names of their
 //!   first three local file headers not under `docProps/` (`word/`, `xl/`, `ppt/` prefixes,
 //!   `Contents/content.hpf`), the first that names one winning, for headers that start at most
-//!   30221 bytes in. An archive that starts with `[Content_Types].xml` and has an end of central
-//!   directory record is looked through without the three-member limit.
+//!   30221 bytes in. Once `[Content_Types].xml` is among those, an archive with an end of
+//!   central directory record is looked through without the three-member limit.
 //! - Binary data whose first 512 bytes are a tar header with a valid unsigned checksum is
 //!   OLD_TAR.
 const std = @import("std");
@@ -39,11 +39,10 @@ pub fn isOldTar(data: []const u8) bool {
 pub fn zipType(data: []const u8) ?types.ClType {
     var pos: usize = 0;
     var counted: usize = 0;
-    // An archive that starts with `[Content_Types].xml` and has an end of central directory
-    // record is looked through without the three-member limit.
-    const ct = "[Content_Types].xml";
-    const unlimited = data.len >= 30 + ct.len and std.mem.readInt(u16, data[26..28], .little) == ct.len and
-        std.mem.eql(u8, data[30..][0..ct.len], ct) and hasEocd(data);
+    // Once `[Content_Types].xml` is among the members looked at, an archive with an end of
+    // central directory record is looked through without the three-member limit.
+    var unlimited = false;
+    const eocd = hasEocd(data);
     while (unlimited or counted < 3) {
         const i = std.mem.indexOfPos(u8, data, pos, "PK\x03\x04") orelse return null;
         if (i > 30221 or data.len < i + 30) return null;
@@ -55,6 +54,7 @@ pub fn zipType(data: []const u8) ?types.ClType {
         if (std.mem.startsWith(u8, name, "xl/")) return .ooxml_xl;
         if (std.mem.startsWith(u8, name, "ppt/")) return .ooxml_ppt;
         if (std.mem.eql(u8, name, "Contents/content.hpf")) return .ooxml_hwp;
+        if (eocd and std.mem.eql(u8, name, "[Content_Types].xml")) unlimited = true;
         if (!std.mem.startsWith(u8, name, "docProps/")) counted += 1;
         pos = i + 30 + name_len + extra_len;
     }

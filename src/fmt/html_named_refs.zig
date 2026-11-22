@@ -4,6 +4,12 @@
 //! entity sets) was presented to clamscan and the code point read back from its normalised
 //! output. Names are case-sensitive; any name not listed is left as text.
 //! Do not edit by hand.
+//!
+//! Entity names in the ISO sets come from files carrying this notice:
+//! (C) International Organization for Standardization 1986
+//! Permission to copy in any form is granted for use with conforming SGML
+//! systems and applications as defined in ISO 8879, provided this notice
+//! is included in all copies.
 
 /// Sorted by name (byte order), for binary search.
 pub const refs = [_]struct { []const u8, u16 }{

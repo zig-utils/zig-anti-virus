@@ -147,6 +147,8 @@ pub const Normalizer = struct {
     capture_len: usize = 0,
     capture_space: bool = false,
     capture_due: bool = false,
+    /// A NUL ended the capture.
+    capture_closed: bool = false,
     /// The rest of a script's end tag goes to the notags form as text.
     nt_tag_text: bool = false,
 
@@ -165,6 +167,7 @@ pub const Normalizer = struct {
     /// A script or style end tag was just matched; a `>` right after belongs to it.
     after_raw: bool = false,
     raw_end_open: bool = false,
+    raw_end_extra: bool = false,
     /// The tag being parsed is the end tag of script or style content.
     raw_end_tag: bool = false,
     /// A script piece is open.
@@ -182,6 +185,7 @@ pub const Normalizer = struct {
     ref_len: usize = 0,
     /// The reference is inside a tag (an attribute value).
     ref_in_tag: bool = false,
+    ref_semi: bool = false,
     nt_ref: bool = false,
     nt_ref_first: bool = false,
     nt_ref_numeric: bool = false,
@@ -363,8 +367,15 @@ pub const Normalizer = struct {
         if (n.after_raw) {
             n.after_raw = false;
             if (n.piece_open) try n.endPiece(c == '>');
-            // In the notags form the end tag is over: anything but `>` right after is text.
-            if (c != '>') n.nt_tag_text = true;
+            // In the notags form the end tag is over when whitespace follows: the rest of the
+            // tag is text there. Whitespace after an end tag with more in it is kept.
+            switch (c) {
+                ' ', '\t', '\n', 0x0b, 0x0c => {
+                    n.nt_tag_text = true;
+                    n.raw_end_extra = true;
+                },
+                else => {},
+            }
         }
         if (n.state == .text) try n.ntTextStep(c);
         if (n.in_ref) {
@@ -436,7 +447,7 @@ pub const Normalizer = struct {
                     n.nt_ref_digits += 1;
                     break :blk true;
                 }
-                if (n.nt_ref_len == 1023) break :blk false;
+                if (n.nt_ref_len == 1024) break :blk false;
                 const name = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == ':';
                 if (name) n.nt_ref_len += 1;
                 break :blk name;
@@ -578,6 +589,7 @@ pub const Normalizer = struct {
                     n.part = .after_eq;
                     if (!n.captured and n.wantsCapture()) {
                         n.capturing = true;
+                        n.capture_closed = false;
                         n.capture_len = 0;
                         n.capture_space = false;
                     }
@@ -819,7 +831,7 @@ pub const Normalizer = struct {
     }
 
     fn captureByte(n: *Normalizer, c: u8) Error!void {
-        if (!n.capturing) return;
+        if (!n.capturing or n.capture_closed) return;
         if (c == ' ' or c == '\t' or c == '\n') {
             if (n.capture_space) return;
             n.capture_space = true;
@@ -851,9 +863,11 @@ pub const Normalizer = struct {
         n.state = .text;
         n.nt_tag_text = false;
         n.nc_space = false;
-        // Whitespace after a tag is dropped.
-        n.nc_suppress = true;
+        // Whitespace after a tag is dropped (not after a script or style end tag with more
+        // than its name).
+        n.nc_suppress = !(n.raw_end_tag and n.raw_end_extra);
         n.raw_end_tag = false;
+        n.raw_end_extra = false;
         if (n.captured) {
             // Written when the next byte arrives.
             n.capture_due = true;
@@ -899,6 +913,8 @@ pub const Normalizer = struct {
     }
 
     fn rawByte(n: *Normalizer, c: u8) Error!void {
+        // The byte after a `<` (whitespace skipped) cannot start an end tag.
+        if (n.raw_after_lt) return n.rawContent(c);
         n.raw_held[n.raw_match] = c;
         switch (n.rawEndsWith(n.raw_held[0 .. n.raw_match + 1])) {
             .full => {
@@ -935,7 +951,8 @@ pub const Normalizer = struct {
         }
         if (c == '<') n.raw_after_lt = true;
         if (c == '>') n.raw_decl = false;
-        if (c >= 0x80) return n.groupByte(c);
+        // Inside `<!...>` high bytes are written as they are, to the nocomment form only.
+        if (c >= 0x80) return if (n.raw_decl) n.ncText(c) else n.groupByte(c);
         switch (c) {
             ' ', '\t', '\n', 0x0b, 0x0c, '\r', 0 => {},
             '\'' => try n.ncText('"'),
@@ -1038,10 +1055,21 @@ pub const Normalizer = struct {
     }
 
     fn refOut(n: *Normalizer, s: []const u8) Error!void {
+        return n.refOutCase(s, s);
+    }
+
+    /// `captured` is what the notags capture of an `href` or `src` gets: the decoded bytes in
+    /// their own case; a NUL ends the capture, and an unterminated empty numeric reference adds
+    /// nothing.
+    fn refOutCase(n: *Normalizer, s: []const u8, captured: []const u8) Error!void {
         if (n.ref_in_tag) {
             if (n.state == .tag and n.part == .after_eq and s.len > 0 and s[0] != 0) n.part = .value;
-            for (s) |c| {
-                try n.nc.put(c);
+            for (s) |c| try n.nc.put(c);
+            for (captured) |c| {
+                if (c == 0) {
+                    if (n.ref_numeric and n.ref_semi) n.capture_closed = true;
+                    continue;
+                }
                 try n.captureByte(c);
             }
         } else for (s) |c| try n.ncText(c);
@@ -1050,6 +1078,7 @@ pub const Normalizer = struct {
     /// The reference is complete; `semi` when it ended with `;`.
     fn endRef(n: *Normalizer, semi: bool) Error!void {
         n.in_ref = false;
+        n.ref_semi = semi;
         if (n.ref_numeric) {
             const v = n.ref_value;
             if (!semi) {
@@ -1080,7 +1109,7 @@ pub const Normalizer = struct {
         if (isDot(u)) return n.refOut(".");
         if (u < 0xff) {
             const b: u8 = @intCast(u);
-            return n.refOut(&.{if (fold) lower(b) else b});
+            return n.refOutCase(&.{if (fold) lower(b) else b}, &.{b});
         }
         var buf: [8]u8 = undefined;
         try n.refOut(std.fmt.bufPrint(&buf, "&#x{x:0>4};", .{u}) catch unreachable);
