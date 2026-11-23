@@ -1,6 +1,7 @@
 #!/bin/sh
 # Installs the official ClamAV Linux release the differential expectations were recorded with,
-# and writes CLAMSCAN and CLAMAV_CERTS to $GITHUB_ENV for the steps after it.
+# for this machine's architecture (x86_64 or aarch64), and writes CLAMSCAN, CLAMD and
+# CLAMAV_CERTS to $GITHUB_ENV for the steps after it.
 #
 #   sh tools/diff/install_clamav.sh VERSION [--pcre2]
 #
@@ -17,10 +18,16 @@ set -eu
 
 version="$1"
 pcre2="${2:-}"
-deb="$RUNNER_TEMP/clamav-$version.linux.x86_64.deb"
+arch=$(uname -m)
+case "$arch" in
+  x86_64 | aarch64) ;;
+  arm64) arch=aarch64 ;;
+  *) echo "install_clamav.sh: no official ClamAV package for $arch" >&2; exit 1 ;;
+esac
+deb="$RUNNER_TEMP/clamav-$version.linux.$arch.deb"
 
 curl -fsSL --retry 3 -o "$deb" \
-  "https://github.com/Cisco-Talos/clamav/releases/download/clamav-$version/clamav-$version.linux.x86_64.deb"
+  "https://github.com/Cisco-Talos/clamav/releases/download/clamav-$version/clamav-$version.linux.$arch.deb"
 
 if sudo -n true 2>/dev/null; then
   if [ "$pcre2" = "--pcre2" ]; then
@@ -29,18 +36,23 @@ if sudo -n true 2>/dev/null; then
     sudo apt-get install -y "$deb"
   fi
   clamscan=$(dpkg -L clamav | grep -m1 '/bin/clamscan$')
+  clamd=$(dpkg -L clamav | grep -m1 '/s\{0,1\}bin/clamd$')
   certs=$(dirname "$(dpkg -L clamav | grep -m1 '/certs/')")
 else
   root="$RUNNER_TEMP/clamav-root"
   rm -rf "$root"
   dpkg-deb -x "$deb" "$root"
-  binary=$(find "$root" -path '*/bin/clamscan' -type f | head -1)
   libs=$(dirname "$(find "$root" -name 'libclamav.so*' | head -1)")
   certs=$(dirname "$(find "$root" -path '*/certs/*' -type f | head -1)")
-  # The package expects its libraries where apt would have put them.
+  # The package expects its libraries where apt would have put them, so each program runs
+  # through a wrapper that names them.
+  for program in clamscan clamd; do
+    binary=$(find "$root" -path "*bin/$program" -type f | head -1)
+    printf '#!/bin/sh\nLD_LIBRARY_PATH="%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "%s" "$@"\n' "$libs" "$binary" > "$root/$program"
+    chmod +x "$root/$program"
+  done
   clamscan="$root/clamscan"
-  printf '#!/bin/sh\nLD_LIBRARY_PATH="%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "%s" "$@"\n' "$libs" "$binary" > "$clamscan"
-  chmod +x "$clamscan"
+  clamd="$root/clamd"
 
   if [ "$pcre2" = "--pcre2" ]; then
     work="$RUNNER_TEMP/pcre2-deb"
@@ -54,5 +66,7 @@ else
 fi
 
 echo "CLAMSCAN=$clamscan" >> "$GITHUB_ENV"
+echo "CLAMD=$clamd" >> "$GITHUB_ENV"
 echo "CLAMAV_CERTS=$certs" >> "$GITHUB_ENV"
 "$clamscan" --version
+"$clamd" --version

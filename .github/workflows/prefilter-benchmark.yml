@@ -73,19 +73,16 @@ jobs:
           for corpus in B1 B2 S1; do
             taskset -c "$core" ./zig-out/bin/prefilter scan "$db" "$RUNNER_TEMP/corpus/$corpus" --rounds 3 2>&1 | grep -v '^LIMITED\|^FOUND' | tee "$bench_dir/$corpus-scan.txt"
           done
+      # tools/diff/install_clamav.sh: apt where the runner allows sudo, otherwise unpacked into
+      # $RUNNER_TEMP, so the job also runs on the self-hosted ReviewOS runner.
       - name: Install ClamAV ${{ env.CLAMAV_VERSION }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          package="clamav-$CLAMAV_VERSION.linux.${{ matrix.arch }}.deb"
-          gh release download "clamav-$CLAMAV_VERSION" -R Cisco-Talos/clamav -p "$package" -D "$RUNNER_TEMP"
-          sudo apt-get install -y "$RUNNER_TEMP/$package"
+        run: sh tools/diff/install_clamav.sh "$CLAMAV_VERSION"
       - name: Measure clamd raw scans on the same corpora
         run: |
           bench_dir="$RUNNER_TEMP/e2"
           core=$(awk '/^Cpus_allowed_list:/ {split($2, ids, /[-,]/); print ids[1]}' /proc/self/status)
-          clamd=$(dpkg -L clamav | awk '/\/clamd$/ {print; exit}')
-          certs=$(dirname "$(dpkg -L clamav | awk '/\/certs\// {print; exit}')")
+          clamd="$CLAMD"
+          certs="$CLAMAV_CERTS"
           test -x "$clamd" && test -d "$certs"
           mkdir -p "$RUNNER_TEMP/e2-clamd-db"
           ln -s "$HOME/clamav-db/"{main,daily}.cvd "$RUNNER_TEMP/e2-clamd-db/"
