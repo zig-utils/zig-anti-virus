@@ -37,7 +37,8 @@ RAW = ["--scan-mail=no", "--scan-html=no", "--scan-ole2=no", "--scan-pdf=no", "-
 class Clamscan:
     def __init__(self, path, certs, raw=False):
         self.path = path
-        self.base = [path, "--no-summary", "--allmatch", "--bytecode=no"] + (RAW if raw else [])
+        # PUA signatures (.ndu, .ldu, .hdu, ...) count: zav-diff scans with PUA detection on.
+        self.base = [path, "--no-summary", "--allmatch", "--bytecode=no", "--detect-pua=yes"] + (RAW if raw else [])
         if certs:
             self.base.append("--cvdcertsdir=" + certs)
 

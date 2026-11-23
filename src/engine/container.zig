@@ -29,6 +29,10 @@ const regex = @import("regex");
 pub const CdbHook = struct {
     table: cdb_match.CdbTable,
     scratch: ?*@import("../match/regex_pool.zig").Scratch = null,
+    /// Signature metadata and the PUA mode (`hashidx.SigMeta.reported`): a .cdu signature is
+    /// reported only with `detect_pua`.
+    meta: ?@import("../match/hashidx.zig").SigMeta = null,
+    detect_pua: bool = false,
 
     /// Check one member and report a match (or an undecidable regex) as a notice at the
     /// member's path. Callers push the member name first.
@@ -40,6 +44,7 @@ pub const CdbHook = struct {
             });
             return;
         } orelse return;
+        if (!@import("../match/hashidx.zig").SigMeta.reported(hook.meta, sig, hook.detect_pua)) return;
         w.notice(.{ .container_signature = sig }, "cdb");
     }
 };

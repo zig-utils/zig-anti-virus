@@ -30,7 +30,7 @@ def main():
     ap.add_argument("samples")
     args = ap.parse_args()
 
-    # PUA signatures (.ndu, .ldu) are reported by zav, so clamscan reports them too.
+    # zav-diff scans with PUA detection on (Engine.setDetectPua), so clamscan does too.
     cmd = [args.clamscan, "--no-summary", "--allmatch", "--bytecode=no", "--detect-pua=yes"]
     if args.certs:
         cmd.append("--cvdcertsdir=" + args.certs)

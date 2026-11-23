@@ -84,6 +84,13 @@ pub const Engine = struct {
         return ftm.classify(f, data, .{}, &budget).type;
     }
 
+    /// Report PUA signatures (clamscan --detect-pua, clamd DetectPUA); off by default. The
+    /// database is the same either way: the filter applies at match time.
+    pub fn setDetectPua(e: *Engine, on: bool) void {
+        e.body.detect_pua = on;
+        e.hashes.detect_pua = on;
+    }
+
     pub fn handlerOf(e: *const Engine, sig: u32) ?types.ClType {
         return e.handlers.get(sig);
     }

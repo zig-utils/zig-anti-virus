@@ -19,6 +19,7 @@ const logical = @import("../match/logical.zig");
 const regex_pool = @import("../match/regex_pool.zig");
 const yara_cond = @import("../match/yara_cond.zig");
 const prefilter = @import("../match/prefilter.zig");
+const hashidx = @import("../match/hashidx.zig");
 
 /// Matches of one YARA regex string recorded per file before the count is reported as limited.
 pub const max_regex_matches: u32 = 1024;
@@ -34,6 +35,17 @@ pub const BodyIndex = struct {
     regexes: ?regex_pool.RegexPool = null,
     /// PREFILTER and ATOM_TABLE per partition; partition 0 serves targets without their own.
     prefilters: [prefilter.partitions]?prefilter.Partition = @splat(null),
+    /// Signature metadata, for the PUA flag.
+    meta: ?hashidx.SigMeta = null,
+    /// Report PUA signatures (`hashidx.SigMeta.reported`). Off by default, as in clamscan: a
+    /// PUA body signature then never detects, and a PUA logical signature's subsig matches are
+    /// not recorded, so it cannot hold.
+    detect_pua: bool = false,
+
+    /// Whether a match of signature `sig` (a sigmeta id) is reported.
+    pub fn reports(index: *const BodyIndex, sig: u32) bool {
+        return hashidx.SigMeta.reported(index.meta, sig, index.detect_pua);
+    }
 
     /// The prefilter a file of `target` is scanned with, or null for the reference path.
     pub fn partitionFor(index: *const BodyIndex, target: u8) ?*const prefilter.Partition {
@@ -44,6 +56,7 @@ pub const BodyIndex = struct {
 
     pub fn load(database: db.reader.Database) !BodyIndex {
         var index: BodyIndex = .{};
+        if (database.section(.sigmeta, 0)) |records| index.meta = try .init(records, database.section(.name_pool, 0) orelse return error.BadSigMeta);
         if (database.section(.regex_pool, 0)) |section| index.regexes = try .init(section);
         // A database of YARA rules with only regex strings has no verify programs at all.
         if (database.section(.subsig_prog, 0)) |bytes| {
@@ -114,6 +127,7 @@ const Collector = struct {
     fn take(c: *Collector, h: anchored.Hit) bool {
         const p = c.programs.get(h.prog);
         if (p.header.flags & prog.flag_ldb == 0) {
+            if (!c.index.reports(p.header.sig)) return true;
             c.hit = .{ .sig = p.header.sig, .start = h.match.start, .end = h.match.end };
             return false;
         }
@@ -128,6 +142,7 @@ const Collector = struct {
         const state = c.state orelse return;
         const table = c.index.ldb orelse return;
         if (p.header.sig >= table.records.len) return;
+        if (!c.index.reports(table.records[p.header.sig].sig)) return;
         c.last = m;
         try state.touch(table, c.ctx, p.header.sig, p.header.subsig, m.start);
     }
@@ -171,6 +186,7 @@ fn searchProgram(c: *Collector, p: prog.Program, data: []const u8, info: vm.File
         const m = scanner.next() catch return .stop;
         const hit = m orelse return .more;
         if (!is_ldb) {
+            if (!c.index.reports(p.header.sig)) return .more;
             c.hit = .{ .sig = p.header.sig, .start = hit.start, .end = hit.end };
             return .detected;
         }
@@ -256,6 +272,7 @@ const Sink = struct {
         };
         const hit = got orelse return true;
         if (!is_ldb) {
+            if (!s.c.index.reports(p.header.sig)) return true;
             s.c.hit = .{ .sig = p.header.sig, .start = hit.start, .end = hit.end };
             return false;
         }
@@ -638,7 +655,7 @@ pub fn scanBufferScratch(index: *const BodyIndex, data: []const u8, file: File, 
     };
     if (state) |st| if (index.ldb) |table| {
         // Expressions that hold with no hits are evaluated for every file, as libclamav does.
-        for (table.always) |i| st.ensure(table, c.ctx, i) catch {
+        for (table.always) |i| if (index.reports(table.records[i].sig)) st.ensure(table, c.ctx, i) catch {
             c.overflow = true;
         };
         var out: [1]u32 = undefined;
@@ -726,6 +743,66 @@ test "compile .ndb signatures and detect them end to end" {
     var two: vm.Budget = .{ .verify_floor = 2, .verify_per_kib = 0 };
     const found = try scanBuffer(&index, doc, .{ .info = .{ .size = doc.len } }, &two, &tracker, null);
     try std.testing.expect(found == .infected);
+}
+
+test "PUA signatures report only with detect_pua, by source file, in every mode" {
+    // Black-box against clamscan 1.5.4: a rule from a `u` source (.ndu, .ldu, .hdu) is reported
+    // only with --detect-pua; a `PUA.` name in a .ndb is reported either way. The logical rule has
+    // the shape of the encrypted-OLE2 one B1 trips (any of two UTF-16 stream names, Target:0
+    // here so a plain buffer reaches it): with detection off its subsig matches are not recorded.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Compiler = @import("../compile/compiler.zig").Compiler;
+    const hashscan = @import("hashscan.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var c = Compiler.init(gpa);
+    defer c.deinit();
+    try c.addFile("t.ndu", "Test.Pua.Body-1-0:0:*:5a415650554142{-4}4f4459\n");
+    try c.addFile("t.ldu", "Test.Pua.Logical-2-0;Engine:51-255,Target:0;0|1;45006e0063007200790070007400;530074007200650061006d00\n");
+    try c.addFile("t.ndb", "PUA.Test.NamedOnly-3-0:0:*:5a41564e414d4544\n");
+    // md5 of "PUA hash sample!"
+    try c.addFile("t.hdu", "9fae63efadf315eb302e089c73387a8b:16:Test.Pua.Hash-4-0\n");
+    _ = try c.write(io, tmp.dir, "pua.zavdb", .{ .db_version = 1 });
+    const database = try db.reader.open(io, tmp.dir, "pua.zavdb", .{ .allow_unsigned = true });
+    defer database.close();
+    var index = try BodyIndex.load(database);
+    var hashes = try hashscan.HashIndex.load(database);
+
+    var scratch: [2 * 1024 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+    var state = try logical.State.init(fba.allocator());
+    var tracker = limits_mod.Tracker.init(.{});
+    var name_buf: [64]u8 = undefined;
+
+    const Case = struct { []const u8, ?[]const u8 };
+    const cases = [_]Case{
+        .{ "....ZAVPUAB....ODY....", "Test.Pua.Body-1-0" },
+        .{ "..E\x00n\x00c\x00r\x00y\x00p\x00t\x00..", "Test.Pua.Logical-2-0" },
+        .{ "....ZAVNAMED....", "PUA.Test.NamedOnly-3-0" },
+    };
+    for ([_]bool{ false, true }) |on| {
+        index.detect_pua = on;
+        hashes.detect_pua = on;
+        for ([_]Mode{ .auto, .reference }) |mode| for (cases) |case| {
+            state.reset();
+            var budget: vm.Budget = .{};
+            const v = try scanBufferScratch(&index, case[0], .{ .info = .{ .size = case[0].len } }, &budget, &tracker, &state, mode, null, null);
+            const always = std.mem.startsWith(u8, case[1].?, "PUA.");
+            if (on or always) {
+                try std.testing.expect(v == .infected);
+                try std.testing.expectEqualStrings(case[1].?, try hashes.meta.?.name(v.infected.sig, &name_buf));
+            } else try std.testing.expectEqual(Verdict.clean, v);
+        };
+        const sample = "PUA hash sample!";
+        var fh = hashscan.FileHashes.init(&hashes, sample.len).?;
+        fh.update(sample);
+        const hv = fh.finish(&hashes);
+        if (on) {
+            try std.testing.expectEqualStrings("Test.Pua.Hash-4-0", try hashes.meta.?.name(hv.infected, &name_buf));
+        } else try std.testing.expectEqual(hashscan.Verdict.clean, hv);
+    }
 }
 
 test "logical signatures end to end: counts, target descriptions, anchored subsigs" {

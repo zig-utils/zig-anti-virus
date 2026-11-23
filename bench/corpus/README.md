@@ -66,10 +66,11 @@ yields is still checked against the manifest. Every other archive's hash is enfo
 B1 is benign, but 11 of its members are OLE2 documents (10 that file(1) calls `CDFV2 Encrypted`,
 one whose short stream it cannot read) that the ClamAV main + daily
 databases match with `PUA.Doc.Packed.EncryptedDoc-6563700-0`, a potentially unwanted application
-signature. `prefilter -- scan` and the zav engine report them: neither filters PUA signatures
-(the PUA flag is kept in the signature metadata but not consulted at scan time). ClamAV 1.5.4
-with the same CVDs reports them with `--detect-pua=yes` and as OK by default, the same 11 files
-and the same signature (checked 2026-11-22). They are expected, not false positives:
+signature from `daily.ldu`. ClamAV 1.5.4 with the same CVDs reports them with `--detect-pua=yes`
+and as OK by default, the same 11 files and the same signature (checked 2026-11-22). zav does the
+same: PUA signatures are reported only with `zav scan --detect-pua` (`prefilter -- scan
+--detect-pua`, zav-diff always), so a default scan of B1 detects nothing. They are expected
+detections in that mode, not false positives:
 
 - `24d908d34dd5248de420962ff88ff46fe1f5b6800ed1e00b88b04e98b4b390a4`
 - `2a86a49c40cdb0e3568fbee2554dd02a19b3901d81bd89e190584662ff135561`

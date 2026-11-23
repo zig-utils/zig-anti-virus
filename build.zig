@@ -82,6 +82,35 @@ pub fn build(b: *std.Build) void {
     c_smoke.root_module.linkLibrary(static_lib);
     test_step.dependOn(&b.addRunArtifact(c_smoke).step);
 
+    // CLI: PUA signatures (a .hdu rule here) are reported only with --detect-pua, as clamscan
+    // reports them only with --detect-pua=yes; the database is the same either way.
+    if (zav_exe) |exe| {
+        const files = b.addWriteFiles();
+        const hdu = files.add("pua.hdu", "9fae63efadf315eb302e089c73387a8b:16:Test.Pua.Hash-4-0\n");
+        const sample = files.add("sample.bin", "PUA hash sample!");
+        const compile_pua = b.addRunArtifact(exe);
+        compile_pua.addArgs(&.{ "compile", "--no-builtin", "-o" });
+        const pua_db = compile_pua.addOutputFileArg("pua.zavdb");
+        compile_pua.addFileArg(hdu);
+        compile_pua.expectExitCode(0);
+        const pua_cases = [_]struct { extra: []const []const u8, code: u8, out: []const u8 }{
+            .{ .extra = &.{}, .code = 0, .out = ": OK" },
+            .{ .extra = &.{"--detect-pua"}, .code = 1, .out = "Test.Pua.Hash-4-0 FOUND" },
+            .{ .extra = &.{"--detect-pua=yes"}, .code = 1, .out = "Test.Pua.Hash-4-0 FOUND" },
+            .{ .extra = &.{"--detect-pua=no"}, .code = 0, .out = ": OK" },
+        };
+        for (pua_cases) |c| {
+            const run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "scan", "--allow-unsigned", "--db" });
+            run.addFileArg(pua_db);
+            run.addArgs(c.extra);
+            run.addFileArg(sample);
+            run.expectExitCode(c.code);
+            run.expectStdOutMatch(c.out);
+            test_step.dependOn(&run.step);
+        }
+    }
+
     // CLI: compile the recorded CVE feeds, then check zav audit's severity exit codes on a
     // fixture Stacks app with a vulnerable lodash (medium: 12) and a patched one (0).
     // Host checks and audits support Linux and macOS only.

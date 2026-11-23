@@ -16,6 +16,8 @@ pub const HashIndex = struct {
     tables: [9]?hashidx.Table = @splat(null),
     allow: [9]?hashidx.Table = @splat(null),
     meta: ?hashidx.SigMeta = null,
+    /// Report PUA signatures (`hashidx.SigMeta.reported`). Off by default, as in clamscan.
+    detect_pua: bool = false,
 
     pub fn load(database: db.reader.Database) !HashIndex {
         var index: HashIndex = .{};
@@ -98,6 +100,7 @@ pub const FileHashes = struct {
             if (file.need & d.bit == 0) continue;
             const table = index.tables[hashidx.tableVariant(d.algo, .file)] orelse continue;
             const sig = table.lookup(file.size, d.bytes) orelse continue;
+            if (!hashidx.SigMeta.reported(index.meta, sig, index.detect_pua)) continue;
             // Check the whole-file allowlist only when a hash hit.
             for (digests) |a| {
                 if (file.need & a.bit == 0) continue;
@@ -126,7 +129,7 @@ pub fn scanPe(io: Io, index: *const HashIndex, src: source_mod.Source, info: *co
             }) |a| if (need & a[1] != 0) {
                 if (index.tables[hashidx.tableVariant(a[0], .pe_section)]) |table| {
                     if (pe.sectionDigest(io, src, s, a[2], block)) |d| {
-                        if (table.lookup(s.stored_raw_size, &d)) |sig| return .{ .infected = sig };
+                        if (table.lookup(s.stored_raw_size, &d)) |sig| if (hashidx.SigMeta.reported(index.meta, sig, index.detect_pua)) return .{ .infected = sig };
                     }
                 }
             };
@@ -135,7 +138,7 @@ pub fn scanPe(io: Io, index: *const HashIndex, src: source_mod.Source, info: *co
     if (index.tables[hashidx.tableVariant(.md5, .pe_import)]) |table| {
         if (pe.importHash(io, src, info)) |ih| {
             const listed = if (index.need[@backingInt(ir.HashScope.pe_import)]) |map| map.mask(ih.size) != 0 else true;
-            if (listed) if (table.lookup(ih.size, &ih.md5)) |sig| return .{ .infected = sig };
+            if (listed) if (table.lookup(ih.size, &ih.md5)) |sig| if (hashidx.SigMeta.reported(index.meta, sig, index.detect_pua)) return .{ .infected = sig };
         }
     }
     return .clean;

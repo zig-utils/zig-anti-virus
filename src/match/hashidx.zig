@@ -426,6 +426,18 @@ pub const SigMeta = struct {
         return .{ .pua = meta.records[sig].pua() };
     }
 
+    /// Whether a match of `sig` is reported. A PUA signature (one from a `u` source: .ndu,
+    /// .ldu, .hdu, .hsu, .mdu, .msu, .imu, and zav's .cdu, which clamscan does not load) is
+    /// reported only with `detect_pua`, as clamscan and clamd report them only with --detect-pua
+    /// / DetectPUA. The flag comes from the source file alone: a `PUA.` name in a .ndb or .ldb is
+    /// reported either way (.ndu, .ldu, .hdu, .hsu and both names checked black-box against
+    /// clamscan 1.5.4). Filtering here, at match time, lets one database serve both modes.
+    pub fn reported(meta: ?SigMeta, sig: u32, detect_pua: bool) bool {
+        if (detect_pua) return true;
+        const m = meta orelse return true;
+        return !m.flags(sig).pua;
+    }
+
     /// The signature's full name, written into `out`.
     pub fn name(meta: SigMeta, sig: u32, out: []u8) ![]const u8 {
         if (sig >= meta.records.len) return error.BadSigMeta;

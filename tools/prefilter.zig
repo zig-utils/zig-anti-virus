@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
     const database = try zav.db.reader.open(io, std.Io.Dir.cwd(), args[2], .{ .allow_unsigned = true });
     defer database.close();
     index_db = database;
-    const index = try bodyscan.BodyIndex.load(database);
+    var index = try bodyscan.BodyIndex.load(database);
     if (std.mem.eql(u8, cmd, "deferral-diff")) {
         if (args.len < 5) return error.MissingDeferralInputs;
         return deferralDiff(gpa, arena, io, database, &index, args[3], args[4..]);
@@ -84,6 +84,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-ms")) {
             i += 1;
             worst_max_ms = try std.fmt.parseFloat(f64, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--detect-pua")) {
+            // Report PUA signatures (.ndu, .ldu, ...), as clamscan --detect-pua=yes does.
+            index.detect_pua = true;
         } else if (std.mem.eql(u8, args[i], "--regex-steps")) {
             i += 1;
             regex_steps = try std.fmt.parseInt(u64, args[i], 10);

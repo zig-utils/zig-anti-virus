@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer out.interface.flush() catch {};
     defer err.interface.flush() catch {};
 
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const args = try clamscanYesNo(init.arena.allocator(), try init.minimal.args.toSlice(init.arena.allocator()));
     const root = try buildCommands(init.gpa);
     defer {
         root.deinit();
@@ -52,6 +52,16 @@ pub fn main(init: std.process.Init) !u8 {
     var version_buf: [32]u8 = undefined;
     const version = try std.fmt.bufPrint(&version_buf, "{f}", .{zav.version});
     return cli.run(init.gpa, root, args[1..], .{ .stdout = app.out, .stderr = app.err, .version = version });
+}
+
+/// clamscan spells its switches `--detect-pua=yes|no`; the option parser takes true or false.
+fn clamscanYesNo(arena: std.mem.Allocator, args: []const [:0]const u8) ![]const [:0]const u8 {
+    const out = try arena.dupe([:0]const u8, args);
+    for (out) |*a| {
+        if (std.mem.eql(u8, a.*, "--detect-pua=yes")) a.* = "--detect-pua=true";
+        if (std.mem.eql(u8, a.*, "--detect-pua=no")) a.* = "--detect-pua=false";
+    }
+    return out;
 }
 
 fn buildCommands(gpa: std.mem.Allocator) !*Command {
@@ -95,6 +105,7 @@ fn buildCommands(gpa: std.mem.Allocator) !*Command {
     _ = try scan.addOption(Option.init("db", "db", "Database to scan with", .string));
     _ = try scan.addOption(Option.init("allow-unsigned", "allow-unsigned", "Accept an unsigned database", .bool));
     _ = try scan.addOption(Option.init("keep-cache", "keep-cache", "Keep directory-scan files in the OS cache", .bool));
+    _ = try scan.addOption(Option.init("detect-pua", "detect-pua", "Report potentially unwanted applications (signatures from .ndu, .ldu, .hdu and the other u sources); also --detect-pua=yes|no", .bool));
     _ = try scan.addArgument(Argument.init("paths", "Files or directories to scan", .string).withVariadic(true));
     _ = scan.setActionWithCode(scanAction);
     _ = try root.addCommand(scan);
@@ -397,6 +408,7 @@ fn scanAction(ctx: *Command.ParseContext) !u8 {
     var scratch = try zav.engine.scratch.Scratch.init(zav.engine.scratch.default_reservation);
     defer scratch.deinit();
     var scan: FileScan = .{ .ctx = ctx, .index = index, .block = try scratch.allocator().alloc(u8, 256 * 1024) };
+    scan.index.detect_pua = flag(ctx, "detect-pua");
     var reader: ?zav.rt.scan_io.Reader = null;
     defer if (reader) |*worker| worker.deinit();
 

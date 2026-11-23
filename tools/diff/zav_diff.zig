@@ -622,6 +622,8 @@ fn check(app: App, args: []const []const u8) !u8 {
             if (print) try app.out.print("LOAD {s} sig{d} {s}\n", .{ case.name, si + 1, if (compiled.rejected) "REJECTS" else "LOADS" });
             if (compiled.rejected or (sig.rejected and !print)) continue;
             var engine = try Engine.open(app.gpa, app.io, tmp, compiled.path, .{ .allow_unsigned = true });
+            // The clamscan runs it is compared with pass --detect-pua=yes (gate.py, clamav.py).
+            engine.setDetectPua(true);
             defer engine.close(app.gpa);
             for (case.samples.items, results, own) |sample, *r, *o| {
                 const name: ?[]const u8 = switch (try scanner.scan(&engine, sample.bytes)) {
@@ -902,6 +904,8 @@ fn typesCmd(app: App, args: []const []const u8) !u8 {
     for (ftms.items) |f| try c.addFile(std.fs.path.basename(f), try cwd.readFileAlloc(app.io, f, app.arena, .limited(1 << 26)));
     _ = try c.write(app.io, tmp, "types.zavdb", .{ .db_version = 1 });
     var engine = try Engine.open(app.gpa, app.io, tmp, "types.zavdb", .{ .allow_unsigned = true });
+    // The clamscan runs it is compared with pass --detect-pua=yes (gate.py, clamav.py).
+    engine.setDetectPua(true);
     defer engine.close(app.gpa);
     var name_buf: [64]u8 = undefined;
     // Directories stand for the files directly in them.
@@ -1194,6 +1198,8 @@ fn scanCmd(app: App, args: []const []const u8) !u8 {
         const summary = try c.write(app.io, tmp, "scan.zavdb", .{ .db_version = 1 });
         if (summary.signatures == 0) continue;
         var engine = try Engine.open(app.gpa, app.io, tmp, "scan.zavdb", .{ .allow_unsigned = true });
+        // The clamscan runs it is compared with pass --detect-pua=yes (gate.py, clamav.py).
+        engine.setDetectPua(true);
         defer engine.close(app.gpa);
         var name_buf: [512]u8 = undefined;
         for (datas, results) |data, *r| {
