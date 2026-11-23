@@ -69,4 +69,6 @@ echo "CLAMSCAN=$clamscan" >> "$GITHUB_ENV"
 echo "CLAMD=$clamd" >> "$GITHUB_ENV"
 echo "CLAMAV_CERTS=$certs" >> "$GITHUB_ENV"
 "$clamscan" --version
-"$clamd" --version
+# clamd reads its configuration before it answers --version, and none exists yet: the steps that
+# run it write their own. That it is there and runnable is the check.
+test -x "$clamd"
