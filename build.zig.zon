@@ -12,8 +12,8 @@
             .hash = "zig_bench-0.2.1-FoCM--g7AwBKI7pKOE_UBYMOONDqfGQr-pR8nTpwf7vw",
         },
         .cli = .{
-            .url = "https://registry.pantry.dev/zig/packages/zig-cli/0.1.7/tarball",
-            .hash = "zig_cli-0.1.7-18T51Bi9BACm0yCxCkiGEdaDGf5lnXTqRCjWBpWN4hDr",
+            .url = "https://registry.pantry.dev/zig/packages/zig-cli/0.1.8/tarball",
+            .hash = "zig_cli-0.1.8-18T51KfQBACgDMxOACMpMrkSVV6dYOSa5lkInBrRmNC0",
         },
         .regex = .{
             .url = "https://registry.pantry.dev/zig/packages/zig-regex/0.5.0/tarball",
