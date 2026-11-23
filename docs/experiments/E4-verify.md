@@ -1,7 +1,9 @@
 # E4: verify VM worst cases with the full database
 
 Issue: zig-utils/zig-anti-virus#35. Pass line (docs/DESIGN.md section 14): no input over 50 ms
-per MB.
+per MB on the reference machine class; since 2026-11-22 it is checked relative to the machine, as
+no input over 50 times a plain stage-one pass over the same bytes (see "Machine-relative pass
+line" at the end).
 
 ## Method
 
@@ -139,3 +141,36 @@ passed the enforced 50 ms/MB gate with freshly compiled main and daily databases
 
 Limits remain explicit verdicts. These results qualify the four generated A1 inputs and the
 documented budget choices; they do not replace the later full-pipeline or real-malware gates.
+
+## Machine-relative pass line (2026-11-22)
+
+The first x86_64 run on the ReviewOS runner (Differential #12 on ecb1b36; a shared Hetzner cx23,
+two Skylake vCPUs with IBRS) failed the absolute line: anchors 68.30 ms/MB (limited:
+regex_steps), unbounded 26.50 (clean), subsigs 50.63 (limited: verify_count), zeros/opcodes
+19.86 (limited: verify_count). The same inputs on the M3 Pro, at a load average near 50, took
+22.94, 17.75, 19.08 and 6.62 ms/MB.
+
+Two findings:
+
+- **The regex_steps verdicts came from the tool, not the engine.** `tools/prefilter.zig` set a
+  2^20-step budget per regex search; production (engine/layerscan.zig) sets none for the linear
+  engine and leaves zig-regex's 10M default for the backtracking one. On anchors the heaviest PCRE
+  subsig is Win.Dropper.Amadey-7377974-0's, at exactly 1,048,576 steps on the 1 MiB input: 1.0
+  step per byte, a linear scan cut off at the end of the file. `worst` now prints the signature
+  whose PCRE steps are highest. With the production budgets that search finishes, the input ends
+  `limited (verify_count)`, and its time is unchanged (22.9 against 26.1 ms/MB). The regex is
+  not the cost; the 90,000 verifies per MB are. The same 2^20 budget caused the six `limited`
+  B1 files in the benchmark's whole scan and the "reference exhausted its budget" files in
+  `prefilter -- diff`. Tools now use the production budgets unless `--regex-steps` is given.
+- **The rest is the machine.** The x86 runner is 1.5 to 3.5 times slower than the M3 on these
+  inputs, and its stage one is 4 to 5 times slower on B1 (251 against about 1,200 MB/s). The
+  inputs are the same and so are the verify and candidate counts. An absolute ms/MB line
+  measures which runner a job lands on.
+
+The gate is now `prefilter -- worst <db> --max-ratio 50`. `worst` times stage one alone over each
+input's own bytes on the same machine (best of 20), and an input fails when its whole scan takes
+more than 50 times that. The factor keeps the old line where it was written: 50 ms/MB on
+hardware whose stage one runs near 1 GB/s (1 ms/MB). On the M3 the four inputs sit at 24.5,
+21.0, 18.9 and 4.3 times stage one (stage one alone 0.76 to 1.55 ms/MB on these bytes).
+Absolute ms/MB are still printed beside the ratio, and `--max-ms` still works for a fixed machine.
+

@@ -82,6 +82,12 @@ pub const State = struct {
     regex_scratch: ?*regex_pool_mod.Scratch = null,
     /// A PCRE subsig could not be decided (step budget, or no scratch) during the last finalize.
     regex_limited: bool = false,
+    /// Diagnostics of the last finalize: the first signature whose PCRE subsig ran out of its
+    /// step budget, and the signature whose PCRE subsigs took the most steps in all.
+    regex_limited_ldb: ?u32 = null,
+    regex_worst: struct { ldb: u32 = 0, steps: u64 = 0 } = .{},
+    /// Steps of the PCRE subsig being run.
+    pcre_steps: u64 = 0,
     /// A YARA condition needed match offsets beyond the ones kept.
     offsets_limited: bool = false,
 
@@ -111,6 +117,8 @@ pub const State = struct {
         s.spill_arena.reset();
         s.bc_out_of_bounds = false;
         s.regex_limited = false;
+        s.regex_limited_ldb = null;
+        s.regex_worst = .{};
         s.offsets_limited = false;
     }
 
@@ -308,7 +316,11 @@ pub const State = struct {
         for (table.pcreSubsigs(rec)) |pr| {
             out[pr.subsig] = 0;
             if (!lt.evalRpn(table.trigger(pr), out[0..pr.subsig])) continue;
+            const limited_before = s.regex_limited;
+            s.pcre_steps = 0;
             const hits = s.runPcre(table, pr, data, info);
+            if (!limited_before and s.regex_limited) s.regex_limited_ldb = ldb;
+            if (s.pcre_steps > s.regex_worst.steps) s.regex_worst = .{ .ldb = ldb, .steps = s.pcre_steps };
             out[pr.subsig] = if (counters != null) hits else @intFromBool(hits > 0);
         }
         return out[0..nsub];
@@ -375,7 +387,12 @@ pub const State = struct {
         var hits: u32 = 0;
         var pos = lo;
         while (pos <= input.len) {
-            const m = (program.findFrom(scratch, input, pos) catch {
+            // Each kind of search reports its own steps; clear both so neither carries over.
+            scratch.linear.steps = 0;
+            if (scratch.bt) |*bt| bt.steps = 0;
+            const found = program.findFrom(scratch, input, pos);
+            s.pcre_steps +|= scratch.linear.steps + if (scratch.bt) |b| b.steps else 0;
+            const m = (found catch {
                 s.regex_limited = true;
                 return if (hits == 0) null else hits;
             }) orelse break;

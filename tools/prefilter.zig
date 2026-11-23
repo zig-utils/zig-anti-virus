@@ -26,11 +26,19 @@ var force_partition: ?u8 = null;
 var planted_record: ?usize = null;
 /// `worst --max-ms X`: exit 1 when an input takes longer than X ms per MB (the E4 pass line).
 var worst_max_ms: f64 = std.math.inf(f64);
+/// `worst --max-ratio X`: exit 1 when an input's ms per MB exceeds X times a plain stage-one
+/// pass over the same bytes on the same machine (the E4 pass line, machine-relative).
+var worst_max_ratio: f64 = std.math.inf(f64);
 /// `--verify-per-kib N`: the verify count budget per KiB (vm.Budget.verify_per_kib) in `worst`.
 var verify_per_kib: u64 = (vm.Budget{}).verify_per_kib;
 /// `--rounds N`: best of N passes in `stages` (a loaded machine needs more than three), and of
 /// N scans per file in `scan` (default 1 there).
 var rounds: usize = 3;
+/// `--regex-steps N`: a PCRE step budget per search (0: none). Without it the scanner's own
+/// defaults apply, as in production (engine/layerscan.zig): no budget for the linear engine,
+/// zig-regex's default for the backtracking one. The tools used to set 2^20 for both, which
+/// stopped any search that had to read a file larger than 1 MiB.
+var regex_steps: ?u64 = null;
 var rounds_set = false;
 
 const Corpus = struct {
@@ -70,9 +78,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--verify-per-kib")) {
             i += 1;
             verify_per_kib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--max-ratio")) {
+            i += 1;
+            worst_max_ratio = try std.fmt.parseFloat(f64, args[i]);
         } else if (std.mem.eql(u8, args[i], "--max-ms")) {
             i += 1;
             worst_max_ms = try std.fmt.parseFloat(f64, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--regex-steps")) {
+            i += 1;
+            regex_steps = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--record")) {
             i += 1;
             planted_record = try std.fmt.parseInt(usize, args[i], 10);
@@ -99,6 +113,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "stages")) return stages(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "diff")) return diff(gpa, io, index, corpus);
+    if (std.mem.eql(u8, cmd, "resolve")) return resolve(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "prefix")) return prefix(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "top")) return top(gpa, io, index, corpus);
     if (std.mem.eql(u8, cmd, "grams")) return grams(gpa, io, index, corpus);
@@ -326,7 +341,10 @@ const Worker = struct {
         if (index.regexes) |pool| {
             const mem = try w.fba.allocator().alignedAlloc(u8, .@"8", pool.scratchBytes(256));
             w.regex_scratch = try .initBuffer(mem, pool, 256);
-            w.regex_scratch.setStepBudget(1 << 20);
+            if (regex_steps) |steps| {
+                w.regex_scratch.setStepBudget(if (steps == 0) std.math.maxInt(u64) else steps);
+                if (steps == 0) w.regex_scratch.linear.step_budget = null;
+            }
             w.state.regex_scratch = &w.regex_scratch;
         }
         return w;
@@ -699,17 +717,52 @@ fn probeCorpus(index: *const bodyscan.BodyIndex, datas: []const []u8, kern: *con
 fn diff(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
     const w = try Worker.init(gpa, &index);
     var mismatches: usize = 0;
+    var undecided: usize = 0;
     for (corpus.paths.items) |p| {
         const data = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31));
         defer gpa.free(data);
         const a = try scanOne(&index, w, data, .auto, null);
         const b = try scanOne(&index, w, data, .reference, null);
-        if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
-            mismatches += 1;
-            std.debug.print("MISMATCH {s}: prefilter {any}, reference {any}\n", .{ p, a, b });
+        if (std.meta.activeTag(a) == std.meta.activeTag(b)) continue;
+        // The reference path searches every program, so it runs PCRE subsigs the prefiltered
+        // path never triggers; when one of those runs out of its step budget the reference has
+        // no verdict to compare. `resolve --regex-steps 0` decides such a file.
+        if (b == .limited and (b.limited == .regex_steps or b.limited == .verify_steps or b.limited == .verify_count)) {
+            undecided += 1;
+            std.debug.print("REFERENCE EXHAUSTED ITS BUDGET {s}: prefilter {any}, reference {any}\n", .{ p, a, b });
+            continue;
         }
+        mismatches += 1;
+        std.debug.print("MISMATCH {s}: prefilter {any}, reference {any}\n", .{ p, a, b });
     }
-    std.debug.print("{d} files compared, {d} mismatches\n", .{ corpus.paths.items.len, mismatches });
+    std.debug.print("{d} files compared, {d} mismatches, {d} where the reference exhausted its budget\n", .{ corpus.paths.items.len, mismatches, undecided });
+}
+
+/// The reference path on each file under `--regex-steps` (0: no PCRE step budget), with the
+/// prefiltered path's verdict beside it, the time it took, and the signature whose PCRE took
+/// the most steps (or ran out first).
+fn resolve(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex, corpus: Corpus) !void {
+    const w = try Worker.init(gpa, &index);
+    const names = try zav.engine.hashscan.HashIndex.load(index_db);
+    const table = index.ldb.?;
+    var nb: [256]u8 = undefined;
+    var disagree: usize = 0;
+    for (corpus.paths.items) |p| {
+        const data = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 31));
+        defer gpa.free(data);
+        const a = try scanOne(&index, w, data, .auto, null);
+        const t = now(io);
+        const b = try scanOne(&index, w, data, .reference, null);
+        const ms = @as(f64, @floatFromInt(nsSince(io, t))) / 1e6;
+        const heavy = w.state.regex_worst;
+        const top_name = names.meta.?.name(table.records[heavy.ldb].sig, &nb) catch "?";
+        std.debug.print("{s}: {d} bytes, prefilter {any}, reference {any} in {d:.0} ms; most PCRE steps {s}: {d} ({d:.1} per byte)\n", .{
+            std.fs.path.basename(p), data.len, a, b, ms, top_name, heavy.steps, @as(f64, @floatFromInt(heavy.steps)) / @as(f64, @floatFromInt(@max(data.len, 1))),
+        });
+        if (w.state.regex_limited_ldb) |l| std.debug.print("  out of budget first: {s}\n", .{names.meta.?.name(table.records[l].sig, &nb) catch "?"});
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) disagree += 1;
+    }
+    std.debug.print("{d} files, {d} where the verdicts differ\n", .{ corpus.paths.items.len, disagree });
 }
 
 fn deferralDiff(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, database: zav.db.reader.Database, index: *const bodyscan.BodyIndex, baseline_path: []const u8, dirs: []const []const u8) !void {
@@ -1166,6 +1219,36 @@ fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
         }
         std.debug.print("  ({d} matches broken)\n", .{broken});
         const ms_per_mb = @as(f64, @floatFromInt(best)) / 1e6 / mb;
+        // The machine's own yardstick: stage one alone over the same bytes, best of 20.
+        const part = index.partitionFor(1).?;
+        var base: u64 = std.math.maxInt(u64);
+        var ring: [pf.ring_len]pf.Candidate = undefined;
+        for (0..20) |_| {
+            const t = now(io);
+            var pos: usize = 0;
+            var n: usize = 0;
+            while (pos < data.len) {
+                const got, const next = pf.stage1(part, data, pos, &ring);
+                n += got;
+                pos = next;
+            }
+            std.mem.doNotOptimizeAway(n);
+            base = @min(base, nsSince(io, t));
+        }
+        const base_ms = @as(f64, @floatFromInt(base)) / 1e6 / mb;
+        const ratio = ms_per_mb / base_ms;
+        {
+            const names = try zav.engine.hashscan.HashIndex.load(index_db);
+            var nb: [256]u8 = undefined;
+            const heavy = w.state.regex_worst;
+            if (heavy.steps > 0) std.debug.print("  most PCRE steps: {s}, {d} ({d:.1} per byte){s}\n", .{
+                names.meta.?.name(index.ldb.?.records[heavy.ldb].sig, &nb) catch "?",
+                heavy.steps,
+                @as(f64, @floatFromInt(heavy.steps)) / @as(f64, @floatFromInt(data.len)),
+                if (w.state.regex_limited_ldb != null) ", out of budget" else "",
+            });
+            std.debug.print("  stage one alone {d:.3} ms/MB; this input {d:.1}x that\n", .{ base_ms, ratio });
+        }
         var what_buf: [64]u8 = undefined;
         const what = switch (verdict) {
             .limited => |e| std.fmt.bufPrint(&what_buf, "limited ({t})", .{e}) catch "limited",
@@ -1176,10 +1259,10 @@ fn worst(gpa: std.mem.Allocator, io: std.Io, index: bodyscan.BodyIndex) !void {
             @as(f64, @floatFromInt(steps)) / mb,            @as(f64, @floatFromInt(stats.verifies)) / mb,
             @as(f64, @floatFromInt(stats.candidates)) / mb, what,
         });
-        if (ms_per_mb > worst_max_ms) over += 1;
+        if (ms_per_mb > worst_max_ms or ratio > worst_max_ratio) over += 1;
     }
     if (over > 0) {
-        std.debug.print("{d} inputs over the pass line of {d} ms/MB\n", .{ over, worst_max_ms });
+        std.debug.print("{d} inputs over the pass line ({d} ms/MB, {d}x stage one)\n", .{ over, worst_max_ms, worst_max_ratio });
         std.process.exit(1);
     }
 }

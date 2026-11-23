@@ -61,6 +61,28 @@ GitHub tag archives are generated on demand and their bytes have changed in the 
 POI archive's hash is recorded but not enforced (`archive_hash_unstable`); every member it
 yields is still checked against the manifest. Every other archive's hash is enforced.
 
+## Known detections in B1
+
+B1 is benign, but 11 of its members are OLE2 documents (10 that file(1) calls `CDFV2 Encrypted`,
+one whose short stream it cannot read) that the ClamAV main + daily
+databases match with `PUA.Doc.Packed.EncryptedDoc-6563700-0`, a potentially unwanted application
+signature. `prefilter -- scan` and the zav engine report them: neither filters PUA signatures
+(the PUA flag is kept in the signature metadata but not consulted at scan time). ClamAV 1.5.4
+with the same CVDs reports them with `--detect-pua=yes` and as OK by default, the same 11 files
+and the same signature (checked 2026-11-22). They are expected, not false positives:
+
+- `24d908d34dd5248de420962ff88ff46fe1f5b6800ed1e00b88b04e98b4b390a4`
+- `2a86a49c40cdb0e3568fbee2554dd02a19b3901d81bd89e190584662ff135561`
+- `316aafa78433238ea38ecd39be718f3b64a81f54f95fa942a1038104ead99c5e`
+- `32613e96db73590cb63c9194e5b1190ba7eb4552f4638afecd584dfd5931988f`
+- `39ae9e6928ad91fa82a54d1aeac665337801ff73071bdfebd0e10d533e4b3cd9`
+- `3c7cc047fae52016c6b89f5461411feb371cb71614bcd6422d92bf74b8141ccd`
+- `6142dd1683ae8b566f26d7cc1f1bbb3e27563bd9cd7ca569867cdf39da26a030`
+- `7141fb4db3698904c17d29d2da827ca9e453ed69599721a00fd05176ae13dd07`
+- `98b0b87fd7f7e73669740b8a4dfd163e7d791308f08546c1c1340506fae9c3b5`
+- `9d461633ab2d4b7b6b0689f098481481f7733357e09d71b1a2b40abca837018e`
+- `9efe0f5df93e6aa76a583f7c2df6fd23132110cc2eb5d411ab2f358814716dc5`
+
 ## Who reads the manifests
 
 - `zig build gram-model -- src/compile/gram_model.bin ~/.cache/zav/corpus/B1` builds the 4-gram

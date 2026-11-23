@@ -578,7 +578,7 @@ bench/         corpus manifests, runner, memory sampler, clamd driver, gates
 | E1 | Hash index lookup cost, warm and cold; share of hashed bytes skipped ([results](experiments/E1-hash-index.md)) | lookup ≤ 300 ns warm; ≥ 70% of MD5 bytes skipped on B1 |
 | E2 | Prefilter bake-off: SBBF vs FDR shift-or vs double-array Aho-Corasick vs Teddy ([results](experiments/E2-prefilter.md)) | PE partition ≥ 1 GB/s per core including stage 2 |
 | E3 | Atom selection vs prefix selection; tier-D deferral coverage ([results](experiments/E3-atoms.md)) | ≥ 10x fewer candidates; ≥ 90% of tier D deferrable or anchorable |
-| E4 | Verify VM worst case on A1 ([results](experiments/E4-verify.md)) | no input over 50 ms/MB |
+| E4 | Verify VM worst case on A1 ([results](experiments/E4-verify.md)) | no input over 50x a stage-one pass over its bytes (50 ms/MB at 1 GB/s) |
 | E5 | Memory: idle, nominal, peak; reload under load | 24 / 64 MB; reload ≤ 2 MB |
 | E6 | pread vs mmap vs io_uring; munmap shootdowns; cache hygiene | pick defaults; io_uring ≥ 2x fewer µs per small file |
 | E7 | std flate, zstd, xz vs zlib-ng, libdeflate, libzstd ([results](experiments/E7-decoders.md)) | std flate ≥ 60% of zlib-ng, otherwise optimise |
