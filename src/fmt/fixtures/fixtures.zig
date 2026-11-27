@@ -411,5 +411,20 @@ pub const exes = [_]Exe{
     .{ .name = "upx-amd64-pe", .bytes = @embedFile("exe-upx-amd64-pe.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
         .{ .path = "upx", .len = 58368, .crc = 0x8b0b0c61 },
     } },
+    .{ .name = "upx-i386-pe", .bytes = @embedFile("exe-upx-i386-pe.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 68608, .crc = 0xbb694269 },
+    } },
+    .{ .name = "upx-i386-pe-res", .bytes = @embedFile("exe-upx-i386-pe-res.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 70656, .crc = 0xcecdf2c0 },
+    } },
+    .{ .name = "upx-amd64-dll", .bytes = @embedFile("exe-upx-amd64-dll.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 56320, .crc = 0x5aa3e0f6 },
+    } },
+    .{ .name = "upx-amd64-pe-ord", .bytes = @embedFile("exe-upx-amd64-pe-ord.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 61368, .crc = 0xc835102e },
+    } },
+    .{ .name = "upx-amd64-pe-big", .bytes = @embedFile("exe-upx-amd64-pe-big.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 128512, .crc = 0xf37bb121 },
+    } },
     .{ .name = "upx-amd64-pe-d", .bytes = @embedFile("exe-upx-amd64-pe-d.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
 };

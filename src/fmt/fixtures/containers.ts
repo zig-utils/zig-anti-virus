@@ -1184,9 +1184,13 @@ export function chmFile(h: Helpers, plainFiles: Member[], compressedFiles: Membe
 }
 
 // ---------------------------------------------------------------------------------------------
-// UPX-packed executables (P5.19): a small C program built with `zig cc` for each target, packed
-// with `upx --best` (NRV2B) and `upx --lzma`, and unpacked again with `upx -d`, whose output is
-// what the unpacker must reproduce. Tools: ZIG and UPX_BIN from the environment (upx itself reads UPX as options), else on PATH.
+// UPX-packed executables (P5.19): small C programs built with `zig cc` for each target, packed
+// with upx (NRV2B, NRV2D, NRV2E or LZMA), and unpacked again with `upx -d`, whose output is what
+// the unpacker must reproduce. The PE samples between them have PE32 and PE32+, filters 0x24
+// (--brute), 0x26 and 0x49, a load configuration, resources (kept and compressed, by number and
+// by name), exports with a forwarder, an ordinal import, an overlay and a relocation delta over
+// 64 KiB. Tools: ZIG and
+// UPX_BIN from the environment (upx itself reads UPX as options), else on PATH.
 
 const helloC = `#include <stdio.h>
 static const char eicar[] = "X5O!P%@AP[4\\\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
@@ -1194,28 +1198,126 @@ int table[4096];
 int main(int argc, char **argv) { for (int i = 0; i < 4096; i++) table[i] = i * argc; printf("%s %d\\n", argc > 5 ? eicar : "hi", table[argc]); return 0; }
 `
 
+/** A load configuration: lld fills the directory from `_load_config_used`. */
+const loadConfigC = `#include <stdio.h>
+#include <windows.h>
+static int marker = 7;
+const IMAGE_LOAD_CONFIG_DIRECTORY _load_config_used = { .Size = sizeof(IMAGE_LOAD_CONFIG_DIRECTORY), .MajorVersion = 1, .CriticalSectionDefaultTimeout = 1234 };
+int *volatile keep = &marker;
+int main(int argc, char **argv) { printf("%d %d %d\\n", argc, (int)_load_config_used.Size, *keep); return 0; }
+`
+
+const ordinalC = `#include <stdio.h>
+unsigned short __stdcall htons(unsigned short);
+int main(int argc, char **argv) { printf("%d\\n", htons((unsigned short)argc)); return 0; }
+`
+
+const dllC = `__declspec(dllexport) int add(int a, int b) { return a + b; }
+__declspec(dllexport) int mul(int a, int b) { return a * b; }
+int counter = 5;
+__declspec(dllexport) int *get(void) { return &counter; }
+`
+
+/** A large read-only array: the first relocation site lies more than 64 KiB into the image,
+ * so the stream's first delta has a high part. */
+const bigC = `#include <stdio.h>
+static int a, b, c;
+int *front[] = { &a, &b };
+static char pad[70000] = {1};
+int *back[] = { &c, &a };
+int main(int argc, char **argv) { printf("%d %p %p %d\\n", pad[argc], (void*)front[argc&1], (void*)back[argc&1], argc); return 0; }
+`
+
+const resourcesRc = `1 VERSIONINFO
+FILEVERSION 1,2,3,4
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "zav fixture\\0"
+    END
+  END
+END
+STRINGTABLE
+BEGIN
+  1 "hello from a string table"
+END
+100 RCDATA
+BEGIN
+  "some custom resource data that should compress well well well well well well\\0"
+END
+MYDATA MYTYPE
+BEGIN
+  "named type and name resource data\\0"
+END
+2 ICON "a.ico"
+`
+
+/** A 32x32, 16-colour icon with one blank image. */
+function icon(): Uint8Array {
+  const w = 32
+  const bmp = new Uint8Array(40 + 64 + (w * w) / 2 + 4 * w)
+  const v = new DataView(bmp.buffer)
+  v.setUint32(0, 40, true)
+  v.setInt32(4, w, true)
+  v.setInt32(8, w * 2, true)
+  v.setUint16(12, 1, true)
+  v.setUint16(14, 4, true)
+  v.setUint32(32, 16, true)
+  const ico = new Uint8Array(22 + bmp.length)
+  const d = new DataView(ico.buffer)
+  d.setUint16(2, 1, true)
+  d.setUint16(4, 1, true)
+  ico[6] = w
+  ico[7] = w
+  ico[8] = 16
+  d.setUint16(10, 1, true)
+  d.setUint16(12, 4, true)
+  d.setUint32(14, bmp.length, true)
+  d.setUint32(18, 22, true)
+  ico.set(bmp, 22)
+  return ico
+}
+
 export function upxSamples(h: Helpers): { name: string, packed: Uint8Array, unpacked: Uint8Array }[] {
   const zig = process.env.ZIG ?? 'zig'
   const upx = process.env.UPX_BIN ?? 'upx'
   const work = mkdtempSync(join(tmpdir(), 'zav-upx-'))
-  writeFileSync(join(work, 'hello.c'), helloC)
+  const at = (f: string): string => join(work, f)
+  writeFileSync(at('hello.c'), helloC)
+  writeFileSync(at('lc.c'), loadConfigC)
+  writeFileSync(at('ord.c'), ordinalC)
+  writeFileSync(at('dll.c'), dllC)
+  writeFileSync(at('big.c'), bigC)
+  writeFileSync(at('res.rc'), resourcesRc)
+  writeFileSync(at('a.ico'), icon())
+  writeFileSync(at('dll.def'), 'EXPORTS\nadd\nmul\nget\nsnooze = kernel32.Sleep\n')
+  writeFileSync(at('ws2.def'), 'LIBRARY ws2_32.dll\nEXPORTS\nhtons @9 NONAME\n')
+  h.run(zig, ['dlltool', '-d', at('ws2.def'), '-l', at('ws2.a'), '-m', 'i386:x86-64'], new Uint8Array(0))
   const out: { name: string, packed: Uint8Array, unpacked: Uint8Array }[] = []
-  const targets: [string, string, string[]][] = [
-    ['amd64-elf', 'x86_64-linux-musl', ['--best']],
-    ['i386-elf', 'x86-linux-musl', ['--best']],
-    ['arm64-elf', 'aarch64-linux-musl', ['--best']],
-    ['amd64-elf-lzma', 'x86_64-linux-musl', ['--lzma']],
-    ['amd64-macho', 'x86_64-macos', ['--best', '--force-macos']],
-    ['amd64-pe', 'x86_64-windows-gnu', ['--best']],
+  // name, target, upx options, inputs, extra compiler arguments, overlay bytes appended
+  const targets: [string, string, string[], string[], string[], number][] = [
+    ['amd64-elf', 'x86_64-linux-musl', ['--best'], ['hello.c'], [], 0],
+    ['i386-elf', 'x86-linux-musl', ['--best'], ['hello.c'], [], 0],
+    ['arm64-elf', 'aarch64-linux-musl', ['--best'], ['hello.c'], [], 0],
+    ['amd64-elf-lzma', 'x86_64-linux-musl', ['--lzma'], ['hello.c'], [], 0],
+    ['amd64-macho', 'x86_64-macos', ['--best', '--force-macos'], ['hello.c'], [], 0],
+    ['amd64-pe', 'x86_64-windows-gnu', ['--best'], ['hello.c'], [], 0],
+    ['i386-pe', 'x86-windows-gnu', ['--best'], ['lc.c'], [], 0],
+    ['i386-pe-res', 'x86-windows-gnu', ['--brute'], ['hello.c', 'res.rc'], [], 0],
+    ['amd64-dll', 'x86_64-windows-gnu', ['--nrv2d'], ['dll.c', 'dll.def'], ['-shared'], 0],
+    ['amd64-pe-ord', 'x86_64-windows-gnu', ['--lzma'], ['ord.c', 'ws2.a'], [], 3000],
+    ['amd64-pe-big', 'x86_64-windows-gnu', ['--best'], ['big.c'], [], 0],
   ]
-  for (const [name, target, opts] of targets) {
-    const exe = join(work, `${name}.bin`)
-    h.run(zig, ['cc', '-target', target, '-Os', ...(target.includes('macos') ? [] : ['-s']), '-o', exe, join(work, 'hello.c')], new Uint8Array(0))
-    const packed = join(work, `${name}.upx`)
-    writeFileSync(packed, readFileSync(exe))
+  for (const [name, target, opts, inputs, extra, overlay] of targets) {
+    const exe = at(`${name}.bin`)
+    h.run(zig, ['cc', '-target', target, '-Os', ...(target.includes('macos') ? [] : ['-s']), ...extra, '-o', exe, ...inputs.map(at)], new Uint8Array(0))
+    const packed = at(`${name}.upx`)
+    writeFileSync(packed, h.concat(new Uint8Array(readFileSync(exe)), new Uint8Array(overlay).fill(0x4f)))
     chmodSync(packed, 0o755)
     h.run(upx, ['-q', ...opts, packed], new Uint8Array(0))
-    const unpacked = join(work, `${name}.d`)
+    const unpacked = at(`${name}.d`)
     writeFileSync(unpacked, readFileSync(packed))
     h.run(upx, ['-q', '-d', unpacked], new Uint8Array(0))
     out.push({ name, packed: new Uint8Array(readFileSync(packed)), unpacked: new Uint8Array(readFileSync(unpacked)) })
@@ -1358,9 +1460,8 @@ export function build(h: Helpers): void {
   // UPX: every sample rebuilds to exactly what upx -d writes. The PE upx -d output is a
   // fixture too, which upx.zig compares byte for byte.
   for (const u of upxSamples(h)) {
-    const isPe = u.name.endsWith('-pe')
     h.exe(`upx-${u.name}`, u.packed, { entry: null, sections: 0, members: [{ path: 'upx', data: u.unpacked }] })
-    if (isPe) h.exe(`upx-${u.name}-d`, u.unpacked, { entry: null, sections: 0 })
+    if (u.name === 'amd64-pe') h.exe(`upx-${u.name}-d`, u.unpacked, { entry: null, sections: 0 })
   }
   archive('dag-bomb.iso', isoImage([{ path: 'x.txt', data: fileA }], { joliet: true, dagDepth: 24 }), [])
 }
