@@ -408,6 +408,8 @@ pub const exes = [_]Exe{
     .{ .name = "upx-amd64-macho", .bytes = @embedFile("exe-upx-amd64-macho.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
         .{ .path = "upx", .len = 16749, .crc = 0xba340d07 },
     } },
-    .{ .name = "upx-amd64-pe", .bytes = @embedFile("exe-upx-amd64-pe.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
+    .{ .name = "upx-amd64-pe", .bytes = @embedFile("exe-upx-amd64-pe.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{
+        .{ .path = "upx", .len = 58368, .crc = 0x8b0b0c61 },
+    } },
     .{ .name = "upx-amd64-pe-d", .bytes = @embedFile("exe-upx-amd64-pe-d.bin")[exe_prefix.len..], .entry = null, .sections = 0, .imphash = "", .impsize = 0, .malformed = false, .members = &.{} },
 };

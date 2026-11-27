@@ -10,14 +10,24 @@
 //!   p_blocksize), then the holes between and after them, as UPX wrote them. The rebuilt file is
 //!   the child "upx", byte-identical to `upx -d` output for the formats tested (i386, amd64 and
 //!   arm64 ELF, amd64 Mach-O; NRV2B, NRV2E and LZMA).
-//! - PE: the compressed image is decompressed and unfiltered into the child "upx/image": the
-//!   sections' bytes laid out from the first section's address. `upx -d` also rebuilds the PE
-//!   header, imports, relocations and resources; that is not done here, so the child is not a
-//!   PE file, but its section bytes match `upx -d` output where UPX did not rewrite them.
-//!
+//! - PE: the compressed image is decompressed and unfiltered (the sections' bytes laid out from
+//!   the lowest section address, then UPX's import records, relocation stream and the original
+//!   PE header). From it the original file is rebuilt as the child "upx", reading the image
+//!   and writing a new buffer: header, section layout, imports and relocations, byte-identical
+//!   to `upx -d` for the amd64 sample (PE32+, NRV2B, filter 0x49, with TLS and exception data).
+//!   Only what that sample shows is accepted: PE32, an overlay on the packed or the original
+//!   file, ordinal or other import records, relocation prefixes other than 0xf0, odd relocation
+//!   blocks, overlapping sections, a record written over non-zero image bytes, or a layout that
+//!   differs in any checked field leave the image unrebuilt, scanned as the child "upx/image"
+//!   with a notice. Resources, exports and
+//!   load configuration are copied as unpacked, with a notice. When image bytes outside the
+//!   original sections' raw data are not all zero, the image is scanned as well.
 //! Bounds: the output size is the header's claim, capped by MaxFileSize and taken as a decoder
 //! window from the big-window budget; every block must decompress to exactly its declared size
-//! inside the output; decoders stop at their input or output end.
+//! inside the output; decoders stop at their input or output end. A rebuilt PE file is a second
+//! window, taken only once its size equals the end of the original sections; every write into
+//! it is checked against one section's raw data, and every record read against the image range
+//! that holds its kind of record.
 const std = @import("std");
 const container = @import("../../engine/container.zig");
 const Source = @import("../../engine/source.zig").Source;
@@ -25,6 +35,7 @@ const Walker = container.Walker;
 const Error = container.Error;
 const Format = container.Format;
 const lzma = @import("../lzma.zig");
+const pe = @import("../pe.zig");
 
 pub const DecodeError = error{ Corrupt, Unsupported };
 
@@ -499,6 +510,7 @@ fn walkPe(w: *Walker, src: Source) Error!void {
     const method: Method = @fromBackingInt(@intCast(h[6]));
     const u_len = std.mem.readInt(u32, h[16..20], .little);
     const c_len = std.mem.readInt(u32, h[20..24], .little);
+    const file_len = std.mem.readInt(u32, h[24..28], .little);
     const filter = h[28];
     const cto = h[29];
     w.path.push("upx");
@@ -519,10 +531,426 @@ fn walkPe(w: *Walker, src: Source) Error!void {
     decompress(w, method, comp, out) catch |e| {
         return w.notice(if (e == error.Unsupported) .unsupported else .malformed, if (e == error.Unsupported) "upx: compression method" else "upx: damaged image");
     };
-    if (!unfilter(out, filter, cto)) w.notice(.unsupported, "upx: filter (scanned filtered)");
+    const unfiltered = unfilter(out, filter, cto);
+    if (!unfiltered) w.notice(.unsupported, "upx: filter (scanned filtered)");
+    // The file is rebuilt only from an image whose filter was undone.
+    const rebuilt = if (unfiltered) rebuildPe(w, src, out, file_len) else null;
+    defer if (rebuilt) |r| r.token.release();
     w.path.pop();
     defer w.path.push("upx");
+    if (rebuilt) |r| {
+        try w.child("upx", .{ .memory = r.file }, .unpacked);
+        // Image bytes that no section of the original file maps are not in the file.
+        if (!r.unmapped_zero) try w.child("upx/image", .{ .memory = out }, .unpacked);
+        return;
+    }
     try w.child("upx/image", .{ .memory = out }, .unpacked);
+}
+
+fn readU16(b: []const u8, at: usize) ?u16 {
+    if (at > b.len or b.len - at < 2) return null;
+    return std.mem.readInt(u16, b[at..][0..2], .little);
+}
+
+fn readU32(b: []const u8, at: usize) ?u32 {
+    if (at > b.len or b.len - at < 4) return null;
+    return std.mem.readInt(u32, b[at..][0..4], .little);
+}
+
+const dir_reloc = 5;
+const dir_load_config = 10;
+const dir_iat = 12;
+/// The Windows loader's limit on sections.
+const max_pe_sections = 96;
+
+/// A PE32+ image as UPX leaves it, in the one layout this was written from (UPX 5.3 output, an
+/// amd64 sample). The section bytes run to the original SizeOfImage; then come the import
+/// records, the relocation stream, and the original PE header with its section table, each
+/// right after the other, and a 17-byte trailer: the import records' offset, a zero word, the
+/// relocation stream's offset, a zero byte, and the header's offset.
+const PeImage = struct {
+    img: []const u8,
+    /// Where the section bytes end (the import records' offset).
+    end: usize,
+    relocs_at: usize,
+    header_at: usize,
+    header_len: usize,
+    image_base: u64,
+    size_of_headers: u32,
+    /// Offset of the data directories in the header, and how many there are.
+    dirs_at: usize,
+    ndirs: u32,
+    nsections: u16,
+    sections_at: usize,
+    /// The lowest section address of the packed file: image offset 0.
+    rvamin: u32,
+
+    const Section = struct { va: u32, raw_len: u32, raw_off: u32 };
+
+    const ParseError = error{ Layout, Pe32 };
+
+    fn parse(img: []const u8, rvamin: u32) ParseError!PeImage {
+        const n = img.len;
+        if (n < 17 + 24) return error.Layout;
+        const tail = n - 17;
+        const imports_at: usize = readU32(img, tail).?;
+        const relocs_at: usize = readU32(img, tail + 8).?;
+        const header_at: usize = readU32(img, tail + 13).?;
+        if (readU32(img, tail + 4).? != 0 or img[tail + 12] != 0) return error.Layout;
+        if (!(imports_at < relocs_at and relocs_at < header_at and header_at < tail)) return error.Layout;
+        if (tail - header_at < 24 + 112 or !std.mem.eql(u8, img[header_at..][0..4], "PE\x00\x00")) return error.Layout;
+        const nsections = readU16(img, header_at + 6).?;
+        const opt_size = readU16(img, header_at + 20).?;
+        switch (readU16(img, header_at + 24).?) {
+            0x20b => {},
+            0x10b => return error.Pe32,
+            else => return error.Layout,
+        }
+        const dirs_off: usize = 112;
+        const header_len = 24 + @as(usize, opt_size) + 40 * @as(usize, nsections);
+        if (opt_size < dirs_off or nsections == 0 or nsections > max_pe_sections) return error.Layout;
+        if (header_len != tail - header_at) return error.Layout;
+        const o = header_at + 24;
+        const size_of_image = readU32(img, o + 56).?;
+        if (size_of_image < rvamin or size_of_image - rvamin != imports_at) return error.Layout;
+        return .{
+            .img = img,
+            .end = imports_at,
+            .relocs_at = relocs_at,
+            .header_at = header_at,
+            .header_len = header_len,
+            .image_base = std.mem.readInt(u64, img[o + 24 ..][0..8], .little),
+            .size_of_headers = readU32(img, o + 60).?,
+            .dirs_at = 24 + dirs_off,
+            .ndirs = @min(readU32(img, o + dirs_off - 4).?, (opt_size - dirs_off) / 8, 16),
+            .nsections = nsections,
+            .sections_at = 24 + @as(usize, opt_size),
+            .rvamin = rvamin,
+        };
+    }
+
+    fn dir(p: *const PeImage, i: usize) pe.DataDir {
+        if (i >= p.ndirs) return .{};
+        const at = p.header_at + p.dirs_at + i * 8;
+        return .{ .rva = readU32(p.img, at).?, .size = readU32(p.img, at + 4).? };
+    }
+
+    fn section(p: *const PeImage, k: usize) Section {
+        const s = p.header_at + p.sections_at + 40 * k;
+        return .{ .va = readU32(p.img, s + 12).?, .raw_len = readU32(p.img, s + 16).?, .raw_off = readU32(p.img, s + 20).? };
+    }
+
+    /// Image offset of `len` bytes at `rva`, when they lie inside the section bytes.
+    fn span(p: *const PeImage, rva: u64, len: usize) ?usize {
+        if (rva < p.rvamin) return null;
+        const off = rva - p.rvamin;
+        if (off > p.end or p.end - off < len) return null;
+        return @intCast(off);
+    }
+
+    /// File offset of `len` bytes at `rva` in the rebuilt file: inside one section's raw data.
+    fn fileSpan(p: *const PeImage, rva: u64, len: usize) ?usize {
+        for (0..p.nsections) |k| {
+            const s = p.section(k);
+            if (rva < s.va or rva - s.va > s.raw_len or s.raw_len - (rva - s.va) < len) continue;
+            return @intCast(s.raw_off + (rva - s.va));
+        }
+        return null;
+    }
+
+    /// Whether the image holds zeros for `len` bytes at `rva`. A record may only be written
+    /// over bytes UPX zeroed (as every one in the sample is), so the file never drops image
+    /// data the scan would otherwise see.
+    fn zeroAt(p: *const PeImage, rva: u64, len: usize) bool {
+        const at = p.span(rva, len) orelse return false;
+        return std.mem.allEqual(u8, p.img[at..][0..len], 0);
+    }
+};
+
+const Rebuilt = struct {
+    file: []u8,
+    token: @import("../../engine/budget.zig").Budget.Token,
+    /// Every image byte outside the original sections' raw data is zero. The file then holds
+    /// all of the image: sections do not overlap in the file, and records are written only over
+    /// zeros.
+    unmapped_zero: bool,
+};
+
+/// Rebuild the original PE file from the unpacked image as `upx -d` writes it: the packed
+/// file's DOS header and stub, the original PE header and section table with the IAT directory
+/// cleared, each section's raw bytes at its file offset, and then the import and relocation
+/// records applied to that file. The image is only read. Null when the image does not have the
+/// layout this was written from, or is damaged (each with a notice), or a limit stops it (the
+/// limit is reported); the caller then scans the image as it is.
+fn rebuildPe(w: *Walker, src: Source, img: []const u8, file_len: u32) ?Rebuilt {
+    var sections: [16]pe.Section = undefined;
+    const packed_info = pe.parse(w.io, src, &sections) catch {
+        w.notice(.malformed, "upx: packed PE headers");
+        return null;
+    };
+    if (packed_info.sections.len == 0 or packed_info.nsections > sections.len) {
+        w.notice(.unsupported, "upx: packed PE section table");
+        return null;
+    }
+    if (packed_info.overlay_off < packed_info.file_size) {
+        w.notice(.unsupported, "upx: packed PE with an overlay");
+        return null;
+    }
+    var rvamin: u32 = std.math.maxInt(u32);
+    for (packed_info.sections) |s| rvamin = @min(rvamin, s.va);
+    const p = PeImage.parse(img, rvamin) catch |e| {
+        w.notice(.unsupported, if (e == error.Pe32) "upx: PE32 rebuild (no sample to check it against)" else "upx: PE records not laid out as in the sample");
+        return null;
+    };
+    const pel = packed_info.pe_offset;
+    if (p.size_of_headers > file_len or pel > p.size_of_headers or p.header_len > p.size_of_headers - pel) {
+        w.notice(.malformed, "upx: original PE header does not fit");
+        return null;
+    }
+    // Each section's raw data comes from inside the section bytes and lands inside the file;
+    // the file ends where the last one does (an overlay was not seen, so none is accepted).
+    var layout_end: u64 = p.size_of_headers;
+    var mapped: [max_pe_sections]Region = undefined;
+    var placed: [max_pe_sections]Region = undefined;
+    var nmapped: usize = 0;
+    for (0..p.nsections) |k| {
+        const s = p.section(k);
+        if (s.raw_len == 0) continue;
+        const from = p.span(s.va, s.raw_len) orelse {
+            w.notice(.malformed, "upx: original section outside the image");
+            return null;
+        };
+        if (s.raw_off < p.size_of_headers or s.raw_off > file_len or s.raw_len > file_len - s.raw_off) {
+            w.notice(.malformed, "upx: original section outside the file");
+            return null;
+        }
+        layout_end = @max(layout_end, @as(u64, s.raw_off) + s.raw_len);
+        mapped[nmapped] = .{ .off = from, .len = s.raw_len };
+        placed[nmapped] = .{ .off = s.raw_off, .len = s.raw_len };
+        nmapped += 1;
+    }
+    sortRegions(placed[0..nmapped]);
+    for (1..nmapped) |k| if (placed[k].off < placed[k - 1].off + placed[k - 1].len) {
+        w.notice(.unsupported, "upx: original sections overlap in the file");
+        return null;
+    };
+    if (layout_end != file_len) {
+        w.notice(.unsupported, "upx: PE file size other than its sections' end (overlay)");
+        return null;
+    }
+    if (file_len > w.tracker.limits.max_file_size) {
+        w.limit(.file_size);
+        return null;
+    }
+    const token = w.window(file_len, 0) orelse return null;
+    const out = w.alloc(u8, file_len) orelse {
+        token.release();
+        return null;
+    };
+    @memset(out, 0);
+    const done = fill(w, src, &p, &packed_info, out);
+    if (done) |unsupported| {
+        if (unsupported) w.notice(.unsupported, "upx: PE records not understood") else w.notice(.malformed, "upx: PE records point outside the file");
+        // The last scratch allocation, so this returns it.
+        w.free(out);
+        token.release();
+        return null;
+    }
+    if (p.dir(pe.dir_resource).rva != 0 or p.dir(pe.dir_export).rva != 0 or p.dir(dir_load_config).rva != 0)
+        w.notice(.unsupported, "upx: PE resources, exports and load configuration are copied, not rebuilt");
+    return .{ .file = out, .token = token, .unmapped_zero = unmappedZero(img[0..p.end], mapped[0..nmapped]) };
+}
+
+/// Whether every byte of `img` outside `mapped` is zero.
+fn sortRegions(r: []Region) void {
+    std.sort.insertion(Region, r, {}, struct {
+        fn lt(_: void, a: Region, b: Region) bool {
+            return a.off < b.off;
+        }
+    }.lt);
+}
+
+fn unmappedZero(img: []const u8, mapped: []Region) bool {
+    sortRegions(mapped);
+    var at: u64 = 0;
+    for (mapped) |r| {
+        if (r.off > at and std.mem.indexOfNone(u8, img[@intCast(at)..@intCast(r.off)], &.{0}) != null) return false;
+        at = @max(at, r.off + r.len);
+    }
+    return at >= img.len or std.mem.indexOfNone(u8, img[@intCast(at)..], &.{0}) == null;
+}
+
+/// Lay the file out and apply the records. Null when done; otherwise whether the failure was a
+/// record that was not understood (true) or one that points outside the file (false).
+fn fill(w: *Walker, src: Source, p: *const PeImage, packed_info: *const pe.Info, out: []u8) ?bool {
+    const img = p.img;
+    const pel = packed_info.pe_offset;
+    src.readAllAt(w.io, 0, out[0..pel]) catch return false;
+    @memcpy(out[pel..][0..p.header_len], img[p.header_at..][0..p.header_len]);
+    if (p.ndirs > dir_iat) @memset(out[pel + p.dirs_at + dir_iat * 8 ..][0..8], 0);
+    for (0..p.nsections) |k| {
+        const s = p.section(k);
+        if (s.raw_len == 0) continue;
+        @memcpy(out[s.raw_off..][0..s.raw_len], img[s.va - p.rvamin ..][0..s.raw_len]);
+    }
+    if (fillImports(w, src, p, packed_info, out)) |e| return e;
+    return fillRelocs(p, out);
+}
+
+/// The import records: per DLL, the offset of its name in the packed file's import data and
+/// its IAT's image offset, then one record per function (1 and the name), ended by 0; a zero
+/// name offset ends the list, and the relocation stream follows at once. The descriptors and
+/// the thunks are still in the image; each descriptor's IAT field, the DLL names and the
+/// hint/name entries (hint 0) are written, each over zeros in the image. Ordinals, any other
+/// record, and more DLLs than the import directory holds were not seen, so they are refused.
+fn fillImports(w: *Walker, src: Source, p: *const PeImage, packed_info: *const pe.Info, out: []u8) ?bool {
+    const img = p.img[0..p.relocs_at];
+    const import_dir = p.dir(pe.dir_import);
+    const dir_rva = import_dir.rva;
+    const names_rva = packed_info.dir(pe.dir_import).rva;
+    var q = p.end;
+    var functions: usize = 0;
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        const name_off = readU32(img, q) orelse return true;
+        q += 4;
+        if (name_off == 0) break;
+        // The directory ends with a zero descriptor, which no record fills.
+        if (dir_rva == 0 or k >= import_dir.size / 20 -| 1 or k == pe.max_import_descriptors) return true;
+        const iat = readU32(img, q) orelse return true;
+        q += 4;
+        const desc_rva = @as(u64, dir_rva) + 20 * k;
+        const desc = p.span(desc_rva, 20) orelse return false;
+        var name_buf: [256]u8 = undefined;
+        const at = packed_info.rvaToOffset(@as(u64, names_rva) + name_off) orelse return false;
+        const got = src.readAt(w.io, at, &name_buf) catch return false;
+        const name_len = std.mem.indexOfScalar(u8, name_buf[0..got], 0) orelse return true;
+        const iat_rva = @as(u64, iat) + p.rvamin;
+        if (iat_rva > std.math.maxInt(u32)) return false;
+        const ft = p.fileSpan(desc_rva + 16, 4) orelse return false;
+        const name_rva = readU32(p.img, desc + 12).?;
+        const name_at = p.fileSpan(name_rva, name_len + 1) orelse return false;
+        if (!p.zeroAt(desc_rva + 16, 4) or !p.zeroAt(name_rva, name_len + 1)) return true;
+        std.mem.writeInt(u32, out[ft..][0..4], @intCast(iat_rva), .little);
+        @memcpy(out[name_at..][0..name_len], name_buf[0..name_len]);
+        out[name_at + name_len] = 0;
+        var thunk = iat_rva;
+        while (true) : (thunk += 8) {
+            if (q >= img.len) return true;
+            const tag = img[q];
+            q += 1;
+            if (tag == 0) break;
+            if (tag != 1) return true;
+            const end = std.mem.indexOfScalarPos(u8, img, q, 0) orelse return true;
+            const fname = img[q..end];
+            q = end + 1;
+            functions += 1;
+            if (functions > pe.max_imports or fname.len > 4096) return true;
+            const t = p.span(thunk, 8) orelse return false;
+            const target = std.mem.readInt(u64, p.img[t..][0..8], .little);
+            const entry = p.fileSpan(target, 2 + fname.len + 1) orelse return false;
+            if (!p.zeroAt(target, 2 + fname.len + 1)) return true;
+            out[entry] = 0;
+            out[entry + 1] = 0;
+            @memcpy(out[entry + 2 ..][0..fname.len], fname);
+            out[entry + 2 + fname.len] = 0;
+        }
+    }
+    if (q != p.relocs_at) return true;
+    return null;
+}
+
+/// The relocation stream: deltas from `rvamin - 4` to each site, one byte each, or 0xf0 and a
+/// 16-bit delta; 0 ends it, and the header follows at once. Each site holds its target as a
+/// big-endian 64-bit offset from the image base plus `rvamin` (all sites are DIR64, at least 8
+/// bytes apart). The table written at the relocation directory, over zeros in the image, has
+/// one block per 4 KiB page and must fill the directory exactly. The sample's blocks all have an
+/// even number of entries; an odd one (which the PE format pads) was not seen and is refused.
+fn fillRelocs(p: *const PeImage, out: []u8) ?bool {
+    const img = p.img;
+    const reloc_dir = p.dir(dir_reloc);
+    // Pass one: the sites, and the table's size.
+    var q = p.relocs_at;
+    var pos: u64 = @as(u64, p.rvamin) -% 4;
+    var table: usize = 0;
+    var entries: usize = 0;
+    // Never a page address: those have the low 12 bits clear.
+    var page: u64 = std.math.maxInt(u64);
+    while (true) {
+        const delta = nextDelta(img[0..p.header_at], &q) orelse return true;
+        if (delta == 0) break;
+        // The first delta reaches the first site from rvamin - 4; later sites do not overlap.
+        if (delta < 8 and entries + table != 0) return true;
+        pos +%= delta;
+        if (pos > std.math.maxInt(u32)) return false;
+        const site = p.span(pos, 8) orelse return false;
+        const to = p.fileSpan(pos, 8) orelse return false;
+        const v = std.mem.readInt(u64, img[site..][0..8], .big) +% p.image_base +% p.rvamin;
+        std.mem.writeInt(u64, out[to..][0..8], v, .little);
+        if (page != pos & ~@as(u64, 0xfff)) {
+            if (entries % 2 != 0) return true;
+            table += blockLen(entries);
+            entries = 0;
+            page = pos & ~@as(u64, 0xfff);
+        }
+        entries += 1;
+    }
+    if (entries % 2 != 0) return true;
+    table += blockLen(entries);
+    if (q != p.header_at or table != reloc_dir.size) return true;
+    if (table == 0) return null;
+    const at = p.fileSpan(reloc_dir.rva, table) orelse return false;
+    if (!p.zeroAt(reloc_dir.rva, table)) return true;
+    // Pass two: the table. The stream was checked in pass one.
+    q = p.relocs_at;
+    pos = @as(u64, p.rvamin) -% 4;
+    var head: ?usize = null;
+    var o = at;
+    while (true) {
+        const delta = nextDelta(img[0..p.header_at], &q).?;
+        if (delta == 0) break;
+        pos +%= delta;
+        if (head == null or page != pos & ~@as(u64, 0xfff)) {
+            if (head) |b| o = closeBlock(out, b, o);
+            page = pos & ~@as(u64, 0xfff);
+            head = o;
+            std.mem.writeInt(u32, out[o..][0..4], @intCast(page), .little);
+            o += 8;
+        }
+        std.mem.writeInt(u16, out[o..][0..2], 0xa000 | @as(u16, @intCast(pos & 0xfff)), .little);
+        o += 2;
+    }
+    _ = closeBlock(out, head.?, o);
+    return null;
+}
+
+/// The next relocation delta (0 at the end of the stream), or null for a prefix that was not
+/// seen (only 0xf0 with a 16-bit delta was) or a stream that runs out.
+fn nextDelta(stream: []const u8, q: *usize) ?u64 {
+    if (q.* >= stream.len) return null;
+    const c = stream[q.*];
+    q.* += 1;
+    if (c < 0xf0) return c;
+    if (c != 0xf0) return null;
+    const d = readU16(stream, q.*) orelse return null;
+    q.* += 2;
+    if (d == 0) return null;
+    return d;
+}
+
+fn blockLen(entries: usize) usize {
+    if (entries == 0) return 0;
+    return 8 + 2 * (entries + entries % 2);
+}
+
+fn closeBlock(out: []u8, at: usize, end: usize) usize {
+    var o = end;
+    if ((o - at) % 4 != 0) {
+        std.mem.writeInt(u16, out[o..][0..2], 0, .little);
+        o += 2;
+    }
+    std.mem.writeInt(u32, out[at + 4 ..][0..4], @intCast(o - at), .little);
+    return o;
 }
 
 test "nrv: a stream that runs out of input or output is an error" {
@@ -567,8 +995,7 @@ const Capture = struct {
     }
 };
 
-test "PE: the unpacked image's code section is what upx -d writes" {
-    const pe = @import("../pe.zig");
+test "PE: the rebuilt file is what upx -d writes" {
     const packed_pe = exe("upx-amd64-pe");
     const unpacked_pe = exe("upx-amd64-pe-d");
     var rig: @import("../scan.zig").TestRig = undefined;
@@ -579,17 +1006,117 @@ test "PE: the unpacked image's code section is what upx -d writes" {
     rig.walker.visitor = cap.visitor();
     try rig.walker.scan(.{ .memory = packed_pe }, "upx-amd64-pe");
     try std.testing.expectEqual(@as(usize, 0), cap.notices);
-    var ps: [16]pe.Section = undefined;
-    const pinfo = try pe.parse(std.testing.io, .{ .memory = packed_pe }, &ps);
-    const rvamin = pinfo.sections[0].va;
-    var ds: [16]pe.Section = undefined;
-    const dinfo = try pe.parse(std.testing.io, .{ .memory = unpacked_pe }, &ds);
-    const text = for (dinfo.sections) |*sec| {
-        if (std.mem.eql(u8, sec.nameSlice(), ".text")) break sec;
-    } else return error.TestUnexpectedResult;
-    const at: usize = @intCast(text.va - rvamin);
-    const want = unpacked_pe[@intCast(text.raw_off)..][0..@intCast(text.raw_size)];
-    try std.testing.expectEqualSlices(u8, want, cap.list.items[at..][0..want.len]);
+    // The rebuilt file is the only unpacked child: every image byte outside it is zero.
+    try std.testing.expectEqualSlices(u8, unpacked_pe, cap.list.items);
+}
+
+/// The sample's decompressed, unfiltered image (caller frees).
+fn sampleImage() !struct { img: []u8, file_len: u32 } {
+    const packed_pe = exe("upx-amd64-pe");
+    const ph = std.mem.indexOf(u8, packed_pe[0..1024], "UPX!").?;
+    const h = packed_pe[ph..][0..32];
+    const img = try std.testing.allocator.alloc(u8, std.mem.readInt(u32, h[16..20], .little));
+    errdefer std.testing.allocator.free(img);
+    try nrv(packed_pe[ph + 32 ..][0..std.mem.readInt(u32, h[20..24], .little)], img, .nrv2b_le32);
+    try std.testing.expect(unfilter(img, h[28], h[29]));
+    return .{ .img = img, .file_len = std.mem.readInt(u32, h[24..28], .little) };
+}
+
+test "PE: records that were never seen are refused, and the image is only read" {
+    const packed_pe = exe("upx-amd64-pe");
+    const sample = try sampleImage();
+    const img = sample.img;
+    defer std.testing.allocator.free(img);
+    const before = try std.testing.allocator.dupe(u8, img);
+    defer std.testing.allocator.free(before);
+    const p = try PeImage.parse(img, 0x1000);
+    var rig: @import("../scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+
+    // The first DLL's first function record: tag 1 (by name). Any other tag is refused.
+    const tag_at = p.end + 8;
+    try std.testing.expectEqual(@as(u8, 1), img[tag_at]);
+    img[tag_at] = 2;
+    try std.testing.expect(rebuildPe(&rig.walker, .{ .memory = packed_pe }, img, sample.file_len) == null);
+    try std.testing.expect(rig.rec.has(.unsupported));
+    img[tag_at] = 1;
+
+    // The first relocation delta is 0xf0 and a 16-bit delta; 0xf1 was never seen.
+    try std.testing.expectEqual(@as(u8, 0xf0), img[p.relocs_at]);
+    img[p.relocs_at] = 0xf1;
+    try std.testing.expect(rebuildPe(&rig.walker, .{ .memory = packed_pe }, img, sample.file_len) == null);
+    img[p.relocs_at] = 0xf0;
+
+    // A trailer whose zero fields are set, or that names no PE header.
+    img[img.len - 13] = 1;
+    try std.testing.expectError(error.Layout, PeImage.parse(img, 0x1000));
+    img[img.len - 13] = 0;
+    img[img.len - 5] = 1;
+    try std.testing.expectError(error.Layout, PeImage.parse(img, 0x1000));
+    img[img.len - 5] = 0;
+    img[img.len - 4] ^= 1;
+    try std.testing.expectError(error.Layout, PeImage.parse(img, 0x1000));
+    img[img.len - 4] ^= 1;
+
+    // PE32 has no sample to check against.
+    img[p.header_at + 24] = 0x0b;
+    img[p.header_at + 25] = 0x01;
+    try std.testing.expectError(error.Pe32, PeImage.parse(img, 0x1000));
+    img[p.header_at + 25] = 0x02;
+
+    // A file size past the sections' end would need an overlay, which was not seen.
+    try std.testing.expect(rebuildPe(&rig.walker, .{ .memory = packed_pe }, img, sample.file_len + 512) == null);
+
+    // A hint/name entry aimed at non-zero image bytes (the first thunk pointed into .text).
+    const thunk_at = readU32(img, p.end + 4).?;
+    const thunk_was = std.mem.readInt(u64, img[thunk_at..][0..8], .little);
+    std.mem.writeInt(u64, img[thunk_at..][0..8], 0x1100, .little);
+    try std.testing.expect(rebuildPe(&rig.walker, .{ .memory = packed_pe }, img, sample.file_len) == null);
+    std.mem.writeInt(u64, img[thunk_at..][0..8], thunk_was, .little);
+
+    // Sections that overlap in the file (.rdata moved onto .text).
+    const rdata_raw = p.header_at + p.sections_at + 40 + 20;
+    const rdata_was = readU32(img, rdata_raw).?;
+    std.mem.writeInt(u32, img[rdata_raw..][0..4], 0x400, .little);
+    try std.testing.expect(rebuildPe(&rig.walker, .{ .memory = packed_pe }, img, sample.file_len) == null);
+    std.mem.writeInt(u32, img[rdata_raw..][0..4], rdata_was, .little);
+
+    // A rebuild reads the image and writes only the file.
+    const r = rebuildPe(&rig.walker, .{ .memory = packed_pe }, img, sample.file_len).?;
+    defer r.token.release();
+    try std.testing.expect(r.unmapped_zero);
+    try std.testing.expectEqualSlices(u8, before, img);
+    try std.testing.expectEqualSlices(u8, exe("upx-amd64-pe-d"), r.file);
+}
+
+test "PE: non-zero image bytes outside the original sections mark the image for scanning too" {
+    const packed_pe = exe("upx-amd64-pe");
+    const sample = try sampleImage();
+    defer std.testing.allocator.free(sample.img);
+    var rig: @import("../scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    // Between .text's raw data (0x9a00 bytes from offset 0) and .rdata (offset 0xa000).
+    sample.img[0x9a00 + 5] = 1;
+    const r = rebuildPe(&rig.walker, .{ .memory = packed_pe }, sample.img, sample.file_len).?;
+    defer r.token.release();
+    try std.testing.expect(!r.unmapped_zero);
+}
+
+test "PE: a PackHeader file size that does not match the sections leaves the image as the child" {
+    const bytes = try std.testing.allocator.dupe(u8, exe("upx-amd64-pe"));
+    defer std.testing.allocator.free(bytes);
+    const ph = std.mem.indexOf(u8, bytes[0..1024], "UPX!").?;
+    // A huge claim must not stop the image from being decoded and scanned.
+    std.mem.writeInt(u32, bytes[ph + 24 ..][0..4], 100 << 20, .little);
+    var rig: @import("../scan.zig").TestRig = undefined;
+    try rig.init(.{});
+    defer rig.deinit();
+    try rig.walker.scan(.{ .memory = bytes }, "f");
+    try std.testing.expect(rig.rec.find("f/upx/image") != null);
+    try std.testing.expect(rig.rec.find("f/upx") == null);
+    try std.testing.expect(rig.rec.has(.unsupported));
 }
 
 test "a damaged block is reported, not decoded past its bounds" {

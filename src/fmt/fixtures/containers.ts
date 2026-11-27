@@ -1355,11 +1355,11 @@ export function build(h: Helpers): void {
   archive('lzx.chm', chmFile(h, chmPlain, chmPacked), chmMembers)
   archive('window21.chm', chmFile(h, chmPlain, chmPacked.slice(0, 1), { windowBits: 21, resetFrames: 4 }), chmMembers.slice(0, 3))
   archive('dupes.chm', chmFile(h, chmPlain, chmPacked, { dupes: 30 }), chmMembers)
-  // UPX: ELF and Mach-O rebuild to exactly what upx -d writes; for PE the unpacked image is
-  // checked against upx -d's sections in upx.zig, so its upx -d output is a fixture too.
+  // UPX: every sample rebuilds to exactly what upx -d writes. The PE upx -d output is a
+  // fixture too, which upx.zig compares byte for byte.
   for (const u of upxSamples(h)) {
     const isPe = u.name.endsWith('-pe')
-    h.exe(`upx-${u.name}`, u.packed, { entry: null, sections: 0, members: isPe ? [] : [{ path: 'upx', data: u.unpacked }] })
+    h.exe(`upx-${u.name}`, u.packed, { entry: null, sections: 0, members: [{ path: 'upx', data: u.unpacked }] })
     if (isPe) h.exe(`upx-${u.name}-d`, u.unpacked, { entry: null, sections: 0 })
   }
   archive('dag-bomb.iso', isoImage([{ path: 'x.txt', data: fileA }], { joliet: true, dagDepth: 24 }), [])
